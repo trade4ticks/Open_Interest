@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+.idea/
+.venv/
+venv/
+*.log
+.claude/
