@@ -19,7 +19,7 @@ WITH latest AS (
 SELECT s.*
 FROM option_oi_surface s
 JOIN latest l USING (ticker, trade_date)
-ORDER BY ticker, expiration, strike, right;
+ORDER BY ticker, expiration, strike, option_type;
 
 -- ---------------------------------------------------------------------------
 -- v_oi_top_nodes_latest
@@ -49,7 +49,7 @@ ORDER BY ticker, oi_rank;
 
 -- ---------------------------------------------------------------------------
 -- v_oi_changes_daily
--- Per (ticker, expiration, strike, right): OI today vs prior available
+-- Per (ticker, expiration, strike, option_type): OI today vs prior available
 -- trade_date for that contract. Helps spot accumulation / unwinds.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_oi_changes_daily AS
@@ -59,7 +59,7 @@ SELECT
     s.expiration,
     s.dte,
     s.strike,
-    s.right,
+    s.option_type,
     s.open_interest                                                            AS oi_today,
     LAG(s.open_interest) OVER w                                                AS oi_prev,
     s.open_interest - LAG(s.open_interest) OVER w                              AS oi_change,
@@ -73,7 +73,7 @@ SELECT
     s.moneyness
 FROM option_oi_surface s
 WINDOW w AS (
-    PARTITION BY s.ticker, s.expiration, s.strike, s.right
+    PARTITION BY s.ticker, s.expiration, s.strike, s.option_type
     ORDER BY s.trade_date
 );
 
@@ -88,16 +88,16 @@ SELECT
     trade_date,
     expiration,
     dte,
-    SUM(open_interest)                                                AS total_oi,
-    SUM(CASE WHEN right = 'C' THEN open_interest ELSE 0 END)          AS call_oi,
-    SUM(CASE WHEN right = 'P' THEN open_interest ELSE 0 END)          AS put_oi,
-    COUNT(*)                                                          AS n_strikes,
-    MIN(strike)                                                       AS min_strike,
-    MAX(strike)                                                       AS max_strike,
-    AVG(spot_close)                                                   AS spot_close,
+    SUM(open_interest)                                                      AS total_oi,
+    SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)          AS call_oi,
+    SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)          AS put_oi,
+    COUNT(*)                                                                AS n_strikes,
+    MIN(strike)                                                             AS min_strike,
+    MAX(strike)                                                             AS max_strike,
+    AVG(spot_close)                                                         AS spot_close,
     -- OI-weighted average strike
     SUM(strike * open_interest)::DOUBLE PRECISION
-        / NULLIF(SUM(open_interest), 0)                               AS oi_weighted_strike
+        / NULLIF(SUM(open_interest), 0)                                     AS oi_weighted_strike
 FROM option_oi_surface
 GROUP BY ticker, trade_date, expiration, dte;
 
@@ -135,7 +135,7 @@ SELECT
     s.expiration,
     s.dte,
     s.strike,
-    s.right,
+    s.option_type,
     s.open_interest,
     s.spot_close,
     s.moneyness,

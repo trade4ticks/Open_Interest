@@ -53,9 +53,9 @@ MAX_WORKERS = 2
 
 UPSERT_RAW_SQL = """
 INSERT INTO option_oi_raw
-    (ticker, trade_date, expiration, strike, right, open_interest)
+    (ticker, trade_date, expiration, strike, option_type, open_interest)
 VALUES %s
-ON CONFLICT (ticker, trade_date, expiration, strike, right) DO UPDATE SET
+ON CONFLICT (ticker, trade_date, expiration, strike, option_type) DO UPDATE SET
     open_interest = EXCLUDED.open_interest
 """
 
@@ -67,7 +67,7 @@ DELETE FROM option_oi_surface
  WHERE ticker = %(ticker)s AND trade_date = %(trade_date)s;
 
 INSERT INTO option_oi_surface
-    (ticker, trade_date, expiration, dte, strike, right, open_interest,
+    (ticker, trade_date, expiration, dte, strike, option_type, open_interest,
      spot_close, moneyness)
 SELECT
     r.ticker,
@@ -75,7 +75,7 @@ SELECT
     r.expiration,
     (r.expiration - r.trade_date)::INTEGER                  AS dte,
     r.strike,
-    r.right,
+    r.option_type,
     r.open_interest,
     o.close                                                 AS spot_close,
     (r.strike / o.close) - 1.0                              AS moneyness
@@ -123,7 +123,7 @@ def _df_to_rows(ticker: str, expiration: date, df) -> list[tuple]:
             r.trade_date,
             expiration,
             float(r.strike),
-            r.right,
+            r.option_type,
             int(r.open_interest),
         ))
     return rows

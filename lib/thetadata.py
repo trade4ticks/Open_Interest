@@ -130,7 +130,7 @@ def fetch_oi(
     """
     Fetch daily OI for all strikes of one expiration over a date range.
 
-    Returns DataFrame[trade_date, strike, right, open_interest].
+    Returns DataFrame[trade_date, strike, option_type, open_interest].
     Empty DataFrame iff terminal returned no data (NOT on transport errors).
     """
     params = {
@@ -180,18 +180,19 @@ def fetch_oi(
         if oi is None or oi == 0:
             # zero OI is genuinely uninteresting for a research project
             continue
-        right_raw = str(row.get("right") or "").strip().lower()
-        right_val = (
-            "C" if right_raw in ("c", "call") else
-            "P" if right_raw in ("p", "put") else
-            right_raw.upper()
+        # ThetaData's API field is named "right"; we normalise to option_type ('C'/'P').
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
         )
-        if right_val not in ("C", "P"):
+        if option_type not in ("C", "P"):
             continue
         records.append({
             "trade_date":    d,
             "strike":        row.get("strike"),
-            "right":         right_val,
+            "option_type":   option_type,
             "open_interest": oi,
         })
 

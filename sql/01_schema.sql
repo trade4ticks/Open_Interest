@@ -3,7 +3,7 @@
 --
 -- Tables:
 --   underlying_ohlc      daily OHLC per ticker (yfinance)
---   option_oi_raw        raw daily OI per (ticker, trade_date, expiration, strike, right)
+--   option_oi_raw        raw daily OI per (ticker, trade_date, expiration, strike, option_type)
 --   option_oi_surface    filtered subset of option_oi_raw, joined to spot/moneyness/DTE
 --   daily_features       per (ticker, trade_date) feature row for AI/stat analysis
 -- =============================================================================
@@ -36,9 +36,9 @@ CREATE TABLE IF NOT EXISTS option_oi_raw (
     trade_date     DATE             NOT NULL,
     expiration     DATE             NOT NULL,
     strike         DOUBLE PRECISION NOT NULL,
-    right          CHAR(1)          NOT NULL CHECK (right IN ('C','P')),
+    option_type    CHAR(1)          NOT NULL CHECK (option_type IN ('C','P')),
     open_interest  BIGINT           NOT NULL,
-    PRIMARY KEY (ticker, trade_date, expiration, strike, right)
+    PRIMARY KEY (ticker, trade_date, expiration, strike, option_type)
 );
 
 CREATE INDEX IF NOT EXISTS option_oi_raw_lookup
@@ -55,11 +55,11 @@ CREATE TABLE IF NOT EXISTS option_oi_surface (
     expiration     DATE             NOT NULL,
     dte            SMALLINT         NOT NULL,
     strike         DOUBLE PRECISION NOT NULL,
-    right          CHAR(1)          NOT NULL CHECK (right IN ('C','P')),
+    option_type    CHAR(1)          NOT NULL CHECK (option_type IN ('C','P')),
     open_interest  BIGINT           NOT NULL,
     spot_close     DOUBLE PRECISION,
     moneyness      DOUBLE PRECISION,
-    PRIMARY KEY (ticker, trade_date, expiration, strike, right)
+    PRIMARY KEY (ticker, trade_date, expiration, strike, option_type)
 );
 
 CREATE INDEX IF NOT EXISTS option_oi_surface_lookup

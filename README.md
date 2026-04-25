@@ -61,7 +61,7 @@ python build_features.py # prompts for tickers (blank = all)
 | Table               | Grain                                              |
 |---------------------|----------------------------------------------------|
 | `underlying_ohlc`   | (ticker, trade_date)                               |
-| `option_oi_raw`     | (ticker, trade_date, expiration, strike, right)    |
+| `option_oi_raw`     | (ticker, trade_date, expiration, strike, option_type) |
 | `option_oi_surface` | same grain, filtered by OI_MIN / OI_MAX_DTE / OI_MAX_MONEYNESS, joined to spot |
 | `daily_features`    | (ticker, trade_date)                               |
 

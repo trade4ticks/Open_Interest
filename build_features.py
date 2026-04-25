@@ -61,17 +61,17 @@ agg AS (
         ticker,
         trade_date,
         SUM(open_interest)                                                  AS total_oi,
-        SUM(CASE WHEN right = 'C' THEN open_interest ELSE 0 END)            AS call_oi,
-        SUM(CASE WHEN right = 'P' THEN open_interest ELSE 0 END)            AS put_oi,
+        SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)            AS call_oi,
+        SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)            AS put_oi,
         SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END) AS oi_within_5pct,
         SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END) AS oi_within_10pct,
         SUM(strike * open_interest)::DOUBLE PRECISION
             / NULLIF(SUM(open_interest), 0)                                 AS oi_weighted_strike_all,
-        SUM(CASE WHEN right = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
-            / NULLIF(SUM(CASE WHEN right = 'C' THEN open_interest ELSE 0 END), 0)
+        SUM(CASE WHEN option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0)
                                                                             AS oi_weighted_strike_call,
-        SUM(CASE WHEN right = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
-            / NULLIF(SUM(CASE WHEN right = 'P' THEN open_interest ELSE 0 END), 0)
+        SUM(CASE WHEN option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0)
                                                                             AS oi_weighted_strike_put
     FROM option_oi_surface
     WHERE ticker = %(ticker)s
@@ -81,14 +81,14 @@ max_call AS (
     SELECT DISTINCT ON (ticker, trade_date)
         ticker, trade_date, strike AS max_oi_strike_call
     FROM option_oi_surface
-    WHERE ticker = %(ticker)s AND right = 'C'
+    WHERE ticker = %(ticker)s AND option_type = 'C'
     ORDER BY ticker, trade_date, open_interest DESC, strike
 ),
 max_put AS (
     SELECT DISTINCT ON (ticker, trade_date)
         ticker, trade_date, strike AS max_oi_strike_put
     FROM option_oi_surface
-    WHERE ticker = %(ticker)s AND right = 'P'
+    WHERE ticker = %(ticker)s AND option_type = 'P'
     ORDER BY ticker, trade_date, open_interest DESC, strike
 ),
 front_expiry AS (
