@@ -9,16 +9,13 @@ Usage:
 
 Strategy
 --------
-For each ticker:
-  1. Discover all expirations the terminal knows about (one call).
-  2. Filter to expirations whose date is >= start of our window
-     (so they were active during the requested range).
-  3. For each expiration, fetch OI for [start, min(end, expiration)] in one
-     call. Auto-splits on HTTP 570 inside the client.
-  4. Bulk-upsert into option_oi_raw.
-After all tickers are loaded, rebuild option_oi_surface for the touched
-(ticker, trade_date) pairs by joining to underlying_ohlc and applying the
-filter thresholds from .env.
+For each (ticker, trading_day) we make ONE HTTP call:
+
+    /v3/option/history/open_interest?symbol=TICK&expiration=*&date=YYYYMMDD
+
+That returns the entire OI chain (every strike of every active expiration)
+for the ticker on that day. We then bulk-upsert into option_oi_raw and
+rebuild option_oi_surface for the touched dates.
 
 Resume-safe: re-running over the same range just re-upserts identical rows.
 """
@@ -33,12 +30,11 @@ from tqdm import tqdm
 
 from config import OI_MAX_DTE, OI_MAX_MONEYNESS, OI_MIN
 from db import get_connection
-from lib.market_hours import last_trading_day
+from lib.market_hours import get_trading_days, last_trading_day
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
-    fetch_oi,
-    list_expirations,
+    fetch_oi_day,
     test_connection,
 )
 
@@ -49,7 +45,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MAX_WORKERS = 2
+MAX_WORKERS = 6
 
 UPSERT_RAW_SQL = """
 INSERT INTO option_oi_raw
@@ -60,8 +56,6 @@ ON CONFLICT (ticker, trade_date, expiration, strike, option_type) DO UPDATE SET
 """
 
 # Rebuild the surface for one (ticker, trade_date) by deleting and reinserting.
-# Filter: open_interest >= OI_MIN, dte between 0 and OI_MAX_DTE,
-#         |strike/spot - 1| <= OI_MAX_MONEYNESS (skip rows with no spot).
 REBUILD_SURFACE_SQL = """
 DELETE FROM option_oi_surface
  WHERE ticker = %(ticker)s AND trade_date = %(trade_date)s;
@@ -113,61 +107,39 @@ def prompt_date(label: str) -> date:
 
 # --- Per-ticker pipeline ---------------------------------------------------
 
-def _df_to_rows(ticker: str, expiration: date, df) -> list[tuple]:
+def _fetch_one_day(ticker: str, day: date) -> list[tuple]:
+    """Return upsert-ready rows for one (ticker, trading_day)."""
+    df = fetch_oi_day(ticker, day)
     if df.empty:
         return []
-    rows = []
-    for r in df.itertuples(index=False):
-        rows.append((
-            ticker,
-            r.trade_date,
-            expiration,
-            float(r.strike),
-            r.option_type,
-            int(r.open_interest),
-        ))
-    return rows
+    return [
+        (ticker, day, r.expiration, float(r.strike),
+         r.option_type, int(r.open_interest))
+        for r in df.itertuples(index=False)
+    ]
 
 
-def _fetch_one_expiry(ticker: str, expiration: date, start: date, end: date):
-    eff_end = min(end, expiration)
-    if eff_end < start:
-        return ticker, expiration, []
-    df = fetch_oi(ticker, expiration, start, eff_end)
-    return ticker, expiration, _df_to_rows(ticker, expiration, df)
-
-
-def fetch_ticker(conn, ticker: str, start: date, end: date) -> set[date]:
+def fetch_ticker(conn, ticker: str, trading_days: list[date]) -> set[date]:
     """Returns the set of trade_dates that received any rows."""
-    log.info("Discovering expirations for %s ...", ticker)
-    all_exps = list_expirations(ticker)
-    exps = [e for e in all_exps if e >= start]
-    if not exps:
-        log.warning("  no expirations >= %s for %s", start, ticker)
-        return set()
-    log.info("  %d expirations to scan", len(exps))
-
-    touched_dates: set[date] = set()
-    failures: list[date]     = []
+    touched: set[date] = set()
+    failures: list[date] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_fetch_one_expiry, ticker, e, start, end): e
-            for e in exps
-        }
-        with tqdm(total=len(futures), unit="exp", ncols=90, desc=f"  {ticker}") as bar:
+        futures = {pool.submit(_fetch_one_day, ticker, d): d for d in trading_days}
+        with tqdm(total=len(futures), unit="day", ncols=90,
+                  desc=f"  {ticker}") as bar:
             for fut in as_completed(futures):
-                exp = futures[fut]
+                d = futures[fut]
                 try:
-                    _, _, rows = fut.result()
+                    rows = fut.result()
                 except (TerminalTimeoutError, TerminalServerError) as exc:
-                    failures.append(exp)
-                    log.warning("  TIMEOUT %s %s: %s", ticker, exp, exc)
+                    failures.append(d)
+                    log.warning("  TIMEOUT %s %s: %s", ticker, d, exc)
                     bar.update(1)
                     continue
                 except Exception as exc:
-                    failures.append(exp)
-                    log.warning("  FAIL    %s %s: %s", ticker, exp, exc)
+                    failures.append(d)
+                    log.warning("  FAIL    %s %s: %s", ticker, d, exc)
                     bar.update(1)
                     continue
 
@@ -177,15 +149,14 @@ def fetch_ticker(conn, ticker: str, start: date, end: date) -> set[date]:
                             cur, UPSERT_RAW_SQL, rows, page_size=2000
                         )
                     conn.commit()
-                    for r in rows:
-                        touched_dates.add(r[1])
-                    bar.set_postfix_str(f"{exp} ({len(rows)}r)")
+                    touched.add(d)
+                    bar.set_postfix_str(f"{d} ({len(rows)}r)")
                 bar.update(1)
 
     if failures:
-        log.warning("  %d expirations failed for %s: retry by re-running.",
+        log.warning("  %d days failed for %s: re-run to retry.",
                     len(failures), ticker)
-    return touched_dates
+    return touched
 
 
 # --- Surface rebuild -------------------------------------------------------
@@ -193,17 +164,17 @@ def fetch_ticker(conn, ticker: str, start: date, end: date) -> set[date]:
 def rebuild_surface(conn, ticker: str, trade_dates: set[date]) -> int:
     if not trade_dates:
         return 0
-    n = 0
     params_list = [
         {
-            "ticker":         ticker,
-            "trade_date":     d,
-            "oi_min":         OI_MIN,
-            "max_dte":        OI_MAX_DTE,
-            "max_moneyness":  OI_MAX_MONEYNESS,
+            "ticker":        ticker,
+            "trade_date":    d,
+            "oi_min":        OI_MIN,
+            "max_dte":       OI_MAX_DTE,
+            "max_moneyness": OI_MAX_MONEYNESS,
         }
         for d in sorted(trade_dates)
     ]
+    n = 0
     with conn.cursor() as cur:
         for params in tqdm(params_list, ncols=90, unit="day",
                            desc=f"  rebuild {ticker}"):
@@ -227,7 +198,12 @@ def main() -> None:
     if end < start:
         raise SystemExit("No completed trading days in the requested range.")
 
-    print(f"\nFetching {len(tickers)} tickers from {start} → {end}")
+    trading_days = get_trading_days(start, end)
+    if not trading_days:
+        raise SystemExit("No NYSE trading days in the requested range.")
+
+    print(f"\nFetching {len(tickers)} tickers × {len(trading_days)} trading days "
+          f"({start} → {end})")
 
     print("Checking ThetaData ...", end=" ", flush=True)
     if not test_connection():
@@ -237,7 +213,7 @@ def main() -> None:
     with get_connection() as conn:
         for t in tickers:
             print(f"\n--- {t} ---")
-            touched = fetch_ticker(conn, t, start, end)
+            touched = fetch_ticker(conn, t, trading_days)
             if touched:
                 rebuild_surface(conn, t, touched)
                 print(f"  surface rebuilt for {len(touched)} trade dates")

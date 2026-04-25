@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import requests
@@ -18,8 +18,7 @@ from config import THETADATA_BASE_URL
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 120
-_BULK_TIMEOUT    = 300
+_DEFAULT_TIMEOUT = 60
 
 
 # --- Exceptions ------------------------------------------------------------
@@ -89,57 +88,60 @@ def _parse_rows(data: dict | list) -> list[dict]:
     return []
 
 
-def _row_date(row: dict) -> date | None:
-    """Pull a date out of a row's 'date' (YYYYMMDD int) or ISO 'timestamp' field."""
-    raw = row.get("date")
-    if raw is not None:
-        s = str(int(raw))
-        if len(s) == 8:
+def _parse_ymd(raw) -> date | None:
+    """Accept 'YYYY-MM-DD', 'YYYYMMDD' or 20240102 → date."""
+    if raw is None:
+        return None
+    s = str(raw)
+    if len(s) >= 10 and s[4] == "-":
+        try:
+            return date(int(s[:4]), int(s[5:7]), int(s[8:10]))
+        except ValueError:
+            return None
+    try:
+        s = str(int(s))
+    except ValueError:
+        return None
+    if len(s) == 8:
+        try:
             return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
-    ts = str(row.get("timestamp") or "")
-    if len(ts) >= 10 and ts[4] == "-":
-        return date(int(ts[:4]), int(ts[5:7]), int(ts[8:10]))
+        except ValueError:
+            return None
     return None
 
 
 # --- Public API ------------------------------------------------------------
 
 def list_expirations(symbol: str) -> list[date]:
-    """All expirations the terminal knows about for `symbol` (sorted ascending)."""
+    """All expirations the terminal knows about for `symbol` (sorted ascending).
+
+    Kept as a utility / for `test_connection`. The OI fetch path no longer
+    needs it — `fetch_oi_day` returns expirations inline with the rows.
+    """
     data = _get("/v3/option/list/expirations", {"symbol": symbol.upper()})
-    rows = _parse_rows(data)
     out: list[date] = []
-    for r in rows:
-        s = str(r.get("expiration") or "")[:10]
-        if not s or s[4] != "-":
-            continue
-        try:
-            out.append(date(int(s[:4]), int(s[5:7]), int(s[8:10])))
-        except ValueError:
-            continue
+    for r in _parse_rows(data):
+        d = _parse_ymd(r.get("expiration"))
+        if d is not None:
+            out.append(d)
     return sorted(set(out))
 
 
-def fetch_oi(
-    symbol: str,
-    expiration: date,
-    start_date: date,
-    end_date: date,
-    timeout: int = _BULK_TIMEOUT,
-) -> pd.DataFrame:
+def fetch_oi_day(symbol: str, trading_day: date,
+                 timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
     """
-    Fetch daily OI for all strikes of one expiration over a date range.
+    Fetch the entire OI chain for one ticker on one trading day in one HTTP call.
 
-    Returns DataFrame[trade_date, strike, option_type, open_interest].
+    Endpoint: /v3/option/history/open_interest with `expiration=*&date=YYYYMMDD`
+    (per ThetaData docs — strike defaults to *, right defaults to both).
+
+    Returns DataFrame[trade_date, expiration, strike, option_type, open_interest].
     Empty DataFrame iff terminal returned no data (NOT on transport errors).
     """
     params = {
         "symbol":     symbol.upper(),
-        "expiration": expiration.strftime("%Y%m%d"),
-        "strike":     "*",
-        "right":      "both",
-        "start_date": start_date.strftime("%Y%m%d"),
-        "end_date":   end_date.strftime("%Y%m%d"),
+        "expiration": "*",
+        "date":       trading_day.strftime("%Y%m%d"),
     }
 
     try:
@@ -147,25 +149,17 @@ def fetch_oi(
     except NoDataError:
         return pd.DataFrame()
     except RateLimitError:
-        log.warning("Rate limited — sleeping 60s, retrying once")
+        log.warning("Rate limited — sleeping 60s, retrying once (%s %s)",
+                    symbol, trading_day)
         time.sleep(60)
         data = _get("/v3/option/history/open_interest", params, timeout=timeout)
     except ServerDisconnectedError:
-        log.warning("Server disconnected — sleeping 10s, retrying once")
+        log.warning("Server disconnected — sleeping 10s, retrying once (%s %s)",
+                    symbol, trading_day)
         time.sleep(10)
         data = _get("/v3/option/history/open_interest", params, timeout=timeout)
-    except LargeRequestError:
-        # Split the date range in half and recurse.
-        if start_date == end_date:
-            raise
-        mid = start_date + (end_date - start_date) // 2
-        log.warning("570 — splitting %s %s %s→%s at %s",
-                    symbol, expiration, start_date, end_date, mid)
-        left  = fetch_oi(symbol, expiration, start_date, mid, timeout)
-        right = fetch_oi(symbol, expiration, mid + timedelta(days=1), end_date, timeout)
-        if left.empty and right.empty:
-            return pd.DataFrame()
-        return pd.concat([left, right], ignore_index=True)
+    # 570 (LargeRequestError) is unlikely for one ticker on one day; if it
+    # happens, let it propagate so the caller can flag the day for retry.
 
     rows = _parse_rows(data)
     if not rows:
@@ -173,13 +167,19 @@ def fetch_oi(
 
     records = []
     for row in rows:
-        d = _row_date(row)
+        # Trading date — should equal trading_day, but parse defensively.
+        d = _parse_ymd(row.get("date"))
         if d is None:
+            d = trading_day
+
+        exp = _parse_ymd(row.get("expiration"))
+        if exp is None:
             continue
+
         oi = row.get("open_interest")
         if oi is None or oi == 0:
-            # zero OI is genuinely uninteresting for a research project
-            continue
+            continue   # zero OI is uninteresting for research
+
         # ThetaData's API field is named "right"; we normalise to option_type ('C'/'P').
         raw = str(row.get("right") or "").strip().lower()
         option_type = (
@@ -189,8 +189,10 @@ def fetch_oi(
         )
         if option_type not in ("C", "P"):
             continue
+
         records.append({
             "trade_date":    d,
+            "expiration":    exp,
             "strike":        row.get("strike"),
             "option_type":   option_type,
             "open_interest": oi,
