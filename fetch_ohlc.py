@@ -9,8 +9,10 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime, timedelta
 
+import numpy as np
 import psycopg2.extras
 import yfinance as yf
 
@@ -57,14 +59,21 @@ def prompt_date(label: str) -> date:
 
 
 def _safe(v):
-    """yfinance NaN → None."""
+    """
+    Convert numpy scalars from yfinance to native Python types and map
+    NaN/Inf → None. psycopg2 calls repr() on unregistered types, and
+    NumPy>=2.0's repr(np.float64) is "np.float64(x)" — Postgres then
+    parses 'np' as a schema and errors out.
+    """
     if v is None:
         return None
-    try:
-        if v != v:   # NaN
-            return None
-    except TypeError:
-        pass
+    if isinstance(v, np.floating):
+        f = float(v)
+        return None if not math.isfinite(f) else f
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     return v
 
 
