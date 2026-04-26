@@ -112,11 +112,19 @@ def _fetch_one_day(ticker: str, day: date) -> list[tuple]:
     df = fetch_oi_day(ticker, day)
     if df.empty:
         return []
-    return [
-        (ticker, day, r.expiration, float(r.strike),
-         r.option_type, int(r.open_interest))
-        for r in df.itertuples(index=False)
-    ]
+
+    seen: dict[tuple, int] = {}
+    for r in df.itertuples(index=False):
+        key = (ticker, day, r.expiration, float(r.strike), r.option_type)
+        seen[key] = seen.get(key, 0) + int(r.open_interest)
+
+    n_raw = len(df)
+    n_deduped = len(seen)
+    if n_deduped < n_raw:
+        log.warning("  DEDUP   %s %s: %d → %d rows (%d dupes removed)",
+                    ticker, day, n_raw, n_deduped, n_raw - n_deduped)
+
+    return [(*key, oi) for key, oi in seen.items()]
 
 
 def fetch_ticker(conn, ticker: str, trading_days: list[date]) -> set[date]:
