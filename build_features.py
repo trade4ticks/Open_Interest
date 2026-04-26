@@ -32,6 +32,7 @@ WITH spot AS (
     SELECT
         ticker,
         trade_date,
+        open,
         close,
         LN(NULLIF(close, 0) / NULLIF(LAG(close) OVER w_t, 0)) AS log_ret
     FROM underlying_ohlc
@@ -42,12 +43,23 @@ spot_lags AS (
     SELECT
         ticker, trade_date, close AS spot_close,
         STDDEV_SAMP(log_ret) OVER w5
-            * SQRT(252)                               AS rv_5d,
+            * SQRT(252)                                                              AS rv_5d,
         STDDEV_SAMP(log_ret) OVER w20
-            * SQRT(252)                               AS rv_20d,
-        (LEAD(close, 1)  OVER w_t) / NULLIF(close, 0) - 1 AS ret_1d_fwd,
-        (LEAD(close, 5)  OVER w_t) / NULLIF(close, 0) - 1 AS ret_5d_fwd,
-        (LEAD(close, 20) OVER w_t) / NULLIF(close, 0) - 1 AS ret_20d_fwd
+            * SQRT(252)                                                              AS rv_20d,
+        -- close-to-close forward returns
+        (LEAD(close,  1) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_1d_fwd_cc,
+        (LEAD(close,  3) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_3d_fwd_cc,
+        (LEAD(close,  5) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_5d_fwd_cc,
+        (LEAD(close,  7) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_7d_fwd_cc,
+        (LEAD(close, 10) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_10d_fwd_cc,
+        (LEAD(close, 20) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_20d_fwd_cc,
+        -- next-open-to-close[+N] forward returns (entry = open of following day)
+        (LEAD(close,  1) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_1d_fwd_oc,
+        (LEAD(close,  3) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_3d_fwd_oc,
+        (LEAD(close,  5) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_5d_fwd_oc,
+        (LEAD(close,  7) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_7d_fwd_oc,
+        (LEAD(close, 10) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_10d_fwd_oc,
+        (LEAD(close, 20) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_20d_fwd_oc
     FROM spot
     WINDOW
         w_t AS (PARTITION BY ticker ORDER BY trade_date),
@@ -60,19 +72,42 @@ agg AS (
     SELECT
         ticker,
         trade_date,
-        SUM(open_interest)                                                  AS total_oi,
-        SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)            AS call_oi,
-        SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)            AS put_oi,
-        SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END) AS oi_within_5pct,
-        SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END) AS oi_within_10pct,
+        SUM(open_interest)                                                           AS total_oi,
+        SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)              AS call_oi,
+        SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)              AS put_oi,
+        SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END)         AS oi_within_5pct,
+        SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END)         AS oi_within_10pct,
+        SUM(CASE WHEN moneyness > 0 THEN open_interest ELSE 0 END)                  AS oi_above_spot,
+        SUM(CASE WHEN moneyness < 0 THEN open_interest ELSE 0 END)                  AS oi_below_spot,
+        -- OI-weighted strikes (all DTE)
         SUM(strike * open_interest)::DOUBLE PRECISION
-            / NULLIF(SUM(open_interest), 0)                                 AS oi_weighted_strike_all,
+            / NULLIF(SUM(open_interest), 0)                                          AS oi_weighted_strike_all,
         SUM(CASE WHEN option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
             / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                            AS oi_weighted_strike_call,
+                                                                                     AS oi_weighted_strike_call,
         SUM(CASE WHEN option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
             / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                            AS oi_weighted_strike_put
+                                                                                     AS oi_weighted_strike_put,
+        -- OI-weighted strikes (DTE 0-30)
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_all_0_30d,
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_call_0_30d,
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_put_0_30d,
+        -- OI-weighted strikes (DTE 31-90)
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_all_31_90d,
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_call_31_90d,
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+            / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
+                                                                                     AS oi_weighted_strike_put_31_90d
     FROM option_oi_surface
     WHERE ticker = %(ticker)s
     GROUP BY ticker, trade_date
@@ -126,9 +161,15 @@ INSERT INTO daily_features (
     oi_weighted_strike_call_minus_spot, oi_weighted_strike_put_minus_spot, oi_weighted_strike_all_minus_spot,
     oi_weighted_strike_call_div_spot, oi_weighted_strike_put_div_spot, oi_weighted_strike_all_div_spot,
     oi_within_5pct, oi_within_10pct, pct_oi_in_front_expiry,
+    oi_above_spot, oi_below_spot, oi_above_below_ratio,
+    oi_weighted_strike_all_0_30d, oi_weighted_strike_call_0_30d, oi_weighted_strike_put_0_30d,
+    oi_weighted_strike_all_0_30d_div_spot, oi_weighted_strike_call_0_30d_div_spot, oi_weighted_strike_put_0_30d_div_spot,
+    oi_weighted_strike_all_31_90d, oi_weighted_strike_call_31_90d, oi_weighted_strike_put_31_90d,
+    oi_weighted_strike_all_31_90d_div_spot, oi_weighted_strike_call_31_90d_div_spot, oi_weighted_strike_put_31_90d_div_spot,
     d1_total_oi_change, d5_total_oi_change, d20_total_oi_change,
     rv_5d, rv_20d,
-    ret_1d_fwd, ret_5d_fwd, ret_20d_fwd
+    ret_1d_fwd_cc, ret_3d_fwd_cc, ret_5d_fwd_cc, ret_7d_fwd_cc, ret_10d_fwd_cc, ret_20d_fwd_cc,
+    ret_1d_fwd_oc, ret_3d_fwd_oc, ret_5d_fwd_oc, ret_7d_fwd_oc, ret_10d_fwd_oc, ret_20d_fwd_oc
 )
 SELECT
     a.ticker,
@@ -137,30 +178,53 @@ SELECT
     a.total_oi,
     a.call_oi,
     a.put_oi,
-    a.put_oi::DOUBLE PRECISION / NULLIF(a.call_oi, 0)        AS put_call_oi_ratio,
+    a.put_oi::DOUBLE PRECISION / NULLIF(a.call_oi, 0)                AS put_call_oi_ratio,
     mc.max_oi_strike_call,
     mp.max_oi_strike_put,
     a.oi_weighted_strike_call,
     a.oi_weighted_strike_put,
     a.oi_weighted_strike_all,
-    a.oi_weighted_strike_call - sl.spot_close                    AS oi_weighted_strike_call_minus_spot,
-    a.oi_weighted_strike_put  - sl.spot_close                    AS oi_weighted_strike_put_minus_spot,
-    a.oi_weighted_strike_all  - sl.spot_close                    AS oi_weighted_strike_all_minus_spot,
-    a.oi_weighted_strike_call / NULLIF(sl.spot_close, 0)         AS oi_weighted_strike_call_div_spot,
-    a.oi_weighted_strike_put  / NULLIF(sl.spot_close, 0)         AS oi_weighted_strike_put_div_spot,
-    a.oi_weighted_strike_all  / NULLIF(sl.spot_close, 0)         AS oi_weighted_strike_all_div_spot,
+    a.oi_weighted_strike_call - sl.spot_close                        AS oi_weighted_strike_call_minus_spot,
+    a.oi_weighted_strike_put  - sl.spot_close                        AS oi_weighted_strike_put_minus_spot,
+    a.oi_weighted_strike_all  - sl.spot_close                        AS oi_weighted_strike_all_minus_spot,
+    a.oi_weighted_strike_call / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_call_div_spot,
+    a.oi_weighted_strike_put  / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_put_div_spot,
+    a.oi_weighted_strike_all  / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_all_div_spot,
     a.oi_within_5pct,
     a.oi_within_10pct,
-    fo.front_total_oi::DOUBLE PRECISION / NULLIF(a.total_oi, 0)
-                                                              AS pct_oi_in_front_expiry,
+    fo.front_total_oi::DOUBLE PRECISION / NULLIF(a.total_oi, 0)      AS pct_oi_in_front_expiry,
+    a.oi_above_spot,
+    a.oi_below_spot,
+    a.oi_above_spot::DOUBLE PRECISION / NULLIF(a.oi_below_spot, 0)   AS oi_above_below_ratio,
+    a.oi_weighted_strike_all_0_30d,
+    a.oi_weighted_strike_call_0_30d,
+    a.oi_weighted_strike_put_0_30d,
+    a.oi_weighted_strike_all_0_30d  / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_all_0_30d_div_spot,
+    a.oi_weighted_strike_call_0_30d / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_call_0_30d_div_spot,
+    a.oi_weighted_strike_put_0_30d  / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_put_0_30d_div_spot,
+    a.oi_weighted_strike_all_31_90d,
+    a.oi_weighted_strike_call_31_90d,
+    a.oi_weighted_strike_put_31_90d,
+    a.oi_weighted_strike_all_31_90d  / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_all_31_90d_div_spot,
+    a.oi_weighted_strike_call_31_90d / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_call_31_90d_div_spot,
+    a.oi_weighted_strike_put_31_90d  / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_put_31_90d_div_spot,
     ol.d1_total_oi_change,
     ol.d5_total_oi_change,
     ol.d20_total_oi_change,
     sl.rv_5d,
     sl.rv_20d,
-    sl.ret_1d_fwd,
-    sl.ret_5d_fwd,
-    sl.ret_20d_fwd
+    sl.ret_1d_fwd_cc,
+    sl.ret_3d_fwd_cc,
+    sl.ret_5d_fwd_cc,
+    sl.ret_7d_fwd_cc,
+    sl.ret_10d_fwd_cc,
+    sl.ret_20d_fwd_cc,
+    sl.ret_1d_fwd_oc,
+    sl.ret_3d_fwd_oc,
+    sl.ret_5d_fwd_oc,
+    sl.ret_7d_fwd_oc,
+    sl.ret_10d_fwd_oc,
+    sl.ret_20d_fwd_oc
 FROM agg       a
 LEFT JOIN max_call  mc USING (ticker, trade_date)
 LEFT JOIN max_put   mp USING (ticker, trade_date)
@@ -168,33 +232,57 @@ LEFT JOIN front_oi  fo USING (ticker, trade_date)
 LEFT JOIN oi_lags   ol USING (ticker, trade_date)
 LEFT JOIN spot_lags sl USING (ticker, trade_date)
 ON CONFLICT (ticker, trade_date) DO UPDATE SET
-    spot_close              = EXCLUDED.spot_close,
-    total_oi                = EXCLUDED.total_oi,
-    call_oi                 = EXCLUDED.call_oi,
-    put_oi                  = EXCLUDED.put_oi,
-    put_call_oi_ratio       = EXCLUDED.put_call_oi_ratio,
-    max_oi_strike_call      = EXCLUDED.max_oi_strike_call,
-    max_oi_strike_put       = EXCLUDED.max_oi_strike_put,
-    oi_weighted_strike_call             = EXCLUDED.oi_weighted_strike_call,
-    oi_weighted_strike_put              = EXCLUDED.oi_weighted_strike_put,
-    oi_weighted_strike_all              = EXCLUDED.oi_weighted_strike_all,
-    oi_weighted_strike_call_minus_spot  = EXCLUDED.oi_weighted_strike_call_minus_spot,
-    oi_weighted_strike_put_minus_spot   = EXCLUDED.oi_weighted_strike_put_minus_spot,
-    oi_weighted_strike_all_minus_spot   = EXCLUDED.oi_weighted_strike_all_minus_spot,
-    oi_weighted_strike_call_div_spot    = EXCLUDED.oi_weighted_strike_call_div_spot,
-    oi_weighted_strike_put_div_spot     = EXCLUDED.oi_weighted_strike_put_div_spot,
-    oi_weighted_strike_all_div_spot     = EXCLUDED.oi_weighted_strike_all_div_spot,
-    oi_within_5pct                      = EXCLUDED.oi_within_5pct,
-    oi_within_10pct         = EXCLUDED.oi_within_10pct,
-    pct_oi_in_front_expiry  = EXCLUDED.pct_oi_in_front_expiry,
-    d1_total_oi_change      = EXCLUDED.d1_total_oi_change,
-    d5_total_oi_change      = EXCLUDED.d5_total_oi_change,
-    d20_total_oi_change     = EXCLUDED.d20_total_oi_change,
-    rv_5d                   = EXCLUDED.rv_5d,
-    rv_20d                  = EXCLUDED.rv_20d,
-    ret_1d_fwd              = EXCLUDED.ret_1d_fwd,
-    ret_5d_fwd              = EXCLUDED.ret_5d_fwd,
-    ret_20d_fwd             = EXCLUDED.ret_20d_fwd
+    spot_close                              = EXCLUDED.spot_close,
+    total_oi                                = EXCLUDED.total_oi,
+    call_oi                                 = EXCLUDED.call_oi,
+    put_oi                                  = EXCLUDED.put_oi,
+    put_call_oi_ratio                       = EXCLUDED.put_call_oi_ratio,
+    max_oi_strike_call                      = EXCLUDED.max_oi_strike_call,
+    max_oi_strike_put                       = EXCLUDED.max_oi_strike_put,
+    oi_weighted_strike_call                 = EXCLUDED.oi_weighted_strike_call,
+    oi_weighted_strike_put                  = EXCLUDED.oi_weighted_strike_put,
+    oi_weighted_strike_all                  = EXCLUDED.oi_weighted_strike_all,
+    oi_weighted_strike_call_minus_spot      = EXCLUDED.oi_weighted_strike_call_minus_spot,
+    oi_weighted_strike_put_minus_spot       = EXCLUDED.oi_weighted_strike_put_minus_spot,
+    oi_weighted_strike_all_minus_spot       = EXCLUDED.oi_weighted_strike_all_minus_spot,
+    oi_weighted_strike_call_div_spot        = EXCLUDED.oi_weighted_strike_call_div_spot,
+    oi_weighted_strike_put_div_spot         = EXCLUDED.oi_weighted_strike_put_div_spot,
+    oi_weighted_strike_all_div_spot         = EXCLUDED.oi_weighted_strike_all_div_spot,
+    oi_within_5pct                          = EXCLUDED.oi_within_5pct,
+    oi_within_10pct                         = EXCLUDED.oi_within_10pct,
+    pct_oi_in_front_expiry                  = EXCLUDED.pct_oi_in_front_expiry,
+    oi_above_spot                           = EXCLUDED.oi_above_spot,
+    oi_below_spot                           = EXCLUDED.oi_below_spot,
+    oi_above_below_ratio                    = EXCLUDED.oi_above_below_ratio,
+    oi_weighted_strike_all_0_30d            = EXCLUDED.oi_weighted_strike_all_0_30d,
+    oi_weighted_strike_call_0_30d           = EXCLUDED.oi_weighted_strike_call_0_30d,
+    oi_weighted_strike_put_0_30d            = EXCLUDED.oi_weighted_strike_put_0_30d,
+    oi_weighted_strike_all_0_30d_div_spot   = EXCLUDED.oi_weighted_strike_all_0_30d_div_spot,
+    oi_weighted_strike_call_0_30d_div_spot  = EXCLUDED.oi_weighted_strike_call_0_30d_div_spot,
+    oi_weighted_strike_put_0_30d_div_spot   = EXCLUDED.oi_weighted_strike_put_0_30d_div_spot,
+    oi_weighted_strike_all_31_90d           = EXCLUDED.oi_weighted_strike_all_31_90d,
+    oi_weighted_strike_call_31_90d          = EXCLUDED.oi_weighted_strike_call_31_90d,
+    oi_weighted_strike_put_31_90d           = EXCLUDED.oi_weighted_strike_put_31_90d,
+    oi_weighted_strike_all_31_90d_div_spot  = EXCLUDED.oi_weighted_strike_all_31_90d_div_spot,
+    oi_weighted_strike_call_31_90d_div_spot = EXCLUDED.oi_weighted_strike_call_31_90d_div_spot,
+    oi_weighted_strike_put_31_90d_div_spot  = EXCLUDED.oi_weighted_strike_put_31_90d_div_spot,
+    d1_total_oi_change                      = EXCLUDED.d1_total_oi_change,
+    d5_total_oi_change                      = EXCLUDED.d5_total_oi_change,
+    d20_total_oi_change                     = EXCLUDED.d20_total_oi_change,
+    rv_5d                                   = EXCLUDED.rv_5d,
+    rv_20d                                  = EXCLUDED.rv_20d,
+    ret_1d_fwd_cc                           = EXCLUDED.ret_1d_fwd_cc,
+    ret_3d_fwd_cc                           = EXCLUDED.ret_3d_fwd_cc,
+    ret_5d_fwd_cc                           = EXCLUDED.ret_5d_fwd_cc,
+    ret_7d_fwd_cc                           = EXCLUDED.ret_7d_fwd_cc,
+    ret_10d_fwd_cc                          = EXCLUDED.ret_10d_fwd_cc,
+    ret_20d_fwd_cc                          = EXCLUDED.ret_20d_fwd_cc,
+    ret_1d_fwd_oc                           = EXCLUDED.ret_1d_fwd_oc,
+    ret_3d_fwd_oc                           = EXCLUDED.ret_3d_fwd_oc,
+    ret_5d_fwd_oc                           = EXCLUDED.ret_5d_fwd_oc,
+    ret_7d_fwd_oc                           = EXCLUDED.ret_7d_fwd_oc,
+    ret_10d_fwd_oc                          = EXCLUDED.ret_10d_fwd_oc,
+    ret_20d_fwd_oc                          = EXCLUDED.ret_20d_fwd_oc
 """
 
 CLEAR_SQL = "DELETE FROM daily_features WHERE ticker = %(ticker)s"

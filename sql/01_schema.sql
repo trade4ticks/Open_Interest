@@ -103,17 +103,51 @@ CREATE TABLE IF NOT EXISTS daily_features (
     oi_within_10pct         BIGINT,
     pct_oi_in_front_expiry  DOUBLE PRECISION,
 
+    -- OI split above vs below spot
+    oi_above_spot           BIGINT,
+    oi_below_spot           BIGINT,
+    oi_above_below_ratio    DOUBLE PRECISION,
+
+    -- OI-weighted strikes by DTE bucket (0-30d)
+    oi_weighted_strike_all_0_30d            DOUBLE PRECISION,
+    oi_weighted_strike_call_0_30d           DOUBLE PRECISION,
+    oi_weighted_strike_put_0_30d            DOUBLE PRECISION,
+    oi_weighted_strike_all_0_30d_div_spot   DOUBLE PRECISION,
+    oi_weighted_strike_call_0_30d_div_spot  DOUBLE PRECISION,
+    oi_weighted_strike_put_0_30d_div_spot   DOUBLE PRECISION,
+
+    -- OI-weighted strikes by DTE bucket (31-90d)
+    oi_weighted_strike_all_31_90d           DOUBLE PRECISION,
+    oi_weighted_strike_call_31_90d          DOUBLE PRECISION,
+    oi_weighted_strike_put_31_90d           DOUBLE PRECISION,
+    oi_weighted_strike_all_31_90d_div_spot  DOUBLE PRECISION,
+    oi_weighted_strike_call_31_90d_div_spot DOUBLE PRECISION,
+    oi_weighted_strike_put_31_90d_div_spot  DOUBLE PRECISION,
+
     -- OI build-up signals (vs N trading days back)
     d1_total_oi_change      BIGINT,
     d5_total_oi_change      BIGINT,
     d20_total_oi_change     BIGINT,
 
-    -- response variables (computed from underlying_ohlc)
+    -- realised vol (computed from underlying_ohlc)
     rv_5d                   DOUBLE PRECISION,
     rv_20d                  DOUBLE PRECISION,
-    ret_1d_fwd              DOUBLE PRECISION,
-    ret_5d_fwd              DOUBLE PRECISION,
-    ret_20d_fwd             DOUBLE PRECISION,
+
+    -- close-to-close forward returns
+    ret_1d_fwd_cc           DOUBLE PRECISION,
+    ret_3d_fwd_cc           DOUBLE PRECISION,
+    ret_5d_fwd_cc           DOUBLE PRECISION,
+    ret_7d_fwd_cc           DOUBLE PRECISION,
+    ret_10d_fwd_cc          DOUBLE PRECISION,
+    ret_20d_fwd_cc          DOUBLE PRECISION,
+
+    -- next-open-to-close[+N] forward returns
+    ret_1d_fwd_oc           DOUBLE PRECISION,
+    ret_3d_fwd_oc           DOUBLE PRECISION,
+    ret_5d_fwd_oc           DOUBLE PRECISION,
+    ret_7d_fwd_oc           DOUBLE PRECISION,
+    ret_10d_fwd_oc          DOUBLE PRECISION,
+    ret_20d_fwd_oc          DOUBLE PRECISION,
 
     PRIMARY KEY (ticker, trade_date)
 );
