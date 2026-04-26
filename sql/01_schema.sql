@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS daily_features (
     oi_weighted_strike_put  DOUBLE PRECISION,
     oi_weighted_strike_all  DOUBLE PRECISION,
 
+    -- distance of OI-weighted strike from spot (absolute and relative)
+    oi_weighted_strike_call_minus_spot DOUBLE PRECISION,
+    oi_weighted_strike_put_minus_spot  DOUBLE PRECISION,
+    oi_weighted_strike_all_minus_spot  DOUBLE PRECISION,
+    oi_weighted_strike_call_div_spot   DOUBLE PRECISION,
+    oi_weighted_strike_put_div_spot    DOUBLE PRECISION,
+    oi_weighted_strike_all_div_spot    DOUBLE PRECISION,
+
     -- concentration of OI near spot
     oi_within_5pct          BIGINT,
     oi_within_10pct         BIGINT,
