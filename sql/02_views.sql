@@ -3,7 +3,20 @@
 --
 -- These views read from the filtered surface (option_oi_surface) so the AI
 -- only sees meaningful nodes. Drop and recreate is fine — they hold no state.
+--
+-- We DROP IF EXISTS up front because CREATE OR REPLACE VIEW in Postgres
+-- cannot change a view's column NAMES (only types/positions). Whenever the
+-- underlying tables get a column rename or `f.*` resolves differently,
+-- CREATE OR REPLACE fails with "cannot change name of view column ..." —
+-- DROP+CREATE sidesteps that.
 -- =============================================================================
+
+DROP VIEW IF EXISTS v_pin_candidates        CASCADE;
+DROP VIEW IF EXISTS v_features_with_returns CASCADE;
+DROP VIEW IF EXISTS v_oi_concentration      CASCADE;
+DROP VIEW IF EXISTS v_oi_changes_daily      CASCADE;
+DROP VIEW IF EXISTS v_oi_top_nodes_latest   CASCADE;
+DROP VIEW IF EXISTS v_oi_surface_latest     CASCADE;
 
 -- ---------------------------------------------------------------------------
 -- v_oi_surface_latest
