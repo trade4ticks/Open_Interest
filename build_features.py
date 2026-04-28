@@ -24,7 +24,7 @@ import duckdb
 import pandas as pd
 import psycopg2.extras
 
-from db import get_connection
+from db import get_connection, read_sql_df
 from lib.expirations import build_next_monthly_lookup
 from lib.parquet_store import list_tickers, parquet_glob
 
@@ -326,10 +326,11 @@ CLEAR_SQL  = "DELETE FROM daily_features WHERE ticker = %(ticker)s"
 
 def load_ohlc(conn, ticker: str) -> pd.DataFrame:
     """Pull (trade_date, open, close) for one ticker out of underlying_ohlc."""
-    df = pd.read_sql(
+    df = read_sql_df(
+        conn,
         "SELECT trade_date, open, close FROM underlying_ohlc "
         "WHERE ticker = %(ticker)s ORDER BY trade_date",
-        conn, params={"ticker": ticker},
+        {"ticker": ticker},
     )
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     return df

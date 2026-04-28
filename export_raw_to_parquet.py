@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import logging
 
-import pandas as pd
 from tqdm import tqdm
 
-from db import get_connection
+from db import get_connection, read_sql_df
 from lib.parquet_store import write_year
 
 logging.basicConfig(
@@ -72,7 +71,7 @@ def export_ticker(conn, ticker: str) -> None:
         return
 
     for y in tqdm(years, ncols=90, unit="yr", desc=f"  {ticker}"):
-        df = pd.read_sql(LOAD_YEAR_SQL, conn, params={"ticker": ticker, "year": y})
+        df = read_sql_df(conn, LOAD_YEAR_SQL, {"ticker": ticker, "year": y})
         if df.empty:
             continue
         rows_written = write_year(ticker, y, df)
