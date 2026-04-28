@@ -9,9 +9,8 @@ Reads:
 Writes:
     daily_features                    one row per (ticker, trade_date)
 
-All percentage features use the FULL UNFILTERED raw chain as the denominator
-(no OI_MIN / DTE / moneyness gate). The legacy `option_oi_surface` table is
-no longer used.
+All percentage features use the FULL UNFILTERED raw chain as the denominator.
+The legacy `option_oi_surface` table is no longer used.
 
 Usage:
     python build_features.py
