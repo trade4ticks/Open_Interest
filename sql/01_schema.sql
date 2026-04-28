@@ -154,3 +154,20 @@ CREATE TABLE IF NOT EXISTS daily_features (
 
 CREATE INDEX IF NOT EXISTS daily_features_date_idx
     ON daily_features (trade_date);
+
+-- ---------------------------------------------------------------------------
+-- 5. New feature columns added 2026-04-28 — populated by build_features.py
+--    using the FULL UNFILTERED parquet chain as the denominator.
+-- ---------------------------------------------------------------------------
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_within_5pct                       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_within_10pct                      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_above_spot                        DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_below_spot                        DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS top5_strikes_pct_total_oi                DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS top10_strikes_pct_total_oi               DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS weighted_avg_dte                         DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_0_30d                             DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_31_90d                            DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_91_365d                           DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_next_monthly                      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS oi_weighted_strike_next_monthly_div_spot DOUBLE PRECISION;

@@ -1,19 +1,33 @@
 """
-build_features.py — Recompute the daily_features table from option_oi_surface
-and underlying_ohlc.
+build_features.py — Recompute the daily_features table from the raw parquet
+store and underlying_ohlc, in one pass per ticker.
 
-Cheap to re-run: it truncates daily_features for the affected tickers and
-rebuilds in a single SQL pass.
+Reads:
+    {OI_RAW_DIR}/{ticker}/*.parquet   raw OI rows
+    underlying_ohlc                   daily open/close per ticker (Postgres)
+
+Writes:
+    daily_features                    one row per (ticker, trade_date)
+
+All percentage features use the FULL UNFILTERED raw chain as the denominator
+(no OI_MIN / DTE / moneyness gate). The legacy `option_oi_surface` table is
+no longer used.
 
 Usage:
     python build_features.py
-    (prompts for tickers — leave blank for "all tickers in the surface table")
+    (prompts for tickers — blank = every ticker found in OI_RAW_DIR)
 """
 from __future__ import annotations
 
 import logging
 
+import duckdb
+import pandas as pd
+import psycopg2.extras
+
 from db import get_connection
+from lib.expirations import build_next_monthly_lookup
+from lib.parquet_store import list_tickers, parquet_glob
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,298 +37,412 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# Single-pass rebuild for one ticker. Runs entirely in SQL.
-#
-# Returns the list of trading days driven by underlying_ohlc (so realized vol
-# and forward returns use trading-day spacing, not calendar-day spacing).
-REBUILD_SQL = """
-WITH spot AS (
+# ---------------------------------------------------------------------------
+# OI features (DuckDB on parquet, joined to ohlc DF)
+# Inputs registered by the caller:
+#   oi    view over read_parquet(...)   — raw chain
+#   ohlc  pandas DF [trade_date, close, next_monthly]
+# ---------------------------------------------------------------------------
+OI_FEATURES_SQL = """
+WITH joined AS (
     SELECT
-        ticker,
-        trade_date,
-        open,
-        close,
-        LN(NULLIF(close, 0) / NULLIF(LAG(close) OVER w_t, 0)) AS log_ret
-    FROM underlying_ohlc
-    WHERE ticker = %(ticker)s
-    WINDOW w_t AS (PARTITION BY ticker ORDER BY trade_date)
+        oi.trade_date,
+        oi.expiration,
+        oi.strike,
+        oi.option_type,
+        oi.open_interest,
+        ohlc.close                                       AS spot_close,
+        ohlc.next_monthly                                AS next_monthly,
+        (oi.expiration - oi.trade_date)::INTEGER         AS dte,
+        CASE WHEN ohlc.close > 0
+             THEN oi.strike / ohlc.close - 1.0
+             ELSE NULL END                               AS moneyness
+    FROM oi
+    JOIN ohlc USING (trade_date)
 ),
-spot_lags AS (
+per_day AS (
     SELECT
-        ticker, trade_date, close AS spot_close,
-        STDDEV_SAMP(log_ret) OVER w5
-            * SQRT(252)                                                              AS rv_5d,
-        STDDEV_SAMP(log_ret) OVER w20
-            * SQRT(252)                                                              AS rv_20d,
-        -- close-to-close forward returns
-        (LEAD(close,  1) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_1d_fwd_cc,
-        (LEAD(close,  3) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_3d_fwd_cc,
-        (LEAD(close,  5) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_5d_fwd_cc,
-        (LEAD(close,  7) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_7d_fwd_cc,
-        (LEAD(close, 10) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_10d_fwd_cc,
-        (LEAD(close, 20) OVER w_t) / NULLIF(close, 0) - 1                           AS ret_20d_fwd_cc,
-        -- next-open-to-close[+N] forward returns (entry = open of following day)
-        (LEAD(close,  1) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_1d_fwd_oc,
-        (LEAD(close,  3) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_3d_fwd_oc,
-        (LEAD(close,  5) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_5d_fwd_oc,
-        (LEAD(close,  7) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_7d_fwd_oc,
-        (LEAD(close, 10) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_10d_fwd_oc,
-        (LEAD(close, 20) OVER w_t) / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1         AS ret_20d_fwd_oc
-    FROM spot
-    WINDOW
-        w_t AS (PARTITION BY ticker ORDER BY trade_date),
-        w5  AS (PARTITION BY ticker ORDER BY trade_date
-                ROWS BETWEEN 4  PRECEDING AND CURRENT ROW),
-        w20 AS (PARTITION BY ticker ORDER BY trade_date
-                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
-),
-agg AS (
-    SELECT
-        ticker,
         trade_date,
-        SUM(open_interest)                                                           AS total_oi,
-        SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)              AS call_oi,
-        SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)              AS put_oi,
-        SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END)         AS oi_within_5pct,
-        SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END)         AS oi_within_10pct,
-        SUM(CASE WHEN moneyness > 0 THEN open_interest ELSE 0 END)                  AS oi_above_spot,
-        SUM(CASE WHEN moneyness < 0 THEN open_interest ELSE 0 END)                  AS oi_below_spot,
+        ANY_VALUE(spot_close)                                                          AS spot_close,
+        ANY_VALUE(next_monthly)                                                        AS next_monthly,
+        SUM(open_interest)                                                             AS total_oi,
+        SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)                 AS call_oi,
+        SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)                 AS put_oi,
+        SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END)            AS oi_within_5pct,
+        SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END)            AS oi_within_10pct,
+        SUM(CASE WHEN moneyness > 0 THEN open_interest ELSE 0 END)                     AS oi_above_spot,
+        SUM(CASE WHEN moneyness < 0 THEN open_interest ELSE 0 END)                     AS oi_below_spot,
+        SUM(CASE WHEN dte BETWEEN 0  AND 30  THEN open_interest ELSE 0 END)            AS oi_0_30,
+        SUM(CASE WHEN dte BETWEEN 31 AND 90  THEN open_interest ELSE 0 END)            AS oi_31_90,
+        SUM(CASE WHEN dte BETWEEN 91 AND 365 THEN open_interest ELSE 0 END)            AS oi_91_365,
         -- OI-weighted strikes (all DTE)
-        SUM(strike * open_interest)::DOUBLE PRECISION
-            / NULLIF(SUM(open_interest), 0)                                          AS oi_weighted_strike_all,
-        SUM(CASE WHEN option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
-            / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_call,
-        SUM(CASE WHEN option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
-            / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_put,
+        SUM(strike * open_interest)::DOUBLE
+            / NULLIF(SUM(open_interest), 0)                                            AS oi_weighted_strike_all,
+        SUM(CASE WHEN option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
+            / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0) AS oi_weighted_strike_call,
+        SUM(CASE WHEN option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
+            / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0) AS oi_weighted_strike_put,
         -- OI-weighted strikes (DTE 0-30)
-        SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_all_0_30d,
-        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+                                                                                       AS oi_weighted_strike_all_0_30d,
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_call_0_30d,
-        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+                                                                                       AS oi_weighted_strike_call_0_30d,
+        SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_put_0_30d,
+                                                                                       AS oi_weighted_strike_put_0_30d,
         -- OI-weighted strikes (DTE 31-90)
-        SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_all_31_90d,
-        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+                                                                                       AS oi_weighted_strike_all_31_90d,
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_call_31_90d,
-        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE PRECISION
+                                                                                       AS oi_weighted_strike_call_31_90d,
+        SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                                     AS oi_weighted_strike_put_31_90d
-    FROM option_oi_surface
-    WHERE ticker = %(ticker)s
-    GROUP BY ticker, trade_date
+                                                                                       AS oi_weighted_strike_put_31_90d,
+        SUM(dte * open_interest)::DOUBLE
+            / NULLIF(SUM(open_interest), 0)                                            AS weighted_avg_dte
+    FROM joined
+    GROUP BY trade_date
+),
+strike_agg AS (
+    SELECT trade_date, strike, SUM(open_interest) AS strike_oi
+    FROM joined
+    GROUP BY trade_date, strike
+),
+strike_ranked AS (
+    SELECT trade_date, strike_oi,
+           ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY strike_oi DESC) AS rk
+    FROM strike_agg
+),
+top_strikes AS (
+    SELECT trade_date,
+           SUM(CASE WHEN rk <= 5  THEN strike_oi ELSE 0 END) AS top5_oi,
+           SUM(CASE WHEN rk <= 10 THEN strike_oi ELSE 0 END) AS top10_oi
+    FROM strike_ranked
+    GROUP BY trade_date
+),
+call_strike_agg AS (
+    SELECT trade_date, strike, SUM(open_interest) AS oi
+    FROM joined WHERE option_type = 'C'
+    GROUP BY trade_date, strike
 ),
 max_call AS (
-    SELECT DISTINCT ON (ticker, trade_date)
-        ticker, trade_date, strike AS max_oi_strike_call
-    FROM option_oi_surface
-    WHERE ticker = %(ticker)s AND option_type = 'C'
-    ORDER BY ticker, trade_date, open_interest DESC, strike
+    SELECT trade_date, strike AS max_oi_strike_call
+    FROM (
+        SELECT trade_date, strike,
+               ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY oi DESC, strike) AS rk
+        FROM call_strike_agg
+    ) WHERE rk = 1
+),
+put_strike_agg AS (
+    SELECT trade_date, strike, SUM(open_interest) AS oi
+    FROM joined WHERE option_type = 'P'
+    GROUP BY trade_date, strike
 ),
 max_put AS (
-    SELECT DISTINCT ON (ticker, trade_date)
-        ticker, trade_date, strike AS max_oi_strike_put
-    FROM option_oi_surface
-    WHERE ticker = %(ticker)s AND option_type = 'P'
-    ORDER BY ticker, trade_date, open_interest DESC, strike
+    SELECT trade_date, strike AS max_oi_strike_put
+    FROM (
+        SELECT trade_date, strike,
+               ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY oi DESC, strike) AS rk
+        FROM put_strike_agg
+    ) WHERE rk = 1
 ),
 front_expiry AS (
-    SELECT ticker, trade_date, MIN(expiration) AS front_exp
-    FROM option_oi_surface
-    WHERE ticker = %(ticker)s AND dte >= 0
-    GROUP BY ticker, trade_date
+    SELECT trade_date, MIN(expiration) AS front_exp
+    FROM joined WHERE dte >= 0
+    GROUP BY trade_date
 ),
-front_oi AS (
-    SELECT
-        s.ticker,
-        s.trade_date,
-        SUM(s.open_interest) AS front_total_oi
-    FROM option_oi_surface s
+front_oi_q AS (
+    SELECT j.trade_date, SUM(j.open_interest) AS front_oi
+    FROM joined j
     JOIN front_expiry f
-      ON  f.ticker     = s.ticker
-      AND f.trade_date = s.trade_date
-      AND f.front_exp  = s.expiration
-    GROUP BY s.ticker, s.trade_date
+      ON f.trade_date = j.trade_date AND f.front_exp = j.expiration
+    GROUP BY j.trade_date
+),
+next_monthly_oi AS (
+    SELECT j.trade_date,
+           SUM(j.open_interest)              AS nm_oi,
+           SUM(j.strike * j.open_interest)   AS nm_strike_oi
+    FROM joined j
+    WHERE j.expiration = j.next_monthly
+    GROUP BY j.trade_date
 ),
 oi_lags AS (
     SELECT
-        ticker, trade_date, total_oi,
-        total_oi - LAG(total_oi, 1)  OVER w AS d1_total_oi_change,
-        total_oi - LAG(total_oi, 5)  OVER w AS d5_total_oi_change,
-        total_oi - LAG(total_oi, 20) OVER w AS d20_total_oi_change
-    FROM agg
-    WINDOW w AS (PARTITION BY ticker ORDER BY trade_date)
-)
-INSERT INTO daily_features (
-    ticker, trade_date, spot_close,
-    total_oi, call_oi, put_oi, put_call_oi_ratio,
-    max_oi_strike_call, max_oi_strike_put,
-    oi_weighted_strike_call, oi_weighted_strike_put, oi_weighted_strike_all,
-    oi_weighted_strike_call_minus_spot, oi_weighted_strike_put_minus_spot, oi_weighted_strike_all_minus_spot,
-    oi_weighted_strike_call_div_spot, oi_weighted_strike_put_div_spot, oi_weighted_strike_all_div_spot,
-    oi_within_5pct, oi_within_10pct, pct_oi_in_front_expiry,
-    oi_above_spot, oi_below_spot, oi_above_below_ratio,
-    oi_weighted_strike_all_0_30d, oi_weighted_strike_call_0_30d, oi_weighted_strike_put_0_30d,
-    oi_weighted_strike_all_0_30d_div_spot, oi_weighted_strike_call_0_30d_div_spot, oi_weighted_strike_put_0_30d_div_spot,
-    oi_weighted_strike_all_31_90d, oi_weighted_strike_call_31_90d, oi_weighted_strike_put_31_90d,
-    oi_weighted_strike_all_31_90d_div_spot, oi_weighted_strike_call_31_90d_div_spot, oi_weighted_strike_put_31_90d_div_spot,
-    d1_total_oi_change, d5_total_oi_change, d20_total_oi_change,
-    rv_5d, rv_20d,
-    ret_1d_fwd_cc, ret_3d_fwd_cc, ret_5d_fwd_cc, ret_7d_fwd_cc, ret_10d_fwd_cc, ret_20d_fwd_cc,
-    ret_1d_fwd_oc, ret_3d_fwd_oc, ret_5d_fwd_oc, ret_7d_fwd_oc, ret_10d_fwd_oc, ret_20d_fwd_oc
+        trade_date, total_oi,
+        total_oi - LAG(total_oi, 1)  OVER (ORDER BY trade_date) AS d1_total_oi_change,
+        total_oi - LAG(total_oi, 5)  OVER (ORDER BY trade_date) AS d5_total_oi_change,
+        total_oi - LAG(total_oi, 20) OVER (ORDER BY trade_date) AS d20_total_oi_change
+    FROM per_day
 )
 SELECT
-    a.ticker,
-    a.trade_date,
-    sl.spot_close,
-    a.total_oi,
-    a.call_oi,
-    a.put_oi,
-    a.put_oi::DOUBLE PRECISION / NULLIF(a.call_oi, 0)                AS put_call_oi_ratio,
+    p.trade_date,
+    p.spot_close,
+    p.total_oi,
+    p.call_oi,
+    p.put_oi,
+    p.put_oi::DOUBLE / NULLIF(p.call_oi, 0)                                AS put_call_oi_ratio,
     mc.max_oi_strike_call,
     mp.max_oi_strike_put,
-    a.oi_weighted_strike_call,
-    a.oi_weighted_strike_put,
-    a.oi_weighted_strike_all,
-    a.oi_weighted_strike_call - sl.spot_close                        AS oi_weighted_strike_call_minus_spot,
-    a.oi_weighted_strike_put  - sl.spot_close                        AS oi_weighted_strike_put_minus_spot,
-    a.oi_weighted_strike_all  - sl.spot_close                        AS oi_weighted_strike_all_minus_spot,
-    a.oi_weighted_strike_call / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_call_div_spot,
-    a.oi_weighted_strike_put  / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_put_div_spot,
-    a.oi_weighted_strike_all  / NULLIF(sl.spot_close, 0)             AS oi_weighted_strike_all_div_spot,
-    a.oi_within_5pct,
-    a.oi_within_10pct,
-    fo.front_total_oi::DOUBLE PRECISION / NULLIF(a.total_oi, 0)      AS pct_oi_in_front_expiry,
-    a.oi_above_spot,
-    a.oi_below_spot,
-    a.oi_above_spot::DOUBLE PRECISION / NULLIF(a.oi_below_spot, 0)   AS oi_above_below_ratio,
-    a.oi_weighted_strike_all_0_30d,
-    a.oi_weighted_strike_call_0_30d,
-    a.oi_weighted_strike_put_0_30d,
-    a.oi_weighted_strike_all_0_30d  / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_all_0_30d_div_spot,
-    a.oi_weighted_strike_call_0_30d / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_call_0_30d_div_spot,
-    a.oi_weighted_strike_put_0_30d  / NULLIF(sl.spot_close, 0)       AS oi_weighted_strike_put_0_30d_div_spot,
-    a.oi_weighted_strike_all_31_90d,
-    a.oi_weighted_strike_call_31_90d,
-    a.oi_weighted_strike_put_31_90d,
-    a.oi_weighted_strike_all_31_90d  / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_all_31_90d_div_spot,
-    a.oi_weighted_strike_call_31_90d / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_call_31_90d_div_spot,
-    a.oi_weighted_strike_put_31_90d  / NULLIF(sl.spot_close, 0)      AS oi_weighted_strike_put_31_90d_div_spot,
+    p.oi_weighted_strike_call,
+    p.oi_weighted_strike_put,
+    p.oi_weighted_strike_all,
+    p.oi_weighted_strike_call - p.spot_close                               AS oi_weighted_strike_call_minus_spot,
+    p.oi_weighted_strike_put  - p.spot_close                               AS oi_weighted_strike_put_minus_spot,
+    p.oi_weighted_strike_all  - p.spot_close                               AS oi_weighted_strike_all_minus_spot,
+    p.oi_weighted_strike_call / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_call_div_spot,
+    p.oi_weighted_strike_put  / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_put_div_spot,
+    p.oi_weighted_strike_all  / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_all_div_spot,
+    p.oi_within_5pct,
+    p.oi_within_10pct,
+    fo.front_oi::DOUBLE / NULLIF(p.total_oi, 0)                            AS pct_oi_in_front_expiry,
+    p.oi_above_spot,
+    p.oi_below_spot,
+    p.oi_above_spot::DOUBLE / NULLIF(p.oi_below_spot, 0)                   AS oi_above_below_ratio,
+    p.oi_weighted_strike_all_0_30d,
+    p.oi_weighted_strike_call_0_30d,
+    p.oi_weighted_strike_put_0_30d,
+    p.oi_weighted_strike_all_0_30d  / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_all_0_30d_div_spot,
+    p.oi_weighted_strike_call_0_30d / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_call_0_30d_div_spot,
+    p.oi_weighted_strike_put_0_30d  / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_put_0_30d_div_spot,
+    p.oi_weighted_strike_all_31_90d,
+    p.oi_weighted_strike_call_31_90d,
+    p.oi_weighted_strike_put_31_90d,
+    p.oi_weighted_strike_all_31_90d  / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_all_31_90d_div_spot,
+    p.oi_weighted_strike_call_31_90d / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_call_31_90d_div_spot,
+    p.oi_weighted_strike_put_31_90d  / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_put_31_90d_div_spot,
     ol.d1_total_oi_change,
     ol.d5_total_oi_change,
     ol.d20_total_oi_change,
-    sl.rv_5d,
-    sl.rv_20d,
-    sl.ret_1d_fwd_cc,
-    sl.ret_3d_fwd_cc,
-    sl.ret_5d_fwd_cc,
-    sl.ret_7d_fwd_cc,
-    sl.ret_10d_fwd_cc,
-    sl.ret_20d_fwd_cc,
-    sl.ret_1d_fwd_oc,
-    sl.ret_3d_fwd_oc,
-    sl.ret_5d_fwd_oc,
-    sl.ret_7d_fwd_oc,
-    sl.ret_10d_fwd_oc,
-    sl.ret_20d_fwd_oc
-FROM agg       a
-LEFT JOIN max_call  mc USING (ticker, trade_date)
-LEFT JOIN max_put   mp USING (ticker, trade_date)
-LEFT JOIN front_oi  fo USING (ticker, trade_date)
-LEFT JOIN oi_lags   ol USING (ticker, trade_date)
-LEFT JOIN spot_lags sl USING (ticker, trade_date)
-ON CONFLICT (ticker, trade_date) DO UPDATE SET
-    spot_close                              = EXCLUDED.spot_close,
-    total_oi                                = EXCLUDED.total_oi,
-    call_oi                                 = EXCLUDED.call_oi,
-    put_oi                                  = EXCLUDED.put_oi,
-    put_call_oi_ratio                       = EXCLUDED.put_call_oi_ratio,
-    max_oi_strike_call                      = EXCLUDED.max_oi_strike_call,
-    max_oi_strike_put                       = EXCLUDED.max_oi_strike_put,
-    oi_weighted_strike_call                 = EXCLUDED.oi_weighted_strike_call,
-    oi_weighted_strike_put                  = EXCLUDED.oi_weighted_strike_put,
-    oi_weighted_strike_all                  = EXCLUDED.oi_weighted_strike_all,
-    oi_weighted_strike_call_minus_spot      = EXCLUDED.oi_weighted_strike_call_minus_spot,
-    oi_weighted_strike_put_minus_spot       = EXCLUDED.oi_weighted_strike_put_minus_spot,
-    oi_weighted_strike_all_minus_spot       = EXCLUDED.oi_weighted_strike_all_minus_spot,
-    oi_weighted_strike_call_div_spot        = EXCLUDED.oi_weighted_strike_call_div_spot,
-    oi_weighted_strike_put_div_spot         = EXCLUDED.oi_weighted_strike_put_div_spot,
-    oi_weighted_strike_all_div_spot         = EXCLUDED.oi_weighted_strike_all_div_spot,
-    oi_within_5pct                          = EXCLUDED.oi_within_5pct,
-    oi_within_10pct                         = EXCLUDED.oi_within_10pct,
-    pct_oi_in_front_expiry                  = EXCLUDED.pct_oi_in_front_expiry,
-    oi_above_spot                           = EXCLUDED.oi_above_spot,
-    oi_below_spot                           = EXCLUDED.oi_below_spot,
-    oi_above_below_ratio                    = EXCLUDED.oi_above_below_ratio,
-    oi_weighted_strike_all_0_30d            = EXCLUDED.oi_weighted_strike_all_0_30d,
-    oi_weighted_strike_call_0_30d           = EXCLUDED.oi_weighted_strike_call_0_30d,
-    oi_weighted_strike_put_0_30d            = EXCLUDED.oi_weighted_strike_put_0_30d,
-    oi_weighted_strike_all_0_30d_div_spot   = EXCLUDED.oi_weighted_strike_all_0_30d_div_spot,
-    oi_weighted_strike_call_0_30d_div_spot  = EXCLUDED.oi_weighted_strike_call_0_30d_div_spot,
-    oi_weighted_strike_put_0_30d_div_spot   = EXCLUDED.oi_weighted_strike_put_0_30d_div_spot,
-    oi_weighted_strike_all_31_90d           = EXCLUDED.oi_weighted_strike_all_31_90d,
-    oi_weighted_strike_call_31_90d          = EXCLUDED.oi_weighted_strike_call_31_90d,
-    oi_weighted_strike_put_31_90d           = EXCLUDED.oi_weighted_strike_put_31_90d,
-    oi_weighted_strike_all_31_90d_div_spot  = EXCLUDED.oi_weighted_strike_all_31_90d_div_spot,
-    oi_weighted_strike_call_31_90d_div_spot = EXCLUDED.oi_weighted_strike_call_31_90d_div_spot,
-    oi_weighted_strike_put_31_90d_div_spot  = EXCLUDED.oi_weighted_strike_put_31_90d_div_spot,
-    d1_total_oi_change                      = EXCLUDED.d1_total_oi_change,
-    d5_total_oi_change                      = EXCLUDED.d5_total_oi_change,
-    d20_total_oi_change                     = EXCLUDED.d20_total_oi_change,
-    rv_5d                                   = EXCLUDED.rv_5d,
-    rv_20d                                  = EXCLUDED.rv_20d,
-    ret_1d_fwd_cc                           = EXCLUDED.ret_1d_fwd_cc,
-    ret_3d_fwd_cc                           = EXCLUDED.ret_3d_fwd_cc,
-    ret_5d_fwd_cc                           = EXCLUDED.ret_5d_fwd_cc,
-    ret_7d_fwd_cc                           = EXCLUDED.ret_7d_fwd_cc,
-    ret_10d_fwd_cc                          = EXCLUDED.ret_10d_fwd_cc,
-    ret_20d_fwd_cc                          = EXCLUDED.ret_20d_fwd_cc,
-    ret_1d_fwd_oc                           = EXCLUDED.ret_1d_fwd_oc,
-    ret_3d_fwd_oc                           = EXCLUDED.ret_3d_fwd_oc,
-    ret_5d_fwd_oc                           = EXCLUDED.ret_5d_fwd_oc,
-    ret_7d_fwd_oc                           = EXCLUDED.ret_7d_fwd_oc,
-    ret_10d_fwd_oc                          = EXCLUDED.ret_10d_fwd_oc,
-    ret_20d_fwd_oc                          = EXCLUDED.ret_20d_fwd_oc
+    -- New percentage / aggregate features (full unfiltered chain in denominator)
+    p.oi_within_5pct::DOUBLE  / NULLIF(p.total_oi, 0)                      AS pct_oi_within_5pct,
+    p.oi_within_10pct::DOUBLE / NULLIF(p.total_oi, 0)                      AS pct_oi_within_10pct,
+    p.oi_above_spot::DOUBLE / NULLIF(p.total_oi, 0)                        AS pct_oi_above_spot,
+    p.oi_below_spot::DOUBLE / NULLIF(p.total_oi, 0)                        AS pct_oi_below_spot,
+    ts.top5_oi::DOUBLE  / NULLIF(p.total_oi, 0)                            AS top5_strikes_pct_total_oi,
+    ts.top10_oi::DOUBLE / NULLIF(p.total_oi, 0)                            AS top10_strikes_pct_total_oi,
+    p.weighted_avg_dte,
+    p.oi_0_30::DOUBLE   / NULLIF(p.total_oi, 0)                            AS pct_oi_0_30d,
+    p.oi_31_90::DOUBLE  / NULLIF(p.total_oi, 0)                            AS pct_oi_31_90d,
+    p.oi_91_365::DOUBLE / NULLIF(p.total_oi, 0)                            AS pct_oi_91_365d,
+    nm.nm_oi::DOUBLE / NULLIF(p.total_oi, 0)                               AS pct_oi_next_monthly,
+    nm.nm_strike_oi::DOUBLE
+        / NULLIF(nm.nm_oi, 0)
+        / NULLIF(p.spot_close, 0)                                          AS oi_weighted_strike_next_monthly_div_spot
+FROM per_day p
+LEFT JOIN max_call         mc USING (trade_date)
+LEFT JOIN max_put          mp USING (trade_date)
+LEFT JOIN top_strikes      ts USING (trade_date)
+LEFT JOIN front_oi_q       fo USING (trade_date)
+LEFT JOIN next_monthly_oi  nm USING (trade_date)
+LEFT JOIN oi_lags          ol USING (trade_date)
+ORDER BY p.trade_date
 """
 
-CLEAR_SQL = "DELETE FROM daily_features WHERE ticker = %(ticker)s"
+
+# ---------------------------------------------------------------------------
+# OHLC-derived features (rv, fwd cc/oc returns) — DuckDB on ohlc_full DF
+# Input: ohlc_full pandas DF [trade_date, open, close]
+# ---------------------------------------------------------------------------
+OHLC_FEATURES_SQL = """
+WITH ret AS (
+    SELECT trade_date, open, close,
+           LN(NULLIF(close, 0)
+              / NULLIF(LAG(close) OVER (ORDER BY trade_date), 0)) AS log_ret
+    FROM ohlc_full
+)
+SELECT
+    trade_date,
+    STDDEV_SAMP(log_ret) OVER w5  * SQRT(252)                              AS rv_5d,
+    STDDEV_SAMP(log_ret) OVER w20 * SQRT(252)                              AS rv_20d,
+    -- close-to-close
+    LEAD(close,  1) OVER w_t / NULLIF(close, 0) - 1                        AS ret_1d_fwd_cc,
+    LEAD(close,  3) OVER w_t / NULLIF(close, 0) - 1                        AS ret_3d_fwd_cc,
+    LEAD(close,  5) OVER w_t / NULLIF(close, 0) - 1                        AS ret_5d_fwd_cc,
+    LEAD(close,  7) OVER w_t / NULLIF(close, 0) - 1                        AS ret_7d_fwd_cc,
+    LEAD(close, 10) OVER w_t / NULLIF(close, 0) - 1                        AS ret_10d_fwd_cc,
+    LEAD(close, 20) OVER w_t / NULLIF(close, 0) - 1                        AS ret_20d_fwd_cc,
+    -- next-open-to-close[+N] (entry = open of following day; OI is released ~6:30am ET)
+    LEAD(close,  1) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_1d_fwd_oc,
+    LEAD(close,  3) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_3d_fwd_oc,
+    LEAD(close,  5) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_5d_fwd_oc,
+    LEAD(close,  7) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_7d_fwd_oc,
+    LEAD(close, 10) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_10d_fwd_oc,
+    LEAD(close, 20) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_20d_fwd_oc
+FROM ret
+WINDOW
+    w_t AS (ORDER BY trade_date),
+    w5  AS (ORDER BY trade_date ROWS BETWEEN 4  PRECEDING AND CURRENT ROW),
+    w20 AS (ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+"""
 
 
-def prompt_tickers(conn) -> list[str]:
+# ---------------------------------------------------------------------------
+# Postgres write
+# ---------------------------------------------------------------------------
+INSERT_COLS = [
+    "ticker", "trade_date", "spot_close",
+    "total_oi", "call_oi", "put_oi", "put_call_oi_ratio",
+    "max_oi_strike_call", "max_oi_strike_put",
+    "oi_weighted_strike_call", "oi_weighted_strike_put", "oi_weighted_strike_all",
+    "oi_weighted_strike_call_minus_spot", "oi_weighted_strike_put_minus_spot",
+    "oi_weighted_strike_all_minus_spot",
+    "oi_weighted_strike_call_div_spot", "oi_weighted_strike_put_div_spot",
+    "oi_weighted_strike_all_div_spot",
+    "oi_within_5pct", "oi_within_10pct", "pct_oi_in_front_expiry",
+    "oi_above_spot", "oi_below_spot", "oi_above_below_ratio",
+    "oi_weighted_strike_all_0_30d", "oi_weighted_strike_call_0_30d",
+    "oi_weighted_strike_put_0_30d",
+    "oi_weighted_strike_all_0_30d_div_spot", "oi_weighted_strike_call_0_30d_div_spot",
+    "oi_weighted_strike_put_0_30d_div_spot",
+    "oi_weighted_strike_all_31_90d", "oi_weighted_strike_call_31_90d",
+    "oi_weighted_strike_put_31_90d",
+    "oi_weighted_strike_all_31_90d_div_spot", "oi_weighted_strike_call_31_90d_div_spot",
+    "oi_weighted_strike_put_31_90d_div_spot",
+    "d1_total_oi_change", "d5_total_oi_change", "d20_total_oi_change",
+    "rv_5d", "rv_20d",
+    "ret_1d_fwd_cc", "ret_3d_fwd_cc", "ret_5d_fwd_cc",
+    "ret_7d_fwd_cc", "ret_10d_fwd_cc", "ret_20d_fwd_cc",
+    "ret_1d_fwd_oc", "ret_3d_fwd_oc", "ret_5d_fwd_oc",
+    "ret_7d_fwd_oc", "ret_10d_fwd_oc", "ret_20d_fwd_oc",
+    # new
+    "pct_oi_within_5pct", "pct_oi_within_10pct",
+    "pct_oi_above_spot", "pct_oi_below_spot",
+    "top5_strikes_pct_total_oi", "top10_strikes_pct_total_oi",
+    "weighted_avg_dte",
+    "pct_oi_0_30d", "pct_oi_31_90d", "pct_oi_91_365d",
+    "pct_oi_next_monthly", "oi_weighted_strike_next_monthly_div_spot",
+]
+
+INSERT_SQL = f"INSERT INTO daily_features ({', '.join(INSERT_COLS)}) VALUES %s"
+CLEAR_SQL  = "DELETE FROM daily_features WHERE ticker = %(ticker)s"
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker pipeline
+# ---------------------------------------------------------------------------
+
+def load_ohlc(conn, ticker: str) -> pd.DataFrame:
+    """Pull (trade_date, open, close) for one ticker out of underlying_ohlc."""
+    df = pd.read_sql(
+        "SELECT trade_date, open, close FROM underlying_ohlc "
+        "WHERE ticker = %(ticker)s ORDER BY trade_date",
+        conn, params={"ticker": ticker},
+    )
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    return df
+
+
+def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,
+                                    ticker: str) -> set:
+    rows = con.execute(
+        f"SELECT DISTINCT expiration FROM read_parquet('{parquet_glob(ticker)}')"
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def build_for_ticker(pg_conn, ticker: str) -> int:
+    log.info("--- %s ---", ticker)
+
+    ohlc = load_ohlc(pg_conn, ticker)
+    if ohlc.empty:
+        log.warning("  no OHLC for %s — skipping (run fetch_ohlc.py first)", ticker)
+        return 0
+
+    con = duckdb.connect(database=":memory:")
+
+    listed = listed_expirations_from_parquet(con, ticker)
+    if not listed:
+        log.warning("  no parquet rows for %s — skipping", ticker)
+        con.close()
+        return 0
+
+    nm_lookup = build_next_monthly_lookup(ohlc["trade_date"].tolist(), listed)
+    ohlc["next_monthly"] = ohlc["trade_date"].map(nm_lookup)
+
+    con.register("ohlc",      ohlc[["trade_date", "close", "next_monthly"]])
+    con.register("ohlc_full", ohlc[["trade_date", "open", "close"]])
+    con.execute(
+        f"CREATE OR REPLACE VIEW oi AS "
+        f"SELECT * FROM read_parquet('{parquet_glob(ticker)}')"
+    )
+
+    log.info("  computing OI features ...")
+    oi_feats = con.execute(OI_FEATURES_SQL).df()
+    log.info("  computing OHLC features ...")
+    ohlc_feats = con.execute(OHLC_FEATURES_SQL).df()
+    con.close()
+
+    if oi_feats.empty:
+        log.warning("  no OI/OHLC overlap for %s — skipping", ticker)
+        return 0
+
+    feats = oi_feats.merge(ohlc_feats, on="trade_date", how="left")
+    feats.insert(0, "ticker", ticker)
+
+    rows = [
+        tuple(_pgify(r.get(c)) for c in INSERT_COLS)
+        for r in feats.to_dict(orient="records")
+    ]
+
+    with pg_conn.cursor() as cur:
+        cur.execute(CLEAR_SQL, {"ticker": ticker})
+        psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+    pg_conn.commit()
+
+    log.info("  wrote %d rows to daily_features", len(rows))
+    return len(rows)
+
+
+def _pgify(v):
+    """numpy/pandas → native; NaN/NaT → None."""
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return None if v != v else v
+    try:
+        import numpy as np
+        if isinstance(v, np.floating):
+            f = float(v)
+            return None if f != f else f
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.bool_):
+            return bool(v)
+    except Exception:
+        pass
+    if pd.isna(v):
+        return None
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def prompt_tickers() -> list[str]:
     raw = input(
-        "Tickers (comma-separated; blank = all tickers in option_oi_surface): "
+        "Tickers (comma-separated; blank = all tickers in OI_RAW_DIR): "
     ).strip()
     if raw:
         return [t.strip().upper() for t in raw.split(",") if t.strip()]
-    with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT ticker FROM option_oi_surface ORDER BY ticker")
-        return [r[0] for r in cur.fetchall()]
+    return list_tickers()
 
 
 def main() -> None:
-    print("=== OI_Research — Build daily_features ===\n")
-    with get_connection() as conn:
-        tickers = prompt_tickers(conn)
-        if not tickers:
-            print("No tickers found in option_oi_surface — nothing to do.")
-            return
-        print(f"\nRebuilding features for: {', '.join(tickers)}\n")
+    print("=== OI_Research — Build daily_features (parquet → Postgres) ===\n")
+    tickers = prompt_tickers()
+    if not tickers:
+        print("No tickers in OI_RAW_DIR — run fetch_oi.py first.")
+        return
+    print(f"\nRebuilding features for: {', '.join(tickers)}\n")
 
-        with conn.cursor() as cur:
-            for t in tickers:
-                log.info("  %s ...", t)
-                cur.execute(CLEAR_SQL,   {"ticker": t})
-                cur.execute(REBUILD_SQL, {"ticker": t})
-                log.info("    %d rows", cur.rowcount)
-        conn.commit()
+    with get_connection() as conn:
+        for t in tickers:
+            build_for_ticker(conn, t)
     print("\nDone.")
 
 

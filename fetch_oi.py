@@ -1,7 +1,6 @@
 """
 fetch_oi.py — Pull daily Open Interest for one or more tickers from
-ThetaData and upsert into option_oi_raw, then rebuild option_oi_surface
-for the affected dates.
+ThetaData and write to parquet at {OI_RAW_DIR}/{ticker}/{year}.parquet.
 
 Usage:
     python fetch_oi.py
@@ -14,10 +13,14 @@ For each (ticker, trading_day) we make ONE HTTP call:
     /v3/option/history/open_interest?symbol=TICK&expiration=*&date=YYYYMMDD
 
 That returns the entire OI chain (every strike of every active expiration)
-for the ticker on that day. We then bulk-upsert into option_oi_raw and
-rebuild option_oi_surface for the touched dates.
+for the ticker on that day. Rows are accumulated in memory per ticker, then
+written to parquet split by year. The parquet writer dedupes on
+(trade_date, expiration, strike, option_type) so re-running a date range is
+safe and overwrites any prior values for the same contract on the same day.
 
-Resume-safe: re-running over the same range just re-upserts identical rows.
+The Postgres `option_oi_raw` and `option_oi_surface` tables are no longer
+populated by this script — derived metrics in `daily_features` are now
+computed directly from the parquet store by `build_features.py`.
 """
 from __future__ import annotations
 
@@ -25,12 +28,11 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
-import psycopg2.extras
+import pandas as pd
 from tqdm import tqdm
 
-from config import OI_MAX_DTE, OI_MAX_MONEYNESS, OI_MIN
-from db import get_connection
 from lib.market_hours import get_trading_days, last_trading_day
+from lib.parquet_store import write_rows
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
@@ -46,44 +48,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 MAX_WORKERS = 6
-
-UPSERT_RAW_SQL = """
-INSERT INTO option_oi_raw
-    (ticker, trade_date, expiration, strike, option_type, open_interest)
-VALUES %s
-ON CONFLICT (ticker, trade_date, expiration, strike, option_type) DO UPDATE SET
-    open_interest = EXCLUDED.open_interest
-"""
-
-# Rebuild the surface for one (ticker, trade_date) by deleting and reinserting.
-REBUILD_SURFACE_SQL = """
-DELETE FROM option_oi_surface
- WHERE ticker = %(ticker)s AND trade_date = %(trade_date)s;
-
-INSERT INTO option_oi_surface
-    (ticker, trade_date, expiration, dte, strike, option_type, open_interest,
-     spot_close, moneyness)
-SELECT
-    r.ticker,
-    r.trade_date,
-    r.expiration,
-    (r.expiration - r.trade_date)::INTEGER                  AS dte,
-    r.strike,
-    r.option_type,
-    r.open_interest,
-    o.close                                                 AS spot_close,
-    (r.strike / o.close) - 1.0                              AS moneyness
-FROM option_oi_raw r
-JOIN underlying_ohlc o
-  ON  o.ticker     = r.ticker
-  AND o.trade_date = r.trade_date
-WHERE r.ticker     = %(ticker)s
-  AND r.trade_date = %(trade_date)s
-  AND r.open_interest >= %(oi_min)s
-  AND (r.expiration - r.trade_date) BETWEEN 0 AND %(max_dte)s
-  AND ABS((r.strike / o.close) - 1.0) <= %(max_moneyness)s
-  AND o.close IS NOT NULL AND o.close > 0;
-"""
 
 
 # --- Prompts ---------------------------------------------------------------
@@ -107,39 +71,52 @@ def prompt_date(label: str) -> date:
 
 # --- Per-ticker pipeline ---------------------------------------------------
 
-def _fetch_one_day(ticker: str, day: date) -> list[tuple]:
-    """Return upsert-ready rows for one (ticker, trading_day)."""
+def _fetch_one_day(ticker: str, day: date) -> pd.DataFrame:
+    """
+    Return a DataFrame of OI rows for one (ticker, day) — empty on no data.
+    Dedupes on (expiration, strike, option_type) by SUMMING open_interest;
+    warns if dupes were seen (ThetaData has been observed to occasionally
+    return repeated rows in a single response — see commit da8ddda).
+    """
     df = fetch_oi_day(ticker, day)
     if df.empty:
-        return []
+        return df
 
-    seen: dict[tuple, int] = {}
-    for r in df.itertuples(index=False):
-        key = (ticker, day, r.expiration, float(r.strike), r.option_type)
-        seen[key] = seen.get(key, 0) + int(r.open_interest)
+    # Pin trade_date to the requested day (response carries it back, but we
+    # already know what we asked for).
+    df = df.copy()
+    df["trade_date"] = day
+    df = df[["trade_date", "expiration", "strike", "option_type", "open_interest"]]
 
     n_raw = len(df)
-    n_deduped = len(seen)
-    if n_deduped < n_raw:
-        log.warning("  DEDUP   %s %s: %d → %d rows (%d dupes removed)",
-                    ticker, day, n_raw, n_deduped, n_raw - n_deduped)
+    df = (
+        df.groupby(["trade_date", "expiration", "strike", "option_type"], as_index=False)
+          ["open_interest"].sum()
+    )
+    n_dedup = len(df)
+    if n_dedup < n_raw:
+        log.warning("  DEDUP   %s %s: %d → %d rows (%d dupes summed)",
+                    ticker, day, n_raw, n_dedup, n_raw - n_dedup)
 
-    return [(*key, oi) for key, oi in seen.items()]
+    return df
 
 
-def fetch_ticker(conn, ticker: str, trading_days: list[date]) -> set[date]:
-    """Returns the set of trade_dates that received any rows."""
-    touched: set[date] = set()
+def fetch_ticker(ticker: str, trading_days: list[date]) -> int:
+    """
+    Fetch every trading_day for one ticker in parallel, then write one
+    parquet merge per year touched. Returns total rows written this run.
+    """
+    frames: list[pd.DataFrame] = []
     failures: list[date] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_one_day, ticker, d): d for d in trading_days}
         with tqdm(total=len(futures), unit="day", ncols=90,
-                  desc=f"  {ticker}") as bar:
+                  desc=f"  {ticker} fetch") as bar:
             for fut in as_completed(futures):
                 d = futures[fut]
                 try:
-                    rows = fut.result()
+                    df = fut.result()
                 except (TerminalTimeoutError, TerminalServerError) as exc:
                     failures.append(d)
                     log.warning("  TIMEOUT %s %s: %s", ticker, d, exc)
@@ -151,51 +128,30 @@ def fetch_ticker(conn, ticker: str, trading_days: list[date]) -> set[date]:
                     bar.update(1)
                     continue
 
-                if rows:
-                    with conn.cursor() as cur:
-                        psycopg2.extras.execute_values(
-                            cur, UPSERT_RAW_SQL, rows, page_size=2000
-                        )
-                    conn.commit()
-                    touched.add(d)
-                    bar.set_postfix_str(f"{d} ({len(rows)}r)")
+                if not df.empty:
+                    frames.append(df)
+                    bar.set_postfix_str(f"{d} ({len(df)}r)")
                 bar.update(1)
 
     if failures:
         log.warning("  %d days failed for %s: re-run to retry.",
                     len(failures), ticker)
-    return touched
 
-
-# --- Surface rebuild -------------------------------------------------------
-
-def rebuild_surface(conn, ticker: str, trade_dates: set[date]) -> int:
-    if not trade_dates:
+    if not frames:
         return 0
-    params_list = [
-        {
-            "ticker":        ticker,
-            "trade_date":    d,
-            "oi_min":        OI_MIN,
-            "max_dte":       OI_MAX_DTE,
-            "max_moneyness": OI_MAX_MONEYNESS,
-        }
-        for d in sorted(trade_dates)
-    ]
-    n = 0
-    with conn.cursor() as cur:
-        for params in tqdm(params_list, ncols=90, unit="day",
-                           desc=f"  rebuild {ticker}"):
-            cur.execute(REBUILD_SURFACE_SQL, params)
-            n += 1
-    conn.commit()
-    return n
+
+    combined = pd.concat(frames, ignore_index=True)
+    log.info("  %s: merging %d rows into parquet ...", ticker, len(combined))
+    by_year = write_rows(ticker, combined)
+    for y, n in sorted(by_year.items()):
+        log.info("    %s/%d.parquet → %d rows total", ticker, y, n)
+    return len(combined)
 
 
 # --- Main ------------------------------------------------------------------
 
 def main() -> None:
-    print("=== OI_Research — ThetaData OI fetch ===\n")
+    print("=== OI_Research — ThetaData OI fetch (parquet) ===\n")
     tickers = prompt_tickers()
     start   = prompt_date("Start date")
     end     = prompt_date("End   date")
@@ -218,15 +174,9 @@ def main() -> None:
         raise SystemExit("FAILED — terminal not reachable.")
     print("OK")
 
-    with get_connection() as conn:
-        for t in tickers:
-            print(f"\n--- {t} ---")
-            touched = fetch_ticker(conn, t, trading_days)
-            if touched:
-                rebuild_surface(conn, t, touched)
-                print(f"  surface rebuilt for {len(touched)} trade dates")
-            else:
-                print("  no data fetched")
+    for t in tickers:
+        print(f"\n--- {t} ---")
+        fetch_ticker(t, trading_days)
 
     print("\nDone. Run build_features.py next to refresh daily_features.")
 
