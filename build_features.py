@@ -59,7 +59,7 @@ WITH joined AS (
     FROM oi
     JOIN ohlc USING (trade_date)
 ),
-per_day AS (
+per_day_agg AS (
     SELECT
         trade_date,
         ANY_VALUE(spot_close)                                                          AS spot_close,
@@ -105,6 +105,16 @@ per_day AS (
             / NULLIF(SUM(open_interest), 0)                                            AS weighted_avg_dte
     FROM joined
     GROUP BY trade_date
+),
+-- Layer derived ratios on top of the GROUP BY so the windowing CTEs below
+-- can LAG / window over them (DuckDB can't do that inside an aggregating SELECT).
+per_day AS (
+    SELECT
+        a.*,
+        a.put_oi::DOUBLE       / NULLIF(a.call_oi, 0)        AS put_call_oi_ratio,
+        a.oi_above_spot::DOUBLE / NULLIF(a.oi_below_spot, 0) AS oi_above_below_ratio,
+        a.oi_weighted_strike_all / NULLIF(a.spot_close, 0)   AS oi_weighted_strike_all_div_spot
+    FROM per_day_agg a
 ),
 strike_agg AS (
     SELECT trade_date, strike, SUM(open_interest) AS strike_oi
@@ -171,11 +181,46 @@ next_monthly_oi AS (
 ),
 oi_lags AS (
     SELECT
-        trade_date, total_oi,
-        total_oi - LAG(total_oi, 1)  OVER (ORDER BY trade_date) AS d1_total_oi_change,
-        total_oi - LAG(total_oi, 5)  OVER (ORDER BY trade_date) AS d5_total_oi_change,
-        total_oi - LAG(total_oi, 20) OVER (ORDER BY trade_date) AS d20_total_oi_change
+        trade_date,
+        total_oi,
+        -- Existing absolute changes
+        total_oi - LAG(total_oi, 1)  OVER w_t                                AS d1_total_oi_change,
+        total_oi - LAG(total_oi, 5)  OVER w_t                                AS d5_total_oi_change,
+        total_oi - LAG(total_oi, 20) OVER w_t                                AS d20_total_oi_change,
+        -- New pct changes
+        (total_oi - LAG(total_oi, 1) OVER w_t)::DOUBLE
+            / NULLIF(LAG(total_oi, 1) OVER w_t, 0)                           AS d1_total_oi_pct_change,
+        (total_oi - LAG(total_oi, 5) OVER w_t)::DOUBLE
+            / NULLIF(LAG(total_oi, 5) OVER w_t, 0)                           AS d5_total_oi_pct_change,
+        -- New d1/d5 changes of derived ratios
+        oi_weighted_strike_all_div_spot
+            - LAG(oi_weighted_strike_all_div_spot, 1) OVER w_t               AS d1_oi_weighted_strike_all_div_spot_change,
+        oi_weighted_strike_all_div_spot
+            - LAG(oi_weighted_strike_all_div_spot, 5) OVER w_t               AS d5_oi_weighted_strike_all_div_spot_change,
+        put_call_oi_ratio - LAG(put_call_oi_ratio, 1) OVER w_t               AS d1_put_call_oi_ratio_change,
+        put_call_oi_ratio - LAG(put_call_oi_ratio, 5) OVER w_t               AS d5_put_call_oi_ratio_change
     FROM per_day
+    WINDOW w_t AS (ORDER BY trade_date)
+),
+-- 90-trading-day z-scores and the d1/d5 pct-change ratio.
+-- Joined back to per_day so we can z-score the derived ratios in the same pass.
+oi_zscores AS (
+    SELECT
+        trade_date,
+        d1_total_oi_pct_change / NULLIF(d5_total_oi_pct_change, 0)                  AS d1_d5_ratio_total_oi_pct_change,
+        (d1_total_oi_change - AVG(d1_total_oi_change) OVER w90)
+            / NULLIF(STDDEV_SAMP(d1_total_oi_change) OVER w90, 0)                   AS zscore_d1_oi_change_3m,
+        (d5_total_oi_change - AVG(d5_total_oi_change) OVER w90)
+            / NULLIF(STDDEV_SAMP(d5_total_oi_change) OVER w90, 0)                   AS zscore_d5_oi_change_3m,
+        (oi_weighted_strike_all_div_spot - AVG(oi_weighted_strike_all_div_spot) OVER w90)
+            / NULLIF(STDDEV_SAMP(oi_weighted_strike_all_div_spot) OVER w90, 0)
+                                                                                    AS zscore_oi_weighted_strike_all_div_spot_3m,
+        (put_call_oi_ratio - AVG(put_call_oi_ratio) OVER w90)
+            / NULLIF(STDDEV_SAMP(put_call_oi_ratio) OVER w90, 0)                    AS zscore_put_call_oi_ratio_3m,
+        (oi_above_below_ratio - AVG(oi_above_below_ratio) OVER w90)
+            / NULLIF(STDDEV_SAMP(oi_above_below_ratio) OVER w90, 0)                 AS zscore_oi_above_below_ratio_3m
+    FROM oi_lags JOIN per_day USING (trade_date)
+    WINDOW w90 AS (ORDER BY trade_date ROWS BETWEEN 89 PRECEDING AND CURRENT ROW)
 )
 SELECT
     p.trade_date,
@@ -230,7 +275,20 @@ SELECT
     nm.nm_oi::DOUBLE / NULLIF(p.total_oi, 0)                               AS pct_oi_next_monthly,
     nm.nm_strike_oi::DOUBLE
         / NULLIF(nm.nm_oi, 0)
-        / NULLIF(p.spot_close, 0)                                          AS oi_weighted_strike_next_monthly_div_spot
+        / NULLIF(p.spot_close, 0)                                          AS oi_weighted_strike_next_monthly_div_spot,
+    -- 2026-04-28 — pct changes / derived-ratio changes / 90-day z-scores
+    ol.d1_total_oi_pct_change,
+    ol.d5_total_oi_pct_change,
+    z.d1_d5_ratio_total_oi_pct_change,
+    ol.d1_oi_weighted_strike_all_div_spot_change,
+    ol.d5_oi_weighted_strike_all_div_spot_change,
+    ol.d1_put_call_oi_ratio_change,
+    ol.d5_put_call_oi_ratio_change,
+    z.zscore_d1_oi_change_3m,
+    z.zscore_d5_oi_change_3m,
+    z.zscore_oi_weighted_strike_all_div_spot_3m,
+    z.zscore_put_call_oi_ratio_3m,
+    z.zscore_oi_above_below_ratio_3m
 FROM per_day p
 LEFT JOIN max_call         mc USING (trade_date)
 LEFT JOIN max_put          mp USING (trade_date)
@@ -238,13 +296,19 @@ LEFT JOIN top_strikes      ts USING (trade_date)
 LEFT JOIN front_oi_q       fo USING (trade_date)
 LEFT JOIN next_monthly_oi  nm USING (trade_date)
 LEFT JOIN oi_lags          ol USING (trade_date)
+LEFT JOIN oi_zscores       z  USING (trade_date)
 ORDER BY p.trade_date
 """
 
 
 # ---------------------------------------------------------------------------
-# OHLC-derived features (rv, fwd cc/oc returns) — DuckDB on ohlc_full DF
+# OHLC-derived features (rv, fwd oc returns) — DuckDB on ohlc_full DF
 # Input: ohlc_full pandas DF [trade_date, open, close]
+#
+# Forward returns: entry = open of trade_date (OI for trade_date is published
+# overnight and visible on broker platforms when the market opens), exit =
+# close of trade_date + (N-1). So ret_1d is intraday open-to-close on
+# trade_date itself, ret_3d is from trade_date open to close[+2], etc.
 # ---------------------------------------------------------------------------
 OHLC_FEATURES_SQL = """
 WITH ret AS (
@@ -257,20 +321,12 @@ SELECT
     trade_date,
     STDDEV_SAMP(log_ret) OVER w5  * SQRT(252)                              AS rv_5d,
     STDDEV_SAMP(log_ret) OVER w20 * SQRT(252)                              AS rv_20d,
-    -- close-to-close
-    LEAD(close,  1) OVER w_t / NULLIF(close, 0) - 1                        AS ret_1d_fwd_cc,
-    LEAD(close,  3) OVER w_t / NULLIF(close, 0) - 1                        AS ret_3d_fwd_cc,
-    LEAD(close,  5) OVER w_t / NULLIF(close, 0) - 1                        AS ret_5d_fwd_cc,
-    LEAD(close,  7) OVER w_t / NULLIF(close, 0) - 1                        AS ret_7d_fwd_cc,
-    LEAD(close, 10) OVER w_t / NULLIF(close, 0) - 1                        AS ret_10d_fwd_cc,
-    LEAD(close, 20) OVER w_t / NULLIF(close, 0) - 1                        AS ret_20d_fwd_cc,
-    -- next-open-to-close[+N] (entry = open of following day; OI is released ~6:30am ET)
-    LEAD(close,  1) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_1d_fwd_oc,
-    LEAD(close,  3) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_3d_fwd_oc,
-    LEAD(close,  5) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_5d_fwd_oc,
-    LEAD(close,  7) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_7d_fwd_oc,
-    LEAD(close, 10) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_10d_fwd_oc,
-    LEAD(close, 20) OVER w_t / NULLIF(LEAD(open, 1) OVER w_t, 0) - 1       AS ret_20d_fwd_oc
+    close                         / NULLIF(open, 0) - 1                    AS ret_1d_fwd_oc,
+    LEAD(close,  2) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_3d_fwd_oc,
+    LEAD(close,  4) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_5d_fwd_oc,
+    LEAD(close,  6) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_7d_fwd_oc,
+    LEAD(close,  9) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_10d_fwd_oc,
+    LEAD(close, 19) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_20d_fwd_oc
 FROM ret
 WINDOW
     w_t AS (ORDER BY trade_date),
@@ -303,17 +359,24 @@ INSERT_COLS = [
     "oi_weighted_strike_put_31_90d_div_spot",
     "d1_total_oi_change", "d5_total_oi_change", "d20_total_oi_change",
     "rv_5d", "rv_20d",
-    "ret_1d_fwd_cc", "ret_3d_fwd_cc", "ret_5d_fwd_cc",
-    "ret_7d_fwd_cc", "ret_10d_fwd_cc", "ret_20d_fwd_cc",
     "ret_1d_fwd_oc", "ret_3d_fwd_oc", "ret_5d_fwd_oc",
     "ret_7d_fwd_oc", "ret_10d_fwd_oc", "ret_20d_fwd_oc",
-    # new
     "pct_oi_within_5pct", "pct_oi_within_10pct",
     "pct_oi_above_spot", "pct_oi_below_spot",
     "top5_strikes_pct_total_oi", "top10_strikes_pct_total_oi",
     "weighted_avg_dte",
     "pct_oi_0_30d", "pct_oi_31_90d", "pct_oi_91_365d",
     "pct_oi_next_monthly", "oi_weighted_strike_next_monthly_div_spot",
+    # 2026-04-28 — pct changes / derived-ratio changes / 90-day z-scores
+    "d1_total_oi_pct_change", "d5_total_oi_pct_change",
+    "d1_d5_ratio_total_oi_pct_change",
+    "d1_oi_weighted_strike_all_div_spot_change",
+    "d5_oi_weighted_strike_all_div_spot_change",
+    "d1_put_call_oi_ratio_change", "d5_put_call_oi_ratio_change",
+    "zscore_d1_oi_change_3m", "zscore_d5_oi_change_3m",
+    "zscore_oi_weighted_strike_all_div_spot_3m",
+    "zscore_put_call_oi_ratio_3m",
+    "zscore_oi_above_below_ratio_3m",
 ]
 
 INSERT_SQL = f"INSERT INTO daily_features ({', '.join(INSERT_COLS)}) VALUES %s"

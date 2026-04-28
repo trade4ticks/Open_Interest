@@ -133,15 +133,9 @@ CREATE TABLE IF NOT EXISTS daily_features (
     rv_5d                   DOUBLE PRECISION,
     rv_20d                  DOUBLE PRECISION,
 
-    -- close-to-close forward returns
-    ret_1d_fwd_cc           DOUBLE PRECISION,
-    ret_3d_fwd_cc           DOUBLE PRECISION,
-    ret_5d_fwd_cc           DOUBLE PRECISION,
-    ret_7d_fwd_cc           DOUBLE PRECISION,
-    ret_10d_fwd_cc          DOUBLE PRECISION,
-    ret_20d_fwd_cc          DOUBLE PRECISION,
-
-    -- next-open-to-close[+N] forward returns
+    -- forward returns: entry = open of trade_date, exit = close of trade_date+(N-1).
+    -- (OI is published overnight and visible on broker platforms when the market
+    -- opens on trade_date, so the realistic entry is that day's open.)
     ret_1d_fwd_oc           DOUBLE PRECISION,
     ret_3d_fwd_oc           DOUBLE PRECISION,
     ret_5d_fwd_oc           DOUBLE PRECISION,
@@ -171,3 +165,30 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_31_90d               
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_91_365d                           DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_oi_next_monthly                      DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS oi_weighted_strike_next_monthly_div_spot DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- 6. Forward-return semantics change + lag/zscore feature additions (2026-04-28)
+--    OI for trade_date is visible on broker platforms when the market opens
+--    that morning, so the realistic entry price is open[trade_date], not the
+--    next day's open. Drop the close-to-close columns (no longer meaningful).
+-- ---------------------------------------------------------------------------
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_1d_fwd_cc;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_3d_fwd_cc;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_5d_fwd_cc;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_7d_fwd_cc;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_10d_fwd_cc;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_20d_fwd_cc;
+
+-- Pct-change / derived-ratio change / 90-day z-score features.
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_total_oi_pct_change                       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d5_total_oi_pct_change                       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_d5_ratio_total_oi_pct_change              DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_oi_weighted_strike_all_div_spot_change    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d5_oi_weighted_strike_all_div_spot_change    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_put_call_oi_ratio_change                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d5_put_call_oi_ratio_change                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_d1_oi_change_3m                       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_d5_oi_change_3m                       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_oi_weighted_strike_all_div_spot_3m    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_put_call_oi_ratio_3m                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m               DOUBLE PRECISION;

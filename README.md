@@ -92,16 +92,29 @@ OI aggregates (full unfiltered chain):
 
 OHLC-derived:
 `rv_5d`, `rv_20d`,
-`ret_{1,3,5,7,10,20}d_fwd_cc`,
-`ret_{1,3,5,7,10,20}d_fwd_oc` (entry = next-day open since OI is released ~6:30am ET).
+`ret_{1,3,5,7,10,20}d_fwd_oc` — entry = open of `trade_date`, exit = close
+of `trade_date + (N-1)`. (OI for `trade_date` is published overnight and
+visible on broker platforms when the market opens, so the realistic entry
+is that day's open. `ret_1d_fwd_oc` is therefore the intraday open-to-close
+on `trade_date` itself.)
 
-New percentage / aggregate features (denominator = full unfiltered chain):
+Percentage / aggregate features (denominator = full unfiltered chain):
 `pct_oi_within_5pct`, `pct_oi_within_10pct`,
 `pct_oi_above_spot`, `pct_oi_below_spot`,
 `top5_strikes_pct_total_oi`, `top10_strikes_pct_total_oi`,
 `weighted_avg_dte`,
 `pct_oi_0_30d`, `pct_oi_31_90d`, `pct_oi_91_365d`,
 `pct_oi_next_monthly`, `oi_weighted_strike_next_monthly_div_spot`.
+
+Pct changes / derived-ratio changes / 90-trading-day z-scores:
+`d1_total_oi_pct_change`, `d5_total_oi_pct_change`,
+`d1_d5_ratio_total_oi_pct_change`,
+`d1_oi_weighted_strike_all_div_spot_change`, `d5_oi_weighted_strike_all_div_spot_change`,
+`d1_put_call_oi_ratio_change`, `d5_put_call_oi_ratio_change`,
+`zscore_d1_oi_change_3m`, `zscore_d5_oi_change_3m`,
+`zscore_oi_weighted_strike_all_div_spot_3m`,
+`zscore_put_call_oi_ratio_3m`,
+`zscore_oi_above_below_ratio_3m`.
 
 Top-N strikes aggregate OI **across all expirations** at each strike level
 (matches the "price magnet" reading). "Next monthly" is the next 3rd-Friday
