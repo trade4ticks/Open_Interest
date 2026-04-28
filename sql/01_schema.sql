@@ -172,12 +172,14 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS oi_weighted_strike_next_mont
 --    that morning, so the realistic entry price is open[trade_date], not the
 --    next day's open. Drop the close-to-close columns (no longer meaningful).
 -- ---------------------------------------------------------------------------
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_1d_fwd_cc;
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_3d_fwd_cc;
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_5d_fwd_cc;
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_7d_fwd_cc;
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_10d_fwd_cc;
-ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_20d_fwd_cc;
+-- CASCADE because v_features_with_returns (SELECT f.* from daily_features) holds
+-- references to these columns. 02_views.sql recreates the view immediately after.
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_1d_fwd_cc  CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_3d_fwd_cc  CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_5d_fwd_cc  CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_7d_fwd_cc  CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_10d_fwd_cc CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_20d_fwd_cc CASCADE;
 
 -- Pct-change / derived-ratio change / 90-day z-score features.
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_total_oi_pct_change                       DOUBLE PRECISION;
