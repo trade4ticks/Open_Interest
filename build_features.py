@@ -553,11 +553,11 @@ def build_for_ticker(pg_conn, ticker: str,
         log.warning("  no OHLC for %s — skipping (run fetch_ohlc.py first)", ticker)
         return 0
 
-    # prev_close (yesterday's close) is needed for the _pc spot variant.
-    # Compute it on the FULL OHLC series before any range filter so the row
-    # at our range start has correct prev_close from the day before.
+    # prev_close is computed as LAG(close) inside DuckDB later (see registration
+    # block below) — doing it there instead of via pandas .shift(1) avoids a
+    # round-trip quirk where a pandas-shifted column with NaN at position 0
+    # was coming back as all-NULL on the DuckDB side.
     ohlc_full_df = ohlc_full_df.sort_values("trade_date").reset_index(drop=True)
-    ohlc_full_df["prev_close"] = ohlc_full_df["close"].shift(1)
 
     end_eff = end or date.today()
     if start is not None:
@@ -597,11 +597,17 @@ def build_for_ticker(pg_conn, ticker: str,
         "next_monthly": list(nm_lookup.values()),
     })
 
-    # Single ohlc DF feeds both feature queries:
-    #   - OI features need open (spot_co), prev_close (spot_pc), close (forward returns)
-    #   - OHLC features need open and close (rv, fwd returns)
-    con.register("ohlc",            ohlc[["trade_date", "open", "close", "prev_close"]])
+    # Register the raw OHLC and then layer prev_close on as a DuckDB view via
+    # LAG. The OI features query joins to `ohlc` (the view) for prev_close and
+    # open; OHLC features query reads from the same view for open and close.
+    con.register("ohlc_base",       ohlc[["trade_date", "open", "close"]])
     con.register("next_monthly_df", nm_df)
+    con.execute("""
+        CREATE OR REPLACE VIEW ohlc AS
+        SELECT trade_date, open, close,
+               LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close
+        FROM ohlc_base
+    """)
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
         f"SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}"
