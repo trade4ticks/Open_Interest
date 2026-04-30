@@ -114,6 +114,19 @@ def fetch_one(ticker: str, start: date, end: date) -> list[tuple]:
     return rows
 
 
+def run(conn, ticker: str, start: date, end: date) -> int:
+    """Fetch + upsert one ticker. Reusable from run_pipeline.py."""
+    log.info("yfinance: %s ...", ticker)
+    rows = fetch_one(ticker, start, end)
+    log.info("  %s: %d rows", ticker, len(rows))
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, UPSERT_SQL, rows, page_size=500)
+    conn.commit()
+    return len(rows)
+
+
 def main() -> None:
     print("=== OI_Research — Daily OHLC fetch ===\n")
     with get_connection() as conn:
@@ -124,16 +137,8 @@ def main() -> None:
             raise SystemExit("End date must be >= start date.")
 
         print(f"\nFetching {len(tickers)} tickers from {start} → {end}")
-
         for t in tickers:
-            log.info("yfinance: %s ...", t)
-            rows = fetch_one(t, start, end)
-            log.info("  %s: %d rows", t, len(rows))
-            if not rows:
-                continue
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, UPSERT_SQL, rows, page_size=500)
-            conn.commit()
+            run(conn, t, start, end)
 
     print("\nDone.")
 

@@ -67,16 +67,40 @@ psql -d open_interest -c "DROP TABLE option_oi_raw;"
 
 `option_oi_surface` can also be dropped manually if you don't plan to use it.
 
-## Daily workflow
+## Daily workflow (interactive)
 
 ```bash
-python fetch_ohlc.py     # prompts for tickers + date range
-python fetch_oi.py       # prompts for tickers + date range; writes parquet
-python build_features.py # prompts for tickers (blank = all); reads parquet + ohlc -> daily_features
+python fetch_ohlc.py     # prompts for tickers + date range (blank ticker = all already-loaded)
+python fetch_oi.py       # prompts for tickers + date range
+python build_features.py # prompts for tickers + date range (blank = full history rebuild)
 ```
 
 `fetch_oi.py` no longer rebuilds a surface table — derived metrics are
 computed on demand by `build_features.py` directly from the raw parquet.
+
+## Daily workflow (cron)
+
+`run_pipeline.py` runs all three steps in sequence over rolling windows:
+
+- OHLC: rolling 10 calendar days (~7 trading days)
+- OI:   rolling 10 calendar days
+- Features: rolling 45 calendar days (~30 trading days — keeps recent rows
+  current and lets older `ret_*_fwd_oc` fill in as new OHLC arrives)
+
+Operates on every ticker already in `underlying_ohlc` / `OI_RAW_DIR`; does
+not add new tickers (run the interactive scripts manually for that).
+
+Cron entry (Mon-Fri at 7am ET, with a flock to prevent overlapping runs):
+
+```
+TZ=America/New_York 0 7 * * 1-5 flock -n /tmp/oi_research.lock /Open_Interest/.venv/bin/python /Open_Interest/run_pipeline.py >> /Open_Interest/logs/pipeline.log 2>&1
+```
+
+Today's row at 7am will have OI-side features (totals, percentages, top-N
+strikes, DTE buckets, OI-weighted strikes, d1/d5 changes, z-scores of
+OI-only ratios, etc.) populated, and spot-derived ones (`pct_oi_within_*pct`,
+`*_div_spot`, `oi_above/below_spot`, forward returns, realised vol) NULL
+until tomorrow's run picks up today's OHLC and recomputes the row.
 
 ## daily_features columns
 
