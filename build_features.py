@@ -527,6 +527,10 @@ def build_for_ticker(pg_conn, ticker: str,
         return 0
 
     feats = oi_feats.merge(ohlc_feats, on="trade_date", how="left")
+    # DuckDB returns DATE columns as datetime64[us]; normalise to Python date
+    # so `>= start` (Python date) comparisons work and psycopg2 sees a clean
+    # DATE value at INSERT time.
+    feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
     feats.insert(0, "ticker", ticker)
 
     # Drop the lookback buffer rows — they were only there for window context.
