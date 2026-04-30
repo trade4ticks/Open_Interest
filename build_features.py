@@ -64,26 +64,35 @@ log = logging.getLogger(__name__)
 # (not 0) when its spot is unknown.
 # ---------------------------------------------------------------------------
 OI_FEATURES_SQL = """
-WITH joined AS (
+WITH ohlc_with_prev AS (
+    -- prev_close (yesterday's close) computed via LAG, inline in this query
+    -- rather than via a pre-created view. Earlier attempts using a separately-
+    -- created view (and earlier still, pandas .shift(1)) returned all-NULL
+    -- prev_close after the LEFT JOIN below — the inline CTE form works.
+    SELECT trade_date, open, close,
+           LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close
+    FROM ohlc
+),
+joined AS (
     SELECT
         oi.trade_date,
         oi.expiration,
         oi.strike,
         oi.option_type,
         oi.open_interest,
-        ohlc.prev_close                                  AS spot_pc,
-        ohlc.open                                        AS spot_co,
+        ohp.prev_close                                   AS spot_pc,
+        ohp.open                                         AS spot_co,
         nm.next_monthly                                  AS next_monthly,
         (oi.expiration - oi.trade_date)::INTEGER         AS dte,
-        CASE WHEN ohlc.prev_close > 0
-             THEN oi.strike / ohlc.prev_close - 1.0
+        CASE WHEN ohp.prev_close > 0
+             THEN oi.strike / ohp.prev_close - 1.0
              ELSE NULL END                               AS moneyness_pc,
-        CASE WHEN ohlc.open > 0
-             THEN oi.strike / ohlc.open - 1.0
+        CASE WHEN ohp.open > 0
+             THEN oi.strike / ohp.open - 1.0
              ELSE NULL END                               AS moneyness_co
     FROM oi
-    LEFT JOIN ohlc            USING (trade_date)
-    LEFT JOIN next_monthly_df nm USING (trade_date)
+    LEFT JOIN ohlc_with_prev  ohp USING (trade_date)
+    LEFT JOIN next_monthly_df nm  USING (trade_date)
 ),
 per_day_agg AS (
     SELECT
@@ -597,17 +606,19 @@ def build_for_ticker(pg_conn, ticker: str,
         "next_monthly": list(nm_lookup.values()),
     })
 
-    # Register the raw OHLC and then layer prev_close on as a DuckDB view via
-    # LAG. The OI features query joins to `ohlc` (the view) for prev_close and
-    # open; OHLC features query reads from the same view for open and close.
-    con.register("ohlc_base",       ohlc[["trade_date", "open", "close"]])
+    # Register the raw OHLC; prev_close gets computed inline as a CTE inside
+    # OI_FEATURES_SQL. Both feature queries read from `ohlc` directly (no
+    # intermediate view).
+    con.register("ohlc",            ohlc[["trade_date", "open", "close"]])
     con.register("next_monthly_df", nm_df)
-    con.execute("""
-        CREATE OR REPLACE VIEW ohlc AS
-        SELECT trade_date, open, close,
-               LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close
-        FROM ohlc_base
-    """)
+
+    # Diagnostic — confirm DuckDB sees the OHLC rows we registered.
+    n_ohlc = con.execute("SELECT COUNT(*) FROM ohlc").fetchone()[0]
+    n_with_prev = con.execute("""
+        SELECT COUNT(prev_close)
+        FROM (SELECT LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close FROM ohlc) t
+    """).fetchone()[0]
+    log.info("  ohlc rows: %d   prev_close populated: %d", n_ohlc, n_with_prev)
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
         f"SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}"
