@@ -45,15 +45,23 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # OI features (DuckDB on parquet, LEFT JOINed to ohlc + next_monthly DFs).
 # Inputs registered by the caller:
-#   oi              view over read_parquet(...)   — raw chain
-#   ohlc            pandas DF [trade_date, close]
+#   oi              view over read_parquet(...)        — raw chain
+#   ohlc            pandas DF [trade_date, open, close, prev_close]
 #   next_monthly_df pandas DF [trade_date, next_monthly] — covers ALL OI dates
 #                   (independent of OHLC, so today's OI features still resolve
 #                   the next-monthly node even before today's OHLC arrives)
 #
-# LEFT JOIN ohlc means OI rows for today (no OHLC yet at 7am) survive the
-# join; spot_close becomes NULL and moneyness-dependent aggregates are
-# NULL-guarded below so they're properly NULL (not 0) when spot is unknown.
+# Two spot definitions:
+#   spot_pc = ohlc.prev_close  — close of the previous trading day (KNOWN at
+#             7am, when OI is published; this is the price a trader sees at
+#             the moment OI[X] becomes visible)
+#   spot_co = ohlc.open        — open of trade_date X (the realistic entry
+#             price after seeing OI[X]; NOT yet known at 7am for today)
+#
+# LEFT JOIN means OI rows for today (no OHLC yet at 7am) still survive — but
+# spot_co will be NULL while spot_pc populates from yesterday's close.
+# Moneyness-dependent SUMs are NULL-guarded so each version is properly NULL
+# (not 0) when its spot is unknown.
 # ---------------------------------------------------------------------------
 OI_FEATURES_SQL = """
 WITH joined AS (
@@ -63,12 +71,16 @@ WITH joined AS (
         oi.strike,
         oi.option_type,
         oi.open_interest,
-        ohlc.close                                       AS spot_close,
+        ohlc.prev_close                                  AS spot_pc,
+        ohlc.open                                        AS spot_co,
         nm.next_monthly                                  AS next_monthly,
         (oi.expiration - oi.trade_date)::INTEGER         AS dte,
-        CASE WHEN ohlc.close > 0
-             THEN oi.strike / ohlc.close - 1.0
-             ELSE NULL END                               AS moneyness
+        CASE WHEN ohlc.prev_close > 0
+             THEN oi.strike / ohlc.prev_close - 1.0
+             ELSE NULL END                               AS moneyness_pc,
+        CASE WHEN ohlc.open > 0
+             THEN oi.strike / ohlc.open - 1.0
+             ELSE NULL END                               AS moneyness_co
     FROM oi
     LEFT JOIN ohlc            USING (trade_date)
     LEFT JOIN next_monthly_df nm USING (trade_date)
@@ -76,69 +88,83 @@ WITH joined AS (
 per_day_agg AS (
     SELECT
         trade_date,
-        ANY_VALUE(spot_close)                                                          AS spot_close,
+        ANY_VALUE(spot_pc)                                                             AS spot_pc,
+        ANY_VALUE(spot_co)                                                             AS spot_co,
         ANY_VALUE(next_monthly)                                                        AS next_monthly,
         SUM(open_interest)                                                             AS total_oi,
         SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)                 AS call_oi,
         SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)                 AS put_oi,
-        -- moneyness IS NULL on a date with no OHLC yet (today, before market open).
-        -- Returning NULL (instead of summing the ELSE 0 branch) keeps the column
-        -- honest — "we don't know spot" rather than "0 OI within 5%".
-        SUM(CASE WHEN moneyness IS NULL          THEN NULL
-                 WHEN ABS(moneyness) <= 0.05     THEN open_interest
-                 ELSE 0 END)                                                           AS oi_within_5pct,
-        SUM(CASE WHEN moneyness IS NULL          THEN NULL
-                 WHEN ABS(moneyness) <= 0.10     THEN open_interest
-                 ELSE 0 END)                                                           AS oi_within_10pct,
-        SUM(CASE WHEN moneyness IS NULL          THEN NULL
-                 WHEN moneyness > 0              THEN open_interest
-                 ELSE 0 END)                                                           AS oi_above_spot,
-        SUM(CASE WHEN moneyness IS NULL          THEN NULL
-                 WHEN moneyness < 0              THEN open_interest
-                 ELSE 0 END)                                                           AS oi_below_spot,
+        -- Moneyness IS NULL on a date with no OHLC yet (today's spot_co at 7am).
+        -- The CASE WHEN ... IS NULL THEN NULL guard makes the SUM honest:
+        -- "we don't know spot" rather than "0 OI within 5%".
+        SUM(CASE WHEN moneyness_pc IS NULL          THEN NULL
+                 WHEN ABS(moneyness_pc) <= 0.05     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_5pct_pc,
+        SUM(CASE WHEN moneyness_co IS NULL          THEN NULL
+                 WHEN ABS(moneyness_co) <= 0.05     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_5pct_co,
+        SUM(CASE WHEN moneyness_pc IS NULL          THEN NULL
+                 WHEN ABS(moneyness_pc) <= 0.10     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_10pct_pc,
+        SUM(CASE WHEN moneyness_co IS NULL          THEN NULL
+                 WHEN ABS(moneyness_co) <= 0.10     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_10pct_co,
+        SUM(CASE WHEN moneyness_pc IS NULL          THEN NULL
+                 WHEN moneyness_pc > 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_above_spot_pc,
+        SUM(CASE WHEN moneyness_co IS NULL          THEN NULL
+                 WHEN moneyness_co > 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_above_spot_co,
+        SUM(CASE WHEN moneyness_pc IS NULL          THEN NULL
+                 WHEN moneyness_pc < 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_below_spot_pc,
+        SUM(CASE WHEN moneyness_co IS NULL          THEN NULL
+                 WHEN moneyness_co < 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_below_spot_co,
         SUM(CASE WHEN dte BETWEEN 0  AND 30  THEN open_interest ELSE 0 END)            AS oi_0_30,
         SUM(CASE WHEN dte BETWEEN 31 AND 90  THEN open_interest ELSE 0 END)            AS oi_31_90,
         SUM(CASE WHEN dte BETWEEN 91 AND 365 THEN open_interest ELSE 0 END)            AS oi_91_365,
-        -- OI-weighted strikes (all DTE)
+        -- OI-weighted strikes (no spot dependency — same value for pc/co)
         SUM(strike * open_interest)::DOUBLE
-            / NULLIF(SUM(open_interest), 0)                                            AS oi_weighted_strike_all,
+            / NULLIF(SUM(open_interest), 0)                                            AS oi_weighted_all,
         SUM(CASE WHEN option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
-            / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0) AS oi_weighted_strike_call,
+            / NULLIF(SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END), 0) AS oi_weighted_call,
         SUM(CASE WHEN option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
-            / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0) AS oi_weighted_strike_put,
-        -- OI-weighted strikes (DTE 0-30)
+            / NULLIF(SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END), 0) AS oi_weighted_put,
         SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_all_0_30d,
+                                                                                       AS oi_weighted_all_0_30d,
         SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_call_0_30d,
+                                                                                       AS oi_weighted_call_0_30d,
         SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 0 AND 30 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_put_0_30d,
-        -- OI-weighted strikes (DTE 31-90)
+                                                                                       AS oi_weighted_put_0_30d,
         SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_all_31_90d,
+                                                                                       AS oi_weighted_all_31_90d,
         SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'C' THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_call_31_90d,
+                                                                                       AS oi_weighted_call_31_90d,
         SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN strike * open_interest ELSE 0 END)::DOUBLE
             / NULLIF(SUM(CASE WHEN dte BETWEEN 31 AND 90 AND option_type = 'P' THEN open_interest ELSE 0 END), 0)
-                                                                                       AS oi_weighted_strike_put_31_90d,
+                                                                                       AS oi_weighted_put_31_90d,
         SUM(dte * open_interest)::DOUBLE
             / NULLIF(SUM(open_interest), 0)                                            AS weighted_avg_dte
     FROM joined
     GROUP BY trade_date
 ),
--- Layer derived ratios on top of the GROUP BY so the windowing CTEs below
--- can LAG / window over them (DuckDB can't do that inside an aggregating SELECT).
+-- Layer derived ratios on top of the GROUP BY so the windowing CTEs below can
+-- LAG / window over them. _pc and _co are split versions of the spot-divided
+-- ones; put_call_oi_ratio is spot-independent.
 per_day AS (
     SELECT
         a.*,
-        a.put_oi::DOUBLE       / NULLIF(a.call_oi, 0)        AS put_call_oi_ratio,
-        a.oi_above_spot::DOUBLE / NULLIF(a.oi_below_spot, 0) AS oi_above_below_ratio,
-        a.oi_weighted_strike_all / NULLIF(a.spot_close, 0)   AS oi_weighted_strike_all_div_spot
+        a.put_oi::DOUBLE       / NULLIF(a.call_oi, 0)              AS put_call_oi_ratio,
+        a.oi_above_spot_pc::DOUBLE / NULLIF(a.oi_below_spot_pc, 0) AS oi_above_below_ratio_pc,
+        a.oi_above_spot_co::DOUBLE / NULLIF(a.oi_below_spot_co, 0) AS oi_above_below_ratio_co,
+        a.oi_weighted_all / NULLIF(a.spot_pc, 0)                   AS oi_weighted_all_div_spot_pc,
+        a.oi_weighted_all / NULLIF(a.spot_co, 0)                   AS oi_weighted_all_div_spot_co
     FROM per_day_agg a
 ),
 strike_agg AS (
@@ -208,29 +234,31 @@ oi_lags AS (
     SELECT
         trade_date,
         total_oi,
-        -- Existing absolute changes
+        -- Spot-independent absolute / pct changes
         total_oi - LAG(total_oi, 1)  OVER w_t                                AS d1_total_oi_change,
         total_oi - LAG(total_oi, 5)  OVER w_t                                AS d5_total_oi_change,
         total_oi - LAG(total_oi, 20) OVER w_t                                AS d20_total_oi_change,
-        -- New pct changes
         (total_oi - LAG(total_oi, 1) OVER w_t)::DOUBLE
             / NULLIF(LAG(total_oi, 1) OVER w_t, 0)                           AS d1_total_oi_pct_change,
         (total_oi - LAG(total_oi, 5) OVER w_t)::DOUBLE
             / NULLIF(LAG(total_oi, 5) OVER w_t, 0)                           AS d5_total_oi_pct_change,
-        -- New d1/d5 changes of derived ratios
-        oi_weighted_strike_all_div_spot
-            - LAG(oi_weighted_strike_all_div_spot, 1) OVER w_t               AS d1_oi_weighted_strike_all_div_spot_change,
-        oi_weighted_strike_all_div_spot
-            - LAG(oi_weighted_strike_all_div_spot, 5) OVER w_t               AS d5_oi_weighted_strike_all_div_spot_change,
         put_call_oi_ratio - LAG(put_call_oi_ratio, 1) OVER w_t               AS d1_put_call_oi_ratio_change,
-        put_call_oi_ratio - LAG(put_call_oi_ratio, 5) OVER w_t               AS d5_put_call_oi_ratio_change
+        put_call_oi_ratio - LAG(put_call_oi_ratio, 5) OVER w_t               AS d5_put_call_oi_ratio_change,
+        -- Spot-dependent — _pc and _co versions
+        oi_weighted_all_div_spot_pc
+            - LAG(oi_weighted_all_div_spot_pc, 1) OVER w_t                   AS d1_oi_weighted_all_div_spot_change_pc,
+        oi_weighted_all_div_spot_pc
+            - LAG(oi_weighted_all_div_spot_pc, 5) OVER w_t                   AS d5_oi_weighted_all_div_spot_change_pc,
+        oi_weighted_all_div_spot_co
+            - LAG(oi_weighted_all_div_spot_co, 1) OVER w_t                   AS d1_oi_weighted_all_div_spot_change_co,
+        oi_weighted_all_div_spot_co
+            - LAG(oi_weighted_all_div_spot_co, 5) OVER w_t                   AS d5_oi_weighted_all_div_spot_change_co
     FROM per_day
     WINDOW w_t AS (ORDER BY trade_date)
 ),
--- 60-trading-day (~3-month) z-scores and the d1/d5 pct-change ratio.
--- Each z-score is gated by COUNT(col) >= 60 so we don't emit a "z-score" off
--- 2-3 observations early in the series — those would be noise, not signal.
--- Joined back to per_day so we can z-score the derived ratios in the same pass.
+-- 60-trading-day (~3-month) z-scores. Each is gated by COUNT(col) >= 60 so
+-- early rows in the series stay NULL until 60 prior observations exist.
+-- Spot-dependent z-scores have _pc and _co versions.
 oi_zscores AS (
     SELECT
         trade_date,
@@ -245,92 +273,130 @@ oi_zscores AS (
                   / NULLIF(STDDEV_SAMP(d5_total_oi_change) OVER w60, 0)
              ELSE NULL
         END                                                                         AS zscore_d5_oi_change_3m,
-        CASE WHEN COUNT(oi_weighted_strike_all_div_spot) OVER w60 >= 60
-             THEN (oi_weighted_strike_all_div_spot
-                   - AVG(oi_weighted_strike_all_div_spot) OVER w60)
-                  / NULLIF(STDDEV_SAMP(oi_weighted_strike_all_div_spot) OVER w60, 0)
-             ELSE NULL
-        END                                                                         AS zscore_oi_weighted_strike_all_div_spot_3m,
         CASE WHEN COUNT(put_call_oi_ratio) OVER w60 >= 60
              THEN (put_call_oi_ratio - AVG(put_call_oi_ratio) OVER w60)
                   / NULLIF(STDDEV_SAMP(put_call_oi_ratio) OVER w60, 0)
              ELSE NULL
         END                                                                         AS zscore_put_call_oi_ratio_3m,
-        CASE WHEN COUNT(oi_above_below_ratio) OVER w60 >= 60
-             THEN (oi_above_below_ratio - AVG(oi_above_below_ratio) OVER w60)
-                  / NULLIF(STDDEV_SAMP(oi_above_below_ratio) OVER w60, 0)
+        -- Spot-dependent z-scores (_pc and _co)
+        CASE WHEN COUNT(oi_weighted_all_div_spot_pc) OVER w60 >= 60
+             THEN (oi_weighted_all_div_spot_pc
+                   - AVG(oi_weighted_all_div_spot_pc) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_weighted_all_div_spot_pc) OVER w60, 0)
              ELSE NULL
-        END                                                                         AS zscore_oi_above_below_ratio_3m
+        END                                                                         AS zscore_oi_weighted_all_div_spot_3m_pc,
+        CASE WHEN COUNT(oi_weighted_all_div_spot_co) OVER w60 >= 60
+             THEN (oi_weighted_all_div_spot_co
+                   - AVG(oi_weighted_all_div_spot_co) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_weighted_all_div_spot_co) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_oi_weighted_all_div_spot_3m_co,
+        CASE WHEN COUNT(oi_above_below_ratio_pc) OVER w60 >= 60
+             THEN (oi_above_below_ratio_pc - AVG(oi_above_below_ratio_pc) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_above_below_ratio_pc) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_oi_above_below_ratio_3m_pc,
+        CASE WHEN COUNT(oi_above_below_ratio_co) OVER w60 >= 60
+             THEN (oi_above_below_ratio_co - AVG(oi_above_below_ratio_co) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_above_below_ratio_co) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_oi_above_below_ratio_3m_co
     FROM oi_lags JOIN per_day USING (trade_date)
     WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 )
 SELECT
     p.trade_date,
-    p.spot_close,
+    p.spot_pc,
+    p.spot_co,
     p.total_oi,
     p.call_oi,
     p.put_oi,
-    p.put_oi::DOUBLE / NULLIF(p.call_oi, 0)                                AS put_call_oi_ratio,
+    p.put_call_oi_ratio,
     mc.max_oi_strike_call,
     mp.max_oi_strike_put,
-    p.oi_weighted_strike_call,
-    p.oi_weighted_strike_put,
-    p.oi_weighted_strike_all,
-    p.oi_weighted_strike_call - p.spot_close                               AS oi_weighted_strike_call_minus_spot,
-    p.oi_weighted_strike_put  - p.spot_close                               AS oi_weighted_strike_put_minus_spot,
-    p.oi_weighted_strike_all  - p.spot_close                               AS oi_weighted_strike_all_minus_spot,
-    p.oi_weighted_strike_call / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_call_div_spot,
-    p.oi_weighted_strike_put  / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_put_div_spot,
-    p.oi_weighted_strike_all  / NULLIF(p.spot_close, 0)                    AS oi_weighted_strike_all_div_spot,
-    p.oi_within_5pct,
-    p.oi_within_10pct,
-    fo.front_oi::DOUBLE / NULLIF(p.total_oi, 0)                            AS pct_oi_in_front_expiry,
-    p.oi_above_spot,
-    p.oi_below_spot,
-    p.oi_above_spot::DOUBLE / NULLIF(p.oi_below_spot, 0)                   AS oi_above_below_ratio,
-    p.oi_weighted_strike_all_0_30d,
-    p.oi_weighted_strike_call_0_30d,
-    p.oi_weighted_strike_put_0_30d,
-    p.oi_weighted_strike_all_0_30d  / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_all_0_30d_div_spot,
-    p.oi_weighted_strike_call_0_30d / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_call_0_30d_div_spot,
-    p.oi_weighted_strike_put_0_30d  / NULLIF(p.spot_close, 0)              AS oi_weighted_strike_put_0_30d_div_spot,
-    p.oi_weighted_strike_all_31_90d,
-    p.oi_weighted_strike_call_31_90d,
-    p.oi_weighted_strike_put_31_90d,
-    p.oi_weighted_strike_all_31_90d  / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_all_31_90d_div_spot,
-    p.oi_weighted_strike_call_31_90d / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_call_31_90d_div_spot,
-    p.oi_weighted_strike_put_31_90d  / NULLIF(p.spot_close, 0)             AS oi_weighted_strike_put_31_90d_div_spot,
+    -- OI-weighted strikes (no spot dependency)
+    p.oi_weighted_call,
+    p.oi_weighted_put,
+    p.oi_weighted_all,
+    -- minus_spot (pc / co)
+    p.oi_weighted_call - p.spot_pc                              AS oi_weighted_call_minus_spot_pc,
+    p.oi_weighted_call - p.spot_co                              AS oi_weighted_call_minus_spot_co,
+    p.oi_weighted_put  - p.spot_pc                              AS oi_weighted_put_minus_spot_pc,
+    p.oi_weighted_put  - p.spot_co                              AS oi_weighted_put_minus_spot_co,
+    p.oi_weighted_all  - p.spot_pc                              AS oi_weighted_all_minus_spot_pc,
+    p.oi_weighted_all  - p.spot_co                              AS oi_weighted_all_minus_spot_co,
+    -- div_spot (pc / co)
+    p.oi_weighted_call / NULLIF(p.spot_pc, 0)                   AS oi_weighted_call_div_spot_pc,
+    p.oi_weighted_call / NULLIF(p.spot_co, 0)                   AS oi_weighted_call_div_spot_co,
+    p.oi_weighted_put  / NULLIF(p.spot_pc, 0)                   AS oi_weighted_put_div_spot_pc,
+    p.oi_weighted_put  / NULLIF(p.spot_co, 0)                   AS oi_weighted_put_div_spot_co,
+    p.oi_weighted_all_div_spot_pc,
+    p.oi_weighted_all_div_spot_co,
+    -- Moneyness counts (pc / co)
+    p.oi_within_5pct_pc,  p.oi_within_5pct_co,
+    p.oi_within_10pct_pc, p.oi_within_10pct_co,
+    fo.front_oi::DOUBLE / NULLIF(p.total_oi, 0)                 AS pct_oi_in_front_expiry,
+    p.oi_above_spot_pc, p.oi_above_spot_co,
+    p.oi_below_spot_pc, p.oi_below_spot_co,
+    p.oi_above_below_ratio_pc, p.oi_above_below_ratio_co,
+    -- DTE-bucketed weighted strikes (no spot)
+    p.oi_weighted_all_0_30d, p.oi_weighted_call_0_30d, p.oi_weighted_put_0_30d,
+    -- DTE-bucketed div_spot variants (pc / co)
+    p.oi_weighted_all_0_30d  / NULLIF(p.spot_pc, 0)             AS oi_weighted_all_0_30d_div_spot_pc,
+    p.oi_weighted_all_0_30d  / NULLIF(p.spot_co, 0)             AS oi_weighted_all_0_30d_div_spot_co,
+    p.oi_weighted_call_0_30d / NULLIF(p.spot_pc, 0)             AS oi_weighted_call_0_30d_div_spot_pc,
+    p.oi_weighted_call_0_30d / NULLIF(p.spot_co, 0)             AS oi_weighted_call_0_30d_div_spot_co,
+    p.oi_weighted_put_0_30d  / NULLIF(p.spot_pc, 0)             AS oi_weighted_put_0_30d_div_spot_pc,
+    p.oi_weighted_put_0_30d  / NULLIF(p.spot_co, 0)             AS oi_weighted_put_0_30d_div_spot_co,
+    p.oi_weighted_all_31_90d, p.oi_weighted_call_31_90d, p.oi_weighted_put_31_90d,
+    p.oi_weighted_all_31_90d  / NULLIF(p.spot_pc, 0)            AS oi_weighted_all_31_90d_div_spot_pc,
+    p.oi_weighted_all_31_90d  / NULLIF(p.spot_co, 0)            AS oi_weighted_all_31_90d_div_spot_co,
+    p.oi_weighted_call_31_90d / NULLIF(p.spot_pc, 0)            AS oi_weighted_call_31_90d_div_spot_pc,
+    p.oi_weighted_call_31_90d / NULLIF(p.spot_co, 0)            AS oi_weighted_call_31_90d_div_spot_co,
+    p.oi_weighted_put_31_90d  / NULLIF(p.spot_pc, 0)            AS oi_weighted_put_31_90d_div_spot_pc,
+    p.oi_weighted_put_31_90d  / NULLIF(p.spot_co, 0)            AS oi_weighted_put_31_90d_div_spot_co,
     ol.d1_total_oi_change,
     ol.d5_total_oi_change,
     ol.d20_total_oi_change,
-    -- New percentage / aggregate features (full unfiltered chain in denominator)
-    p.oi_within_5pct::DOUBLE  / NULLIF(p.total_oi, 0)                      AS pct_oi_within_5pct,
-    p.oi_within_10pct::DOUBLE / NULLIF(p.total_oi, 0)                      AS pct_oi_within_10pct,
-    p.oi_above_spot::DOUBLE / NULLIF(p.total_oi, 0)                        AS pct_oi_above_spot,
-    p.oi_below_spot::DOUBLE / NULLIF(p.total_oi, 0)                        AS pct_oi_below_spot,
-    ts.top5_oi::DOUBLE  / NULLIF(p.total_oi, 0)                            AS top5_strikes_pct_total_oi,
-    ts.top10_oi::DOUBLE / NULLIF(p.total_oi, 0)                            AS top10_strikes_pct_total_oi,
+    -- pct features (denominator = total_oi)
+    p.oi_within_5pct_pc::DOUBLE  / NULLIF(p.total_oi, 0)        AS pct_oi_within_5pct_pc,
+    p.oi_within_5pct_co::DOUBLE  / NULLIF(p.total_oi, 0)        AS pct_oi_within_5pct_co,
+    p.oi_within_10pct_pc::DOUBLE / NULLIF(p.total_oi, 0)        AS pct_oi_within_10pct_pc,
+    p.oi_within_10pct_co::DOUBLE / NULLIF(p.total_oi, 0)        AS pct_oi_within_10pct_co,
+    p.oi_above_spot_pc::DOUBLE / NULLIF(p.total_oi, 0)          AS pct_oi_above_spot_pc,
+    p.oi_above_spot_co::DOUBLE / NULLIF(p.total_oi, 0)          AS pct_oi_above_spot_co,
+    p.oi_below_spot_pc::DOUBLE / NULLIF(p.total_oi, 0)          AS pct_oi_below_spot_pc,
+    p.oi_below_spot_co::DOUBLE / NULLIF(p.total_oi, 0)          AS pct_oi_below_spot_co,
+    ts.top5_oi::DOUBLE  / NULLIF(p.total_oi, 0)                 AS top5_strikes_pct_total_oi,
+    ts.top10_oi::DOUBLE / NULLIF(p.total_oi, 0)                 AS top10_strikes_pct_total_oi,
     p.weighted_avg_dte,
-    p.oi_0_30::DOUBLE   / NULLIF(p.total_oi, 0)                            AS pct_oi_0_30d,
-    p.oi_31_90::DOUBLE  / NULLIF(p.total_oi, 0)                            AS pct_oi_31_90d,
-    p.oi_91_365::DOUBLE / NULLIF(p.total_oi, 0)                            AS pct_oi_91_365d,
-    nm.nm_oi::DOUBLE / NULLIF(p.total_oi, 0)                               AS pct_oi_next_monthly,
+    p.oi_0_30::DOUBLE   / NULLIF(p.total_oi, 0)                 AS pct_oi_0_30d,
+    p.oi_31_90::DOUBLE  / NULLIF(p.total_oi, 0)                 AS pct_oi_31_90d,
+    p.oi_91_365::DOUBLE / NULLIF(p.total_oi, 0)                 AS pct_oi_91_365d,
+    nm.nm_oi::DOUBLE / NULLIF(p.total_oi, 0)                    AS pct_oi_next_monthly,
     nm.nm_strike_oi::DOUBLE
         / NULLIF(nm.nm_oi, 0)
-        / NULLIF(p.spot_close, 0)                                          AS oi_weighted_strike_next_monthly_div_spot,
-    -- 2026-04-28 — pct changes / derived-ratio changes / 90-day z-scores
+        / NULLIF(p.spot_pc, 0)                                  AS oi_weighted_next_monthly_div_spot_pc,
+    nm.nm_strike_oi::DOUBLE
+        / NULLIF(nm.nm_oi, 0)
+        / NULLIF(p.spot_co, 0)                                  AS oi_weighted_next_monthly_div_spot_co,
+    -- pct changes / derived ratio changes / z-scores
     ol.d1_total_oi_pct_change,
     ol.d5_total_oi_pct_change,
     z.d1_d5_ratio_total_oi_pct_change,
-    ol.d1_oi_weighted_strike_all_div_spot_change,
-    ol.d5_oi_weighted_strike_all_div_spot_change,
+    ol.d1_oi_weighted_all_div_spot_change_pc,
+    ol.d1_oi_weighted_all_div_spot_change_co,
+    ol.d5_oi_weighted_all_div_spot_change_pc,
+    ol.d5_oi_weighted_all_div_spot_change_co,
     ol.d1_put_call_oi_ratio_change,
     ol.d5_put_call_oi_ratio_change,
     z.zscore_d1_oi_change_3m,
     z.zscore_d5_oi_change_3m,
-    z.zscore_oi_weighted_strike_all_div_spot_3m,
+    z.zscore_oi_weighted_all_div_spot_3m_pc,
+    z.zscore_oi_weighted_all_div_spot_3m_co,
     z.zscore_put_call_oi_ratio_3m,
-    z.zscore_oi_above_below_ratio_3m
+    z.zscore_oi_above_below_ratio_3m_pc,
+    z.zscore_oi_above_below_ratio_3m_co
 FROM per_day p
 LEFT JOIN max_call         mc USING (trade_date)
 LEFT JOIN max_put          mp USING (trade_date)
@@ -344,8 +410,8 @@ ORDER BY p.trade_date
 
 
 # ---------------------------------------------------------------------------
-# OHLC-derived features (rv, fwd oc returns) — DuckDB on ohlc_full DF
-# Input: ohlc_full pandas DF [trade_date, open, close]
+# OHLC-derived features (rv, fwd oc returns) — DuckDB on the unified ohlc DF.
+# Input: ohlc pandas DF [trade_date, open, close, prev_close]
 #
 # Forward returns: entry = open of trade_date (OI for trade_date is published
 # overnight and visible on broker platforms when the market opens), exit =
@@ -357,7 +423,7 @@ WITH ret AS (
     SELECT trade_date, open, close,
            LN(NULLIF(close, 0)
               / NULLIF(LAG(close) OVER (ORDER BY trade_date), 0)) AS log_ret
-    FROM ohlc_full
+    FROM ohlc
 )
 SELECT
     trade_date,
@@ -381,44 +447,61 @@ WINDOW
 # Postgres write
 # ---------------------------------------------------------------------------
 INSERT_COLS = [
-    "ticker", "trade_date", "spot_close",
+    "ticker", "trade_date",
+    "spot_pc", "spot_co",
     "total_oi", "call_oi", "put_oi", "put_call_oi_ratio",
     "max_oi_strike_call", "max_oi_strike_put",
-    "oi_weighted_strike_call", "oi_weighted_strike_put", "oi_weighted_strike_all",
-    "oi_weighted_strike_call_minus_spot", "oi_weighted_strike_put_minus_spot",
-    "oi_weighted_strike_all_minus_spot",
-    "oi_weighted_strike_call_div_spot", "oi_weighted_strike_put_div_spot",
-    "oi_weighted_strike_all_div_spot",
-    "oi_within_5pct", "oi_within_10pct", "pct_oi_in_front_expiry",
-    "oi_above_spot", "oi_below_spot", "oi_above_below_ratio",
-    "oi_weighted_strike_all_0_30d", "oi_weighted_strike_call_0_30d",
-    "oi_weighted_strike_put_0_30d",
-    "oi_weighted_strike_all_0_30d_div_spot", "oi_weighted_strike_call_0_30d_div_spot",
-    "oi_weighted_strike_put_0_30d_div_spot",
-    "oi_weighted_strike_all_31_90d", "oi_weighted_strike_call_31_90d",
-    "oi_weighted_strike_put_31_90d",
-    "oi_weighted_strike_all_31_90d_div_spot", "oi_weighted_strike_call_31_90d_div_spot",
-    "oi_weighted_strike_put_31_90d_div_spot",
+    # OI-weighted strikes (no spot — same value regardless of pc/co)
+    "oi_weighted_call", "oi_weighted_put", "oi_weighted_all",
+    # minus_spot pc / co
+    "oi_weighted_call_minus_spot_pc", "oi_weighted_call_minus_spot_co",
+    "oi_weighted_put_minus_spot_pc",  "oi_weighted_put_minus_spot_co",
+    "oi_weighted_all_minus_spot_pc",  "oi_weighted_all_minus_spot_co",
+    # div_spot pc / co
+    "oi_weighted_call_div_spot_pc",   "oi_weighted_call_div_spot_co",
+    "oi_weighted_put_div_spot_pc",    "oi_weighted_put_div_spot_co",
+    "oi_weighted_all_div_spot_pc",    "oi_weighted_all_div_spot_co",
+    # Moneyness-dependent counts (pc / co)
+    "oi_within_5pct_pc",  "oi_within_5pct_co",
+    "oi_within_10pct_pc", "oi_within_10pct_co",
+    "pct_oi_in_front_expiry",
+    "oi_above_spot_pc",   "oi_above_spot_co",
+    "oi_below_spot_pc",   "oi_below_spot_co",
+    "oi_above_below_ratio_pc", "oi_above_below_ratio_co",
+    # DTE-bucketed weighted strikes (no spot)
+    "oi_weighted_all_0_30d",  "oi_weighted_call_0_30d",  "oi_weighted_put_0_30d",
+    # DTE-bucketed div_spot pc / co
+    "oi_weighted_all_0_30d_div_spot_pc",   "oi_weighted_all_0_30d_div_spot_co",
+    "oi_weighted_call_0_30d_div_spot_pc",  "oi_weighted_call_0_30d_div_spot_co",
+    "oi_weighted_put_0_30d_div_spot_pc",   "oi_weighted_put_0_30d_div_spot_co",
+    "oi_weighted_all_31_90d", "oi_weighted_call_31_90d", "oi_weighted_put_31_90d",
+    "oi_weighted_all_31_90d_div_spot_pc",  "oi_weighted_all_31_90d_div_spot_co",
+    "oi_weighted_call_31_90d_div_spot_pc", "oi_weighted_call_31_90d_div_spot_co",
+    "oi_weighted_put_31_90d_div_spot_pc",  "oi_weighted_put_31_90d_div_spot_co",
     "d1_total_oi_change", "d5_total_oi_change", "d20_total_oi_change",
     "rv_5d", "rv_20d",
-    "ret_1d_fwd_oc", "ret_3d_fwd_oc", "ret_5d_fwd_oc",
-    "ret_7d_fwd_oc", "ret_10d_fwd_oc", "ret_20d_fwd_oc",
-    "pct_oi_within_5pct", "pct_oi_within_10pct",
-    "pct_oi_above_spot", "pct_oi_below_spot",
+    "ret_1d_fwd_oc",  "ret_3d_fwd_oc",  "ret_5d_fwd_oc",
+    "ret_7d_fwd_oc",  "ret_10d_fwd_oc", "ret_20d_fwd_oc",
+    # pct features (denominator = total_oi)
+    "pct_oi_within_5pct_pc",  "pct_oi_within_5pct_co",
+    "pct_oi_within_10pct_pc", "pct_oi_within_10pct_co",
+    "pct_oi_above_spot_pc",   "pct_oi_above_spot_co",
+    "pct_oi_below_spot_pc",   "pct_oi_below_spot_co",
     "top5_strikes_pct_total_oi", "top10_strikes_pct_total_oi",
     "weighted_avg_dte",
     "pct_oi_0_30d", "pct_oi_31_90d", "pct_oi_91_365d",
-    "pct_oi_next_monthly", "oi_weighted_strike_next_monthly_div_spot",
-    # 2026-04-28 — pct changes / derived-ratio changes / 90-day z-scores
+    "pct_oi_next_monthly",
+    "oi_weighted_next_monthly_div_spot_pc", "oi_weighted_next_monthly_div_spot_co",
+    # pct changes / derived-ratio changes / 60-day z-scores
     "d1_total_oi_pct_change", "d5_total_oi_pct_change",
     "d1_d5_ratio_total_oi_pct_change",
-    "d1_oi_weighted_strike_all_div_spot_change",
-    "d5_oi_weighted_strike_all_div_spot_change",
+    "d1_oi_weighted_all_div_spot_change_pc", "d1_oi_weighted_all_div_spot_change_co",
+    "d5_oi_weighted_all_div_spot_change_pc", "d5_oi_weighted_all_div_spot_change_co",
     "d1_put_call_oi_ratio_change", "d5_put_call_oi_ratio_change",
     "zscore_d1_oi_change_3m", "zscore_d5_oi_change_3m",
-    "zscore_oi_weighted_strike_all_div_spot_3m",
+    "zscore_oi_weighted_all_div_spot_3m_pc", "zscore_oi_weighted_all_div_spot_3m_co",
     "zscore_put_call_oi_ratio_3m",
-    "zscore_oi_above_below_ratio_3m",
+    "zscore_oi_above_below_ratio_3m_pc", "zscore_oi_above_below_ratio_3m_co",
 ]
 
 INSERT_SQL = f"INSERT INTO daily_features ({', '.join(INSERT_COLS)}) VALUES %s"
@@ -470,6 +553,12 @@ def build_for_ticker(pg_conn, ticker: str,
         log.warning("  no OHLC for %s — skipping (run fetch_ohlc.py first)", ticker)
         return 0
 
+    # prev_close (yesterday's close) is needed for the _pc spot variant.
+    # Compute it on the FULL OHLC series before any range filter so the row
+    # at our range start has correct prev_close from the day before.
+    ohlc_full_df = ohlc_full_df.sort_values("trade_date").reset_index(drop=True)
+    ohlc_full_df["prev_close"] = ohlc_full_df["close"].shift(1)
+
     end_eff = end or date.today()
     if start is not None:
         buffer_start = start - timedelta(days=LOOKBACK_BUFFER_DAYS)
@@ -508,8 +597,10 @@ def build_for_ticker(pg_conn, ticker: str,
         "next_monthly": list(nm_lookup.values()),
     })
 
-    con.register("ohlc",            ohlc[["trade_date", "close"]])
-    con.register("ohlc_full",       ohlc[["trade_date", "open", "close"]])
+    # Single ohlc DF feeds both feature queries:
+    #   - OI features need open (spot_co), prev_close (spot_pc), close (forward returns)
+    #   - OHLC features need open and close (rv, fwd returns)
+    con.register("ohlc",            ohlc[["trade_date", "open", "close", "prev_close"]])
     con.register("next_monthly_df", nm_df)
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "

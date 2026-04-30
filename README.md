@@ -115,15 +115,24 @@ until tomorrow's run picks up today's OHLC and recomputes the row.
 
 ## daily_features columns
 
+**Spot** comes in two flavours so both can be backtested:
+- `_pc` — **prior trading day's close** (known at 7am, when OI publishes)
+- `_co` — **current day's open** (the realistic entry price after seeing OI)
+
+At 7am cron time, today's row populates `_pc` fields immediately (yesterday's
+close is known) and leaves `_co` fields NULL until tomorrow's run picks up
+today's open.
+
 OI aggregates (full unfiltered chain):
-`spot_close`, `total_oi`, `call_oi`, `put_oi`, `put_call_oi_ratio`,
+`spot_pc`, `spot_co`, `total_oi`, `call_oi`, `put_oi`, `put_call_oi_ratio`,
 `max_oi_strike_call`, `max_oi_strike_put`,
-`oi_weighted_strike_call/put/all`,
-`oi_weighted_strike_*_minus_spot`, `oi_weighted_strike_*_div_spot`,
-`oi_within_5pct`, `oi_within_10pct`, `pct_oi_in_front_expiry`,
-`oi_above_spot`, `oi_below_spot`, `oi_above_below_ratio`,
-`oi_weighted_strike_*_0_30d`, `oi_weighted_strike_*_31_90d` (each with `_div_spot`),
-`d1_total_oi_change`, `d5_total_oi_change`, `d20_total_oi_change`.
+`oi_weighted_call/put/all` (no `_strike`, spot-independent),
+`oi_weighted_*_minus_spot_pc/co`, `oi_weighted_*_div_spot_pc/co`,
+`oi_within_5pct_pc/co`, `oi_within_10pct_pc/co`, `pct_oi_in_front_expiry`,
+`oi_above_spot_pc/co`, `oi_below_spot_pc/co`, `oi_above_below_ratio_pc/co`,
+`oi_weighted_*_0_30d`, `oi_weighted_*_31_90d` (spot-independent),
+each with `_div_spot_pc` and `_div_spot_co` variants,
+`d1/d5/d20_total_oi_change`.
 
 OHLC-derived:
 `rv_5d`, `rv_20d`,
@@ -134,24 +143,24 @@ is that day's open. `ret_1d_fwd_oc` is therefore the intraday open-to-close
 on `trade_date` itself.)
 
 Percentage / aggregate features (denominator = full unfiltered chain):
-`pct_oi_within_5pct`, `pct_oi_within_10pct`,
-`pct_oi_above_spot`, `pct_oi_below_spot`,
+`pct_oi_within_5pct_pc/co`, `pct_oi_within_10pct_pc/co`,
+`pct_oi_above_spot_pc/co`, `pct_oi_below_spot_pc/co`,
 `top5_strikes_pct_total_oi`, `top10_strikes_pct_total_oi`,
 `weighted_avg_dte`,
 `pct_oi_0_30d`, `pct_oi_31_90d`, `pct_oi_91_365d`,
-`pct_oi_next_monthly`, `oi_weighted_strike_next_monthly_div_spot`.
+`pct_oi_next_monthly`, `oi_weighted_next_monthly_div_spot_pc/co`.
 
 Pct changes / derived-ratio changes / 60-trading-day (~3-month) z-scores —
 each z-score is NULL until at least 60 prior observations exist for that
 column, so early rows in the series are NULL by design:
 `d1_total_oi_pct_change`, `d5_total_oi_pct_change`,
 `d1_d5_ratio_total_oi_pct_change`,
-`d1_oi_weighted_strike_all_div_spot_change`, `d5_oi_weighted_strike_all_div_spot_change`,
+`d1_oi_weighted_all_div_spot_change_pc/co`, `d5_oi_weighted_all_div_spot_change_pc/co`,
 `d1_put_call_oi_ratio_change`, `d5_put_call_oi_ratio_change`,
 `zscore_d1_oi_change_3m`, `zscore_d5_oi_change_3m`,
-`zscore_oi_weighted_strike_all_div_spot_3m`,
+`zscore_oi_weighted_all_div_spot_3m_pc/co`,
 `zscore_put_call_oi_ratio_3m`,
-`zscore_oi_above_below_ratio_3m`.
+`zscore_oi_above_below_ratio_3m_pc/co`.
 
 Top-N strikes aggregate OI **across all expirations** at each strike level
 (matches the "price magnet" reading). "Next monthly" is the next 3rd-Friday

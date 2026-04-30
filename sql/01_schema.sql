@@ -194,3 +194,131 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_d5_oi_change_3m      
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_oi_weighted_strike_all_div_spot_3m    DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_put_call_oi_ratio_3m                  DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m               DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- 7. Spot-dual-version migration (2026-04-30)
+--    Replace the single close[X]-based "spot" with explicit _pc (prior-day
+--    close) and _co (current-day open) variants for every spot-dependent
+--    metric, so we can backtest both entry models. Also drop "_strike" from
+--    the oi_weighted_strike_* names since it was redundant in long names.
+--
+--    DROPs use CASCADE because v_features_with_returns (SELECT f.*) pins
+--    these columns. 02_views.sql recreates the view immediately after.
+-- ---------------------------------------------------------------------------
+
+-- 7a. Drop obsolete close[X]-based spot-dependent columns.
+ALTER TABLE daily_features DROP COLUMN IF EXISTS spot_close                                  CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_within_5pct                              CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_within_10pct                             CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_above_spot                               CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_below_spot                               CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_above_below_ratio                        CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_oi_within_5pct                          CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_oi_within_10pct                         CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_oi_above_spot                           CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_oi_below_spot                           CASCADE;
+
+-- 7b. Drop obsolete _strike-named columns (renamed to drop "_strike").
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call                     CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put                      CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all                      CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_minus_spot          CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_minus_spot           CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_minus_spot           CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_div_spot            CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_div_spot             CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_div_spot             CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_0_30d                CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_0_30d               CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_0_30d                CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_0_30d_div_spot       CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_0_30d_div_spot      CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_0_30d_div_spot       CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_31_90d               CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_31_90d              CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_31_90d               CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_all_31_90d_div_spot      CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_call_31_90d_div_spot     CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_put_31_90d_div_spot      CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS oi_weighted_strike_next_monthly_div_spot    CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS d1_oi_weighted_strike_all_div_spot_change   CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS d5_oi_weighted_strike_all_div_spot_change   CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS zscore_oi_weighted_strike_all_div_spot_3m   CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS zscore_oi_above_below_ratio_3m              CASCADE;
+
+-- 7c. Renamed (_strike dropped) — spot-independent OI-weighted strike values.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call                        DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put                         DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all                         DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_0_30d                   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_0_30d                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_0_30d                   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_31_90d                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_31_90d                 DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_31_90d                  DOUBLE PRECISION;
+
+-- 7d. Spot in two flavours.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS spot_pc                                 DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS spot_co                                 DOUBLE PRECISION;
+
+-- 7e. Moneyness-dependent counts and pct-of-total — _pc and _co versions.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_within_5pct_pc                       BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_within_5pct_co                       BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_within_10pct_pc                      BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_within_10pct_co                      BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_above_spot_pc                        BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_above_spot_co                        BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_below_spot_pc                        BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_below_spot_co                        BIGINT;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_above_below_ratio_pc                 DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_above_below_ratio_co                 DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_within_5pct_pc                   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_within_5pct_co                   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_within_10pct_pc                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_within_10pct_co                  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_above_spot_pc                    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_above_spot_co                    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_below_spot_pc                    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS pct_oi_below_spot_co                    DOUBLE PRECISION;
+
+-- 7f. OI-weighted strikes vs spot (minus_spot and div_spot, _pc and _co).
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_minus_spot_pc          DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_minus_spot_co          DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_minus_spot_pc           DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_minus_spot_co           DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_minus_spot_pc           DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_minus_spot_co           DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_div_spot_pc            DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_div_spot_co            DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_div_spot_pc             DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_div_spot_co             DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_div_spot_pc             DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_div_spot_co             DOUBLE PRECISION;
+
+-- 7g. DTE-bucketed div_spot variants — _pc and _co.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_0_30d_div_spot_pc       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_0_30d_div_spot_co       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_0_30d_div_spot_pc      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_0_30d_div_spot_co      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_0_30d_div_spot_pc       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_0_30d_div_spot_co       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_31_90d_div_spot_pc      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_all_31_90d_div_spot_co      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_31_90d_div_spot_pc     DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_call_31_90d_div_spot_co     DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_31_90d_div_spot_pc      DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_put_31_90d_div_spot_co      DOUBLE PRECISION;
+
+-- 7h. Next-monthly div_spot variants — _pc and _co.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_next_monthly_div_spot_pc    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS oi_weighted_next_monthly_div_spot_co    DOUBLE PRECISION;
+
+-- 7i. Lag changes and z-scores of spot-dependent ratios — _pc and _co.
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS d1_oi_weighted_all_div_spot_change_pc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS d1_oi_weighted_all_div_spot_change_co   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS d5_oi_weighted_all_div_spot_change_pc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS d5_oi_weighted_all_div_spot_change_co   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_weighted_all_div_spot_3m_pc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_weighted_all_div_spot_3m_co   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m_pc       DOUBLE PRECISION;
+ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m_co       DOUBLE PRECISION;
