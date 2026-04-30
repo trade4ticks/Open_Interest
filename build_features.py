@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime, timedelta
 
 import duckdb
 import pandas as pd
@@ -27,6 +28,11 @@ import psycopg2.extras
 from db import get_connection, read_sql_df
 from lib.expirations import build_next_monthly_lookup
 from lib.parquet_store import list_tickers, parquet_glob
+
+# Backward window buffer (calendar days) when running with a date range.
+# 60-day z-scores need ~65 trading-day inputs; 130 calendar days covers that
+# comfortably even across long weekends / holidays.
+LOOKBACK_BUFFER_DAYS = 130
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,10 +43,17 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# OI features (DuckDB on parquet, joined to ohlc DF)
+# OI features (DuckDB on parquet, LEFT JOINed to ohlc + next_monthly DFs).
 # Inputs registered by the caller:
-#   oi    view over read_parquet(...)   — raw chain
-#   ohlc  pandas DF [trade_date, close, next_monthly]
+#   oi              view over read_parquet(...)   — raw chain
+#   ohlc            pandas DF [trade_date, close]
+#   next_monthly_df pandas DF [trade_date, next_monthly] — covers ALL OI dates
+#                   (independent of OHLC, so today's OI features still resolve
+#                   the next-monthly node even before today's OHLC arrives)
+#
+# LEFT JOIN ohlc means OI rows for today (no OHLC yet at 7am) survive the
+# join; spot_close becomes NULL and moneyness-dependent aggregates are
+# NULL-guarded below so they're properly NULL (not 0) when spot is unknown.
 # ---------------------------------------------------------------------------
 OI_FEATURES_SQL = """
 WITH joined AS (
@@ -51,13 +64,14 @@ WITH joined AS (
         oi.option_type,
         oi.open_interest,
         ohlc.close                                       AS spot_close,
-        ohlc.next_monthly                                AS next_monthly,
+        nm.next_monthly                                  AS next_monthly,
         (oi.expiration - oi.trade_date)::INTEGER         AS dte,
         CASE WHEN ohlc.close > 0
              THEN oi.strike / ohlc.close - 1.0
              ELSE NULL END                               AS moneyness
     FROM oi
-    JOIN ohlc USING (trade_date)
+    LEFT JOIN ohlc            USING (trade_date)
+    LEFT JOIN next_monthly_df nm USING (trade_date)
 ),
 per_day_agg AS (
     SELECT
@@ -67,10 +81,21 @@ per_day_agg AS (
         SUM(open_interest)                                                             AS total_oi,
         SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)                 AS call_oi,
         SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)                 AS put_oi,
-        SUM(CASE WHEN ABS(moneyness) <= 0.05 THEN open_interest ELSE 0 END)            AS oi_within_5pct,
-        SUM(CASE WHEN ABS(moneyness) <= 0.10 THEN open_interest ELSE 0 END)            AS oi_within_10pct,
-        SUM(CASE WHEN moneyness > 0 THEN open_interest ELSE 0 END)                     AS oi_above_spot,
-        SUM(CASE WHEN moneyness < 0 THEN open_interest ELSE 0 END)                     AS oi_below_spot,
+        -- moneyness IS NULL on a date with no OHLC yet (today, before market open).
+        -- Returning NULL (instead of summing the ELSE 0 branch) keeps the column
+        -- honest — "we don't know spot" rather than "0 OI within 5%".
+        SUM(CASE WHEN moneyness IS NULL          THEN NULL
+                 WHEN ABS(moneyness) <= 0.05     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_5pct,
+        SUM(CASE WHEN moneyness IS NULL          THEN NULL
+                 WHEN ABS(moneyness) <= 0.10     THEN open_interest
+                 ELSE 0 END)                                                           AS oi_within_10pct,
+        SUM(CASE WHEN moneyness IS NULL          THEN NULL
+                 WHEN moneyness > 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_above_spot,
+        SUM(CASE WHEN moneyness IS NULL          THEN NULL
+                 WHEN moneyness < 0              THEN open_interest
+                 ELSE 0 END)                                                           AS oi_below_spot,
         SUM(CASE WHEN dte BETWEEN 0  AND 30  THEN open_interest ELSE 0 END)            AS oi_0_30,
         SUM(CASE WHEN dte BETWEEN 31 AND 90  THEN open_interest ELSE 0 END)            AS oi_31_90,
         SUM(CASE WHEN dte BETWEEN 91 AND 365 THEN open_interest ELSE 0 END)            AS oi_91_365,
@@ -424,13 +449,41 @@ def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,
     return {r[0] for r in rows}
 
 
-def build_for_ticker(pg_conn, ticker: str) -> int:
+def build_for_ticker(pg_conn, ticker: str,
+                     start: date | None = None,
+                     end:   date | None = None) -> int:
+    """
+    Recompute daily_features for one ticker.
+
+    - start/end both None: full rebuild (entire history, fastest path through
+      a single DuckDB pass).
+    - start set: rebuild only [start, end] (end defaults to today). DuckDB
+      reads parquet+OHLC from (start - LOOKBACK_BUFFER_DAYS) so window
+      functions (LAG, 60-day z-scores) still see enough history; the result
+      is then sliced to [start, end] before INSERT, and only that range is
+      DELETEd from daily_features.
+    """
     log.info("--- %s ---", ticker)
 
-    ohlc = load_ohlc(pg_conn, ticker)
-    if ohlc.empty:
+    ohlc_full_df = load_ohlc(pg_conn, ticker)
+    if ohlc_full_df.empty:
         log.warning("  no OHLC for %s — skipping (run fetch_ohlc.py first)", ticker)
         return 0
+
+    end_eff = end or date.today()
+    if start is not None:
+        buffer_start = start - timedelta(days=LOOKBACK_BUFFER_DAYS)
+        ohlc = ohlc_full_df[
+            (ohlc_full_df["trade_date"] >= buffer_start)
+            & (ohlc_full_df["trade_date"] <= end_eff)
+        ].reset_index(drop=True)
+        date_filter_sql = (
+            f" WHERE trade_date >= DATE '{buffer_start.isoformat()}'"
+            f" AND trade_date <= DATE '{end_eff.isoformat()}'"
+        )
+    else:
+        ohlc = ohlc_full_df
+        date_filter_sql = ""
 
     con = duckdb.connect(database=":memory:")
 
@@ -440,14 +493,27 @@ def build_for_ticker(pg_conn, ticker: str) -> int:
         con.close()
         return 0
 
-    nm_lookup = build_next_monthly_lookup(ohlc["trade_date"].tolist(), listed)
-    ohlc["next_monthly"] = ohlc["trade_date"].map(nm_lookup)
+    # next_monthly must cover every trade_date that appears in the OI parquet
+    # (NOT just OHLC dates), so today's OI row resolves a next-monthly node
+    # even when today's OHLC hasn't been published yet.
+    oi_dates_rows = con.execute(
+        f"SELECT DISTINCT trade_date FROM read_parquet('{parquet_glob(ticker)}')"
+        f"{date_filter_sql} ORDER BY trade_date"
+    ).fetchall()
+    oi_dates = [r[0] for r in oi_dates_rows]
+    all_dates = sorted(set(ohlc["trade_date"].tolist()) | set(oi_dates))
+    nm_lookup = build_next_monthly_lookup(all_dates, listed)
+    nm_df = pd.DataFrame({
+        "trade_date":   list(nm_lookup.keys()),
+        "next_monthly": list(nm_lookup.values()),
+    })
 
-    con.register("ohlc",      ohlc[["trade_date", "close", "next_monthly"]])
-    con.register("ohlc_full", ohlc[["trade_date", "open", "close"]])
+    con.register("ohlc",            ohlc[["trade_date", "close"]])
+    con.register("ohlc_full",       ohlc[["trade_date", "open", "close"]])
+    con.register("next_monthly_df", nm_df)
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
-        f"SELECT * FROM read_parquet('{parquet_glob(ticker)}')"
+        f"SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}"
     )
 
     log.info("  computing OI features ...")
@@ -457,11 +523,18 @@ def build_for_ticker(pg_conn, ticker: str) -> int:
     con.close()
 
     if oi_feats.empty:
-        log.warning("  no OI/OHLC overlap for %s — skipping", ticker)
+        log.warning("  no OI rows in range for %s — skipping", ticker)
         return 0
 
     feats = oi_feats.merge(ohlc_feats, on="trade_date", how="left")
     feats.insert(0, "ticker", ticker)
+
+    # Drop the lookback buffer rows — they were only there for window context.
+    if start is not None:
+        feats = feats[feats["trade_date"] >= start].reset_index(drop=True)
+        if feats.empty:
+            log.info("  no rows in [%s, %s] for %s", start, end_eff, ticker)
+            return 0
 
     rows = [
         tuple(_pgify(r.get(c)) for c in INSERT_COLS)
@@ -469,7 +542,15 @@ def build_for_ticker(pg_conn, ticker: str) -> int:
     ]
 
     with pg_conn.cursor() as cur:
-        cur.execute(CLEAR_SQL, {"ticker": ticker})
+        if start is None:
+            cur.execute(CLEAR_SQL, {"ticker": ticker})
+        else:
+            cur.execute(
+                "DELETE FROM daily_features "
+                "WHERE ticker = %(ticker)s "
+                "  AND trade_date BETWEEN %(start)s AND %(end)s",
+                {"ticker": ticker, "start": start, "end": end_eff},
+            )
         psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
     pg_conn.commit()
 
@@ -512,17 +593,41 @@ def prompt_tickers() -> list[str]:
     return list_tickers()
 
 
+def prompt_date_range() -> tuple[date | None, date | None]:
+    """Returns (start, end) or (None, None) for a full-history rebuild."""
+    raw_start = input("Start date (blank = full history rebuild): ").strip()
+    if not raw_start:
+        return None, None
+    try:
+        start = datetime.strptime(raw_start, "%Y-%m-%d").date()
+    except ValueError:
+        raise SystemExit("Start date must be YYYY-MM-DD.")
+    raw_end = input("End date   (blank = today): ").strip()
+    if raw_end:
+        try:
+            end = datetime.strptime(raw_end, "%Y-%m-%d").date()
+        except ValueError:
+            raise SystemExit("End date must be YYYY-MM-DD.")
+    else:
+        end = date.today()
+    if end < start:
+        raise SystemExit("End date must be >= start date.")
+    return start, end
+
+
 def main() -> None:
     print("=== OI_Research — Build daily_features (parquet → Postgres) ===\n")
     tickers = prompt_tickers()
     if not tickers:
         print("No tickers in OI_RAW_DIR — run fetch_oi.py first.")
         return
-    print(f"\nRebuilding features for: {', '.join(tickers)}\n")
+    start, end = prompt_date_range()
+    range_label = f"{start} → {end}" if start else "full history"
+    print(f"\nRebuilding features ({range_label}) for: {', '.join(tickers)}\n")
 
     with get_connection() as conn:
         for t in tickers:
-            build_for_ticker(conn, t)
+            build_for_ticker(conn, t, start=start, end=end)
     print("\nDone.")
 
 
