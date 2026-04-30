@@ -64,35 +64,34 @@ log = logging.getLogger(__name__)
 # (not 0) when its spot is unknown.
 # ---------------------------------------------------------------------------
 OI_FEATURES_SQL = """
-WITH ohlc_with_prev AS (
-    -- prev_close (yesterday's close) computed via LAG, inline in this query
-    -- rather than via a pre-created view. Earlier attempts using a separately-
-    -- created view (and earlier still, pandas .shift(1)) returned all-NULL
-    -- prev_close after the LEFT JOIN below — the inline CTE form works.
-    SELECT trade_date, open, close,
-           LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close
-    FROM ohlc
-),
-joined AS (
+WITH joined AS (
+    -- spot_pc and spot_co need different JOINs:
+    --   spot_pc = close of the most recent OHLC row STRICTLY BEFORE the OI's
+    --            trade_date. ASOF LEFT JOIN handles this directly. For today
+    --            (no OHLC row yet at 7am ET), this still resolves to
+    --            yesterday's close — which is what we want.
+    --   spot_co = open of the SAME trade_date. Plain equality LEFT JOIN.
+    --            Today's row gets NULL until today's OHLC is ingested.
     SELECT
         oi.trade_date,
         oi.expiration,
         oi.strike,
         oi.option_type,
         oi.open_interest,
-        ohp.prev_close                                   AS spot_pc,
-        ohp.open                                         AS spot_co,
+        ohlc_pc.close                                    AS spot_pc,
+        ohlc_co.open                                     AS spot_co,
         nm.next_monthly                                  AS next_monthly,
         (oi.expiration - oi.trade_date)::INTEGER         AS dte,
-        CASE WHEN ohp.prev_close > 0
-             THEN oi.strike / ohp.prev_close - 1.0
+        CASE WHEN ohlc_pc.close > 0
+             THEN oi.strike / ohlc_pc.close - 1.0
              ELSE NULL END                               AS moneyness_pc,
-        CASE WHEN ohp.open > 0
-             THEN oi.strike / ohp.open - 1.0
+        CASE WHEN ohlc_co.open > 0
+             THEN oi.strike / ohlc_co.open - 1.0
              ELSE NULL END                               AS moneyness_co
     FROM oi
-    LEFT JOIN ohlc_with_prev  ohp USING (trade_date)
-    LEFT JOIN next_monthly_df nm  USING (trade_date)
+    ASOF LEFT JOIN ohlc ohlc_pc      ON oi.trade_date > ohlc_pc.trade_date
+    LEFT JOIN      ohlc ohlc_co      ON oi.trade_date = ohlc_co.trade_date
+    LEFT JOIN      next_monthly_df nm ON oi.trade_date = nm.trade_date
 ),
 per_day_agg AS (
     SELECT
@@ -606,19 +605,10 @@ def build_for_ticker(pg_conn, ticker: str,
         "next_monthly": list(nm_lookup.values()),
     })
 
-    # Register the raw OHLC; prev_close gets computed inline as a CTE inside
-    # OI_FEATURES_SQL. Both feature queries read from `ohlc` directly (no
-    # intermediate view).
+    # Register the raw OHLC. spot_pc and spot_co are resolved via two JOINs in
+    # OI_FEATURES_SQL — see the comment in the joined CTE for the asymmetry.
     con.register("ohlc",            ohlc[["trade_date", "open", "close"]])
     con.register("next_monthly_df", nm_df)
-
-    # Diagnostic — confirm DuckDB sees the OHLC rows we registered.
-    n_ohlc = con.execute("SELECT COUNT(*) FROM ohlc").fetchone()[0]
-    n_with_prev = con.execute("""
-        SELECT COUNT(prev_close)
-        FROM (SELECT LAG(close, 1) OVER (ORDER BY trade_date) AS prev_close FROM ohlc) t
-    """).fetchone()[0]
-    log.info("  ohlc rows: %d   prev_close populated: %d", n_ohlc, n_with_prev)
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
         f"SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}"
