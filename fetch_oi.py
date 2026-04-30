@@ -32,7 +32,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from lib.market_hours import get_trading_days, last_trading_day
-from lib.parquet_store import write_rows
+from lib.parquet_store import list_tickers, write_rows
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
@@ -53,10 +53,16 @@ MAX_WORKERS = 6
 # --- Prompts ---------------------------------------------------------------
 
 def prompt_tickers() -> list[str]:
-    raw = input("Tickers (comma-separated, e.g. SPY,QQQ,AAPL): ").strip()
-    out = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    raw = input(
+        "Tickers (comma-separated; blank = all tickers in OI_RAW_DIR): "
+    ).strip()
+    if raw:
+        return [t.strip().upper() for t in raw.split(",") if t.strip()]
+    out = list_tickers()
     if not out:
-        raise SystemExit("No tickers entered.")
+        raise SystemExit(
+            "No tickers entered and OI_RAW_DIR is empty — please specify."
+        )
     return out
 
 

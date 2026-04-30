@@ -41,11 +41,19 @@ ON CONFLICT (ticker, trade_date) DO UPDATE SET
 """
 
 
-def prompt_tickers() -> list[str]:
-    raw = input("Tickers (comma-separated, e.g. SPY,QQQ,AAPL): ").strip()
-    out = [t.strip().upper() for t in raw.split(",") if t.strip()]
+def prompt_tickers(conn) -> list[str]:
+    raw = input(
+        "Tickers (comma-separated; blank = all tickers in underlying_ohlc): "
+    ).strip()
+    if raw:
+        return [t.strip().upper() for t in raw.split(",") if t.strip()]
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT ticker FROM underlying_ohlc ORDER BY ticker")
+        out = [r[0] for r in cur.fetchall()]
     if not out:
-        raise SystemExit("No tickers entered.")
+        raise SystemExit(
+            "No tickers entered and underlying_ohlc is empty — please specify."
+        )
     return out
 
 
@@ -108,15 +116,15 @@ def fetch_one(ticker: str, start: date, end: date) -> list[tuple]:
 
 def main() -> None:
     print("=== OI_Research — Daily OHLC fetch ===\n")
-    tickers = prompt_tickers()
-    start   = prompt_date("Start date")
-    end     = prompt_date("End   date")
-    if end < start:
-        raise SystemExit("End date must be >= start date.")
-
-    print(f"\nFetching {len(tickers)} tickers from {start} → {end}")
-
     with get_connection() as conn:
+        tickers = prompt_tickers(conn)
+        start   = prompt_date("Start date")
+        end     = prompt_date("End   date")
+        if end < start:
+            raise SystemExit("End date must be >= start date.")
+
+        print(f"\nFetching {len(tickers)} tickers from {start} → {end}")
+
         for t in tickers:
             log.info("yfinance: %s ...", t)
             rows = fetch_one(t, start, end)
