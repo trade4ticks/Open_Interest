@@ -106,7 +106,9 @@ Percentage / aggregate features (denominator = full unfiltered chain):
 `pct_oi_0_30d`, `pct_oi_31_90d`, `pct_oi_91_365d`,
 `pct_oi_next_monthly`, `oi_weighted_strike_next_monthly_div_spot`.
 
-Pct changes / derived-ratio changes / 90-trading-day z-scores:
+Pct changes / derived-ratio changes / 60-trading-day (~3-month) z-scores —
+each z-score is NULL until at least 60 prior observations exist for that
+column, so early rows in the series are NULL by design:
 `d1_total_oi_pct_change`, `d5_total_oi_pct_change`,
 `d1_d5_ratio_total_oi_pct_change`,
 `d1_oi_weighted_strike_all_div_spot_change`, `d5_oi_weighted_strike_all_div_spot_change`,

@@ -181,7 +181,7 @@ ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_7d_fwd_cc  CASCADE;
 ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_10d_fwd_cc CASCADE;
 ALTER TABLE daily_features DROP COLUMN IF EXISTS ret_20d_fwd_cc CASCADE;
 
--- Pct-change / derived-ratio change / 90-day z-score features.
+-- Pct-change / derived-ratio change / 60-day (~3-month) z-score features.
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_total_oi_pct_change                       DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d5_total_oi_pct_change                       DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS d1_d5_ratio_total_oi_pct_change              DOUBLE PRECISION;

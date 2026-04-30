@@ -202,25 +202,42 @@ oi_lags AS (
     FROM per_day
     WINDOW w_t AS (ORDER BY trade_date)
 ),
--- 90-trading-day z-scores and the d1/d5 pct-change ratio.
+-- 60-trading-day (~3-month) z-scores and the d1/d5 pct-change ratio.
+-- Each z-score is gated by COUNT(col) >= 60 so we don't emit a "z-score" off
+-- 2-3 observations early in the series — those would be noise, not signal.
 -- Joined back to per_day so we can z-score the derived ratios in the same pass.
 oi_zscores AS (
     SELECT
         trade_date,
         d1_total_oi_pct_change / NULLIF(d5_total_oi_pct_change, 0)                  AS d1_d5_ratio_total_oi_pct_change,
-        (d1_total_oi_change - AVG(d1_total_oi_change) OVER w90)
-            / NULLIF(STDDEV_SAMP(d1_total_oi_change) OVER w90, 0)                   AS zscore_d1_oi_change_3m,
-        (d5_total_oi_change - AVG(d5_total_oi_change) OVER w90)
-            / NULLIF(STDDEV_SAMP(d5_total_oi_change) OVER w90, 0)                   AS zscore_d5_oi_change_3m,
-        (oi_weighted_strike_all_div_spot - AVG(oi_weighted_strike_all_div_spot) OVER w90)
-            / NULLIF(STDDEV_SAMP(oi_weighted_strike_all_div_spot) OVER w90, 0)
-                                                                                    AS zscore_oi_weighted_strike_all_div_spot_3m,
-        (put_call_oi_ratio - AVG(put_call_oi_ratio) OVER w90)
-            / NULLIF(STDDEV_SAMP(put_call_oi_ratio) OVER w90, 0)                    AS zscore_put_call_oi_ratio_3m,
-        (oi_above_below_ratio - AVG(oi_above_below_ratio) OVER w90)
-            / NULLIF(STDDEV_SAMP(oi_above_below_ratio) OVER w90, 0)                 AS zscore_oi_above_below_ratio_3m
+        CASE WHEN COUNT(d1_total_oi_change) OVER w60 >= 60
+             THEN (d1_total_oi_change - AVG(d1_total_oi_change) OVER w60)
+                  / NULLIF(STDDEV_SAMP(d1_total_oi_change) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_d1_oi_change_3m,
+        CASE WHEN COUNT(d5_total_oi_change) OVER w60 >= 60
+             THEN (d5_total_oi_change - AVG(d5_total_oi_change) OVER w60)
+                  / NULLIF(STDDEV_SAMP(d5_total_oi_change) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_d5_oi_change_3m,
+        CASE WHEN COUNT(oi_weighted_strike_all_div_spot) OVER w60 >= 60
+             THEN (oi_weighted_strike_all_div_spot
+                   - AVG(oi_weighted_strike_all_div_spot) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_weighted_strike_all_div_spot) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_oi_weighted_strike_all_div_spot_3m,
+        CASE WHEN COUNT(put_call_oi_ratio) OVER w60 >= 60
+             THEN (put_call_oi_ratio - AVG(put_call_oi_ratio) OVER w60)
+                  / NULLIF(STDDEV_SAMP(put_call_oi_ratio) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_put_call_oi_ratio_3m,
+        CASE WHEN COUNT(oi_above_below_ratio) OVER w60 >= 60
+             THEN (oi_above_below_ratio - AVG(oi_above_below_ratio) OVER w60)
+                  / NULLIF(STDDEV_SAMP(oi_above_below_ratio) OVER w60, 0)
+             ELSE NULL
+        END                                                                         AS zscore_oi_above_below_ratio_3m
     FROM oi_lags JOIN per_day USING (trade_date)
-    WINDOW w90 AS (ORDER BY trade_date ROWS BETWEEN 89 PRECEDING AND CURRENT ROW)
+    WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 )
 SELECT
     p.trade_date,
