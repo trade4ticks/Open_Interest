@@ -208,6 +208,83 @@ def fetch_oi_day(symbol: str, trading_day: date,
     return df
 
 
+def fetch_oi_snapshot(symbol: str, trade_date: date,
+                      timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Fetch the CURRENT OI chain for one ticker (entire chain, all expirations).
+
+    Endpoint: /v3/option/snapshot/open_interest with `expiration=*` (strike
+    and right default to *). The history endpoint typically lags by ~1 day
+    (today's row isn't in /history/open_interest yet at 7am ET); the
+    snapshot endpoint is the only way to capture today's chain on the day
+    itself.
+
+    `trade_date` is the date the caller wants stamped on every row. Pass
+    `last_trading_day(today)` so weekend / holiday runs anchor to the most
+    recent session (the OI hasn't changed since then).
+
+    Returns DataFrame[trade_date, expiration, strike, option_type, open_interest].
+    Empty DataFrame iff terminal returned no data (NOT on transport errors).
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+    }
+
+    try:
+        data = _get("/v3/option/snapshot/open_interest", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (snapshot %s)", symbol)
+        time.sleep(60)
+        data = _get("/v3/option/snapshot/open_interest", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (snapshot %s)", symbol)
+        time.sleep(10)
+        data = _get("/v3/option/snapshot/open_interest", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for row in rows:
+        exp = _parse_ymd(row.get("expiration"))
+        if exp is None:
+            continue
+
+        oi = row.get("open_interest")
+        if oi is None or oi == 0:
+            continue
+
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
+        )
+        if option_type not in ("C", "P"):
+            continue
+
+        records.append({
+            "trade_date":    trade_date,
+            "expiration":    exp,
+            "strike":        row.get("strike"),
+            "option_type":   option_type,
+            "open_interest": oi,
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["strike"]        = pd.to_numeric(df["strike"],        errors="coerce")
+    df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["strike", "open_interest"])
+    return df
+
+
 def test_connection() -> bool:
     try:
         return bool(list_expirations("SPY"))

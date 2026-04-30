@@ -70,22 +70,33 @@ psql -d open_interest -c "DROP TABLE option_oi_raw;"
 ## Daily workflow (interactive)
 
 ```bash
-python fetch_ohlc.py     # prompts for tickers + date range (blank ticker = all already-loaded)
-python fetch_oi.py       # prompts for tickers + date range
-python build_features.py # prompts for tickers + date range (blank = full history rebuild)
+python fetch_ohlc.py         # prompts for tickers + date range (blank ticker = all already-loaded)
+python fetch_oi.py           # prompts for tickers + date range — history endpoint (lags ~1 day)
+python fetch_oi_snapshot.py  # prompts for tickers — captures TODAY's chain via the snapshot endpoint
+python build_features.py     # prompts for tickers + date range (blank = full history rebuild)
 ```
 
 `fetch_oi.py` no longer rebuilds a surface table — derived metrics are
 computed on demand by `build_features.py` directly from the raw parquet.
 
+The history endpoint (`/v3/option/history/open_interest`) typically lags
+by ~1 day, so today's chain isn't in it yet at 7am ET. The snapshot
+endpoint (`/v3/option/snapshot/open_interest`) returns the current OI
+for every contract in one call per ticker. Both write to the same
+parquet store; the writer dedupes on
+`(trade_date, expiration, strike, option_type)` keeping last, so when
+tomorrow's history fetch finally returns today, it overwrites the
+snapshot value cleanly.
+
 ## Daily workflow (cron)
 
-`run_pipeline.py` runs all three steps in sequence over rolling windows:
+`run_pipeline.py` runs the four steps in sequence over rolling windows:
 
-- OHLC: rolling 10 calendar days (~7 trading days)
-- OI:   rolling 10 calendar days
-- Features: rolling 45 calendar days (~30 trading days — keeps recent rows
-  current and lets older `ret_*_fwd_oc` fill in as new OHLC arrives)
+- OHLC:        rolling 10 calendar days (~7 trading days)
+- OI history:  rolling 10 calendar days (fills/refreshes the prior week)
+- OI snapshot: today only (or last_trading_day on weekends / holidays)
+- Features:    rolling 45 calendar days (~30 trading days — keeps recent
+  rows current and lets older `ret_*_fwd_oc` fill in as new OHLC arrives)
 
 Operates on every ticker already in `underlying_ohlc` / `OI_RAW_DIR`; does
 not add new tickers (run the interactive scripts manually for that).

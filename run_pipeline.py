@@ -40,7 +40,8 @@ from pathlib import Path
 from build_features import build_for_ticker
 from db import get_connection
 from fetch_ohlc import run as run_ohlc_fetch
-from fetch_oi import fetch_ticker as run_oi_fetch
+from fetch_oi import fetch_ticker as run_oi_history_fetch
+from fetch_oi_snapshot import fetch_ticker as run_oi_snapshot_fetch
 from lib.market_hours import get_trading_days, last_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import test_connection as test_thetadata
@@ -99,15 +100,26 @@ def main() -> None:
         for t in sorted(ohlc_tickers):
             run_ohlc_fetch(conn, t, ohlc_start, ohlc_end)
 
-        # 2. OI fetch — ThetaData publishes today's OI ~6:30am ET.
+        # 2a. OI history — fills/refreshes the prior week. The history
+        #     endpoint typically lags by ~1 day so today usually returns
+        #     nothing here; that's expected (snapshot covers today).
         oi_end   = today
         oi_start = oi_end - timedelta(days=OI_LOOKBACK_DAYS)
         oi_trading_days = get_trading_days(oi_start, oi_end)
-        log.info("--- OI fetch: %s → %s (%d trading days) ---",
+        log.info("--- OI history: %s → %s (%d trading days) ---",
                  oi_start, oi_end, len(oi_trading_days))
         for t in sorted(oi_tickers):
             log.info("  %s ...", t)
-            run_oi_fetch(t, oi_trading_days)
+            run_oi_history_fetch(t, oi_trading_days)
+
+        # 2b. OI snapshot — today's chain (or last_trading_day(today) on
+        #     weekends / holidays). Stamped onto today's row in the parquet
+        #     store; tomorrow's history fetch will overwrite it with the
+        #     authoritative EOD value (parquet dedupe keeps last).
+        snapshot_td = last_trading_day(today)
+        log.info("--- OI snapshot: trade_date = %s ---", snapshot_td)
+        for t in sorted(oi_tickers):
+            run_oi_snapshot_fetch(t, snapshot_td)
 
         # 3. build_features — rolling ~30-trading-day rebuild keeps recent
         #    rows current AND lets older ret_*_fwd_oc fill in as new OHLC
