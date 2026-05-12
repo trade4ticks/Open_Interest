@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import bisect
 import logging
 from datetime import date, datetime, timedelta
 
@@ -532,6 +533,46 @@ def load_ohlc(conn, ticker: str) -> pd.DataFrame:
     return df
 
 
+def load_splits(conn, ticker: str) -> pd.DataFrame:
+    """Pull non-zero split events for one ticker, sorted ascending by date."""
+    df = read_sql_df(
+        conn,
+        "SELECT trade_date, splits FROM underlying_ohlc "
+        "WHERE ticker = %(ticker)s AND splits IS NOT NULL AND splits != 0 "
+        "ORDER BY trade_date",
+        {"ticker": ticker},
+    )
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    return df
+
+
+def make_split_factors(splits_df: pd.DataFrame, oi_dates: list) -> pd.DataFrame:
+    """Return DataFrame(trade_date, adj_factor) for each date in oi_dates.
+
+    adj_factor = product of (1/ratio) for all splits on or after trade_date.
+    Converts pre-split strikes to current (post-split) terms.
+    Handles forward splits (ratio > 1) and reverse splits (ratio < 1) uniformly.
+    For tickers with no splits every factor is 1.0 (no-op).
+    """
+    if splits_df.empty:
+        return pd.DataFrame({"trade_date": oi_dates,
+                             "adj_factor":  [1.0] * len(oi_dates)})
+
+    split_dates  = splits_df["trade_date"].tolist()   # sorted asc by query
+    split_ratios = splits_df["splits"].tolist()
+
+    # Build suffix cumulative product: suffix_factors[i] = prod(1/ratio for splits[i:])
+    # Boundary: trade_date <= split_date → adjust (bisect_left returns that split's idx)
+    #           trade_date >  split_date → no adjustment (idx past the split)
+    n = len(split_dates)
+    suffix_factors = [1.0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_factors[i] = suffix_factors[i + 1] / split_ratios[i]
+
+    factors = [suffix_factors[bisect.bisect_left(split_dates, td)] for td in oi_dates]
+    return pd.DataFrame({"trade_date": oi_dates, "adj_factor": factors})
+
+
 def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,
                                     ticker: str) -> set:
     rows = con.execute(
@@ -605,13 +646,34 @@ def build_for_ticker(pg_conn, ticker: str,
         "next_monthly": list(nm_lookup.values()),
     })
 
+    # Build per-trade_date strike adjustment factors to normalise pre-split OI
+    # strikes to current (post-split) price terms.  ThetaData does not adjust
+    # historical strikes for splits, so without this, any metric that divides
+    # strike by spot (OI-weighted strikes, moneyness bands, above/below-spot OI)
+    # is wrong for all trade_dates before a split event.  The 1-day CBOE
+    # publication lag means trade_date == split_date is still pre-split OI, so
+    # the boundary is: adjust for trade_date <= split_date.
+    splits_df = load_splits(pg_conn, ticker)
+    sf_df     = make_split_factors(splits_df, oi_dates)
+    if not splits_df.empty:
+        log.info("  applying split adjustments for %d event(s): %s",
+                 len(splits_df),
+                 ", ".join(f"{r.trade_date}×{r.splits}" for r in splits_df.itertuples()))
+
     # Register the raw OHLC. spot_pc and spot_co are resolved via two JOINs in
     # OI_FEATURES_SQL — see the comment in the joined CTE for the asymmetry.
     con.register("ohlc",            ohlc[["trade_date", "open", "close"]])
     con.register("next_monthly_df", nm_df)
+    con.register("split_factors",   sf_df)
+    # The oi view applies split-adjustment to strike via a LEFT JOIN on split_factors.
+    # Rows with no split event in their history get adj_factor=1.0 (COALESCE guard).
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
-        f"SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}"
+        f"SELECT raw.trade_date, raw.expiration, "
+        f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
+        f"       raw.option_type, raw.open_interest "
+        f"FROM (SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}) raw "
+        f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
     )
 
     log.info("  computing OI features ...")
