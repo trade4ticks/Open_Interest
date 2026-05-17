@@ -285,6 +285,177 @@ def fetch_oi_snapshot(symbol: str, trade_date: date,
     return df
 
 
+def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
+                     timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Fetch EOD option volume for a date range in one HTTP call.
+
+    Endpoint: /v3/option/history/eod with expiration=* (all expirations).
+    Report is available at 17:15 ET, well before the 7am pipeline run.
+
+    Returns DataFrame[trade_date, expiration, strike, option_type, volume].
+    Empty DataFrame if terminal returned no data.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+        "start_date": start_date.strftime("%Y%m%d"),
+        "end_date":   end_date.strftime("%Y%m%d"),
+    }
+
+    try:
+        data = _get("/v3/option/history/eod", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (vol_eod %s)", symbol)
+        time.sleep(60)
+        data = _get("/v3/option/history/eod", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (vol_eod %s)", symbol)
+        time.sleep(10)
+        data = _get("/v3/option/history/eod", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for row in rows:
+        d = _parse_ymd(row.get("date"))
+        if d is None:
+            continue
+
+        exp = _parse_ymd(row.get("expiration"))
+        if exp is None:
+            continue
+
+        vol = row.get("volume")
+        if vol is None:
+            continue
+
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
+        )
+        if option_type not in ("C", "P"):
+            continue
+
+        records.append({
+            "trade_date":  d,
+            "expiration":  exp,
+            "strike":      row.get("strike"),
+            "option_type": option_type,
+            "volume":      vol,
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["strike", "volume"])
+    return df
+
+
+def fetch_greeks_1545(symbol: str, expiration: date,
+                      start_date: date, end_date: date,
+                      timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Fetch 15:45 first-order Greeks for one expiration over a date range.
+
+    Endpoint: /v3/option/history/greeks/first_order
+    Params: interval=5m, start_time=15:45, end_time=15:45, strike_range=10
+    (21 strikes around ATM — keeps response size small).
+
+    expiration must be a specific date (no wildcard — API requirement).
+    Callers should loop over the expirations they need and call once per.
+
+    Returns DataFrame[trade_date, expiration, strike, option_type,
+                      implied_vol, delta, underlying_price].
+    Empty DataFrame if terminal returned no data.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": expiration.strftime("%Y%m%d"),
+        "start_date": start_date.strftime("%Y%m%d"),
+        "end_date":   end_date.strftime("%Y%m%d"),
+        "interval":   "5m",
+        "start_time": "15:45",
+        "end_time":   "15:45",
+        "strike_range": 10,
+    }
+
+    try:
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (greeks %s %s)",
+                    symbol, expiration)
+        time.sleep(60)
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (greeks %s %s)",
+                    symbol, expiration)
+        time.sleep(10)
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for row in rows:
+        d = _parse_ymd(row.get("date"))
+        if d is None:
+            continue
+
+        exp = _parse_ymd(row.get("expiration"))
+        if exp is None:
+            exp = expiration
+
+        iv = row.get("implied_vol") or row.get("iv")
+        delta = row.get("delta")
+        if iv is None or delta is None:
+            continue
+
+        underlying = row.get("underlying_price") or row.get("underlying")
+
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
+        )
+        if option_type not in ("C", "P"):
+            continue
+
+        records.append({
+            "trade_date":       d,
+            "expiration":       exp,
+            "strike":           row.get("strike"),
+            "option_type":      option_type,
+            "implied_vol":      iv,
+            "delta":            delta,
+            "underlying_price": underlying,
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["strike"]           = pd.to_numeric(df["strike"],           errors="coerce")
+    df["implied_vol"]      = pd.to_numeric(df["implied_vol"],      errors="coerce")
+    df["delta"]            = pd.to_numeric(df["delta"],            errors="coerce")
+    df["underlying_price"] = pd.to_numeric(df["underlying_price"], errors="coerce")
+    df = df.dropna(subset=["strike", "implied_vol", "delta"])
+    return df
+
+
 def test_connection() -> bool:
     try:
         return bool(list_expirations("SPY"))

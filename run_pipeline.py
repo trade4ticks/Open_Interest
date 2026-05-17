@@ -39,10 +39,12 @@ from pathlib import Path
 
 from build_features import build_for_ticker
 from db import get_connection
+from fetch_iv_chain import fetch_ticker as run_iv_chain_fetch
 from fetch_ohlc import run as run_ohlc_fetch
 from fetch_oi import fetch_ticker as run_oi_history_fetch
 from fetch_oi_snapshot import fetch_ticker as run_oi_snapshot_fetch
-from lib.market_hours import get_trading_days, last_trading_day
+from fetch_volume_eod import fetch_ticker as run_vol_eod_fetch
+from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import test_connection as test_thetadata
 
@@ -120,6 +122,28 @@ def main() -> None:
         log.info("--- OI snapshot: trade_date = %s ---", snapshot_td)
         for t in sorted(oi_tickers):
             run_oi_snapshot_fetch(t, snapshot_td)
+
+        # 2c. EOD option volume — yesterday's report (T-1), stored as today's
+        #     trade_date (T) to align with OI and OHLC. Report is available
+        #     by 17:15 ET so it's always ready for the 7am run.
+        vol_fetch_end   = last_trading_day(today)   # T-1 perspective
+        vol_fetch_start = vol_fetch_end - timedelta(days=OI_LOOKBACK_DAYS)
+        vol_fetch_days  = get_trading_days(vol_fetch_start, vol_fetch_end)
+        log.info("--- EOD vol fetch: %s → %s (%d trading days) ---",
+                 vol_fetch_start, vol_fetch_end, len(vol_fetch_days))
+        for t in sorted(oi_tickers):
+            log.info("  %s ...", t)
+            run_vol_eod_fetch(conn, t, vol_fetch_days)
+
+        # 2d. IV chain (15:45 greeks) — same T-1/T date alignment as vol.
+        iv_fetch_end   = last_trading_day(today)
+        iv_fetch_start = iv_fetch_end - timedelta(days=OI_LOOKBACK_DAYS)
+        iv_fetch_days  = get_trading_days(iv_fetch_start, iv_fetch_end)
+        log.info("--- IV chain fetch: %s → %s (%d trading days) ---",
+                 iv_fetch_start, iv_fetch_end, len(iv_fetch_days))
+        for t in sorted(oi_tickers):
+            log.info("  %s ...", t)
+            run_iv_chain_fetch(conn, t, iv_fetch_days)
 
         # 3. build_features — rolling ~30-trading-day rebuild keeps recent
         #    rows current AND lets older ret_*_fwd_oc fill in as new OHLC

@@ -35,6 +35,11 @@ from lib.parquet_store import list_tickers, parquet_glob
 # comfortably even across long weekends / holidays.
 LOOKBACK_BUFFER_DAYS = 130
 
+# Wider buffer applied only to the OHLC pandas slice.
+# 52-week metrics require 252 trading days ≈ 365 calendar days of OHLC;
+# 400 adds ~10% slack for holidays and non-trading periods.
+OHLC_LOOKBACK_BUFFER_DAYS = 400
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -428,27 +433,308 @@ ORDER BY p.trade_date
 # trade_date itself, ret_3d is from trade_date open to close[+2], etc.
 # ---------------------------------------------------------------------------
 OHLC_FEATURES_SQL = """
-WITH ret AS (
-    SELECT trade_date, open, close,
-           LN(NULLIF(close, 0)
-              / NULLIF(LAG(close) OVER (ORDER BY trade_date), 0)) AS log_ret
+WITH base AS (
+    SELECT
+        trade_date, open, high, low, close, volume,
+        LN(
+            NULLIF(close, 0) /
+            NULLIF(LAG(close) OVER (ORDER BY trade_date), 0)
+        ) AS log_ret,
+        GREATEST(
+            high - low,
+            ABS(high - LAG(close) OVER (ORDER BY trade_date)),
+            ABS(low  - LAG(close) OVER (ORDER BY trade_date))
+        ) AS true_range
     FROM ohlc
+),
+windowed AS (
+    SELECT
+        trade_date, open, close, volume, log_ret, true_range,
+        -- Realized vol
+        STDDEV_SAMP(log_ret) OVER w5  * SQRT(252)                  AS rv_5d,
+        STDDEV_SAMP(log_ret) OVER w20 * SQRT(252)                  AS rv_20d,
+        -- Moving averages
+        AVG(close) OVER w20                                         AS ma20,
+        AVG(close) OVER w50                                         AS ma50,
+        -- 52-week extremes
+        MAX(close) OVER w252                                        AS hi52,
+        MIN(close) OVER w252                                        AS lo52,
+        -- Donchian channel components
+        MAX(high)  OVER w20                                         AS hi20,
+        MIN(low)   OVER w20                                         AS lo20,
+        -- Average true range (14-day)
+        AVG(true_range) OVER w14                                    AS atr_14d,
+        -- Backward returns
+        close / NULLIF(LAG(close,  5) OVER w_t, 0) - 1             AS ret_5d,
+        close / NULLIF(LAG(close, 10) OVER w_t, 0) - 1             AS ret_10d,
+        close / NULLIF(LAG(close, 20) OVER w_t, 0) - 1             AS ret_20d,
+        -- Forward returns (entry = open of trade_date)
+        close                      / NULLIF(open, 0) - 1           AS ret_1d_fwd_oc,
+        LEAD(close,  2) OVER w_t   / NULLIF(open, 0) - 1           AS ret_3d_fwd_oc,
+        LEAD(close,  4) OVER w_t   / NULLIF(open, 0) - 1           AS ret_5d_fwd_oc,
+        LEAD(close,  6) OVER w_t   / NULLIF(open, 0) - 1           AS ret_7d_fwd_oc,
+        LEAD(close,  9) OVER w_t   / NULLIF(open, 0) - 1           AS ret_10d_fwd_oc,
+        LEAD(close, 19) OVER w_t   / NULLIF(open, 0) - 1           AS ret_20d_fwd_oc,
+        -- Up-day frequency (20-day)
+        AVG(CASE WHEN log_ret > 0 THEN 1.0 ELSE 0.0 END) OVER w20  AS pct_up_days_20d,
+        -- Volume-weighted directional indicator (OBV-style, normalized)
+        SUM(SIGN(log_ret) * volume::DOUBLE) OVER w20
+            / NULLIF(SUM(volume::DOUBLE) OVER w20, 0)               AS cum_signed_vol_20d
+    FROM base
+    WINDOW
+        w_t  AS (ORDER BY trade_date),
+        w5   AS (ORDER BY trade_date ROWS BETWEEN   4 PRECEDING AND CURRENT ROW),
+        w14  AS (ORDER BY trade_date ROWS BETWEEN  13 PRECEDING AND CURRENT ROW),
+        w20  AS (ORDER BY trade_date ROWS BETWEEN  19 PRECEDING AND CURRENT ROW),
+        w50  AS (ORDER BY trade_date ROWS BETWEEN  49 PRECEDING AND CURRENT ROW),
+        w252 AS (ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
+),
+derived AS (
+    SELECT
+        *,
+        close / NULLIF(ma20, 0) - 1                                 AS pct_from_ma20,
+        close / NULLIF(ma50, 0) - 1                                 AS pct_from_ma50,
+        close / NULLIF(hi52, 0) - 1                                 AS pct_from_52w_high,
+        close / NULLIF(lo52, 0) - 1                                 AS pct_from_52w_low,
+        (close - lo20) / NULLIF(hi20 - lo20, 0)                     AS donchian_pos_20d,
+        ma20 / NULLIF(LAG(ma20, 5) OVER (ORDER BY trade_date), 0) - 1 AS ma20_slope_5d,
+        rv_5d / NULLIF(rv_20d, 0)                                   AS rv_ratio_5d_20d,
+        ret_5d / NULLIF(atr_14d, 0)                                 AS atr_normalized_ret_5d
+    FROM windowed
+),
+zscores AS (
+    SELECT
+        trade_date,
+        CASE WHEN COUNT(pct_from_ma20) OVER w60 >= 60
+             THEN (pct_from_ma20 - AVG(pct_from_ma20) OVER w60)
+                  / NULLIF(STDDEV_SAMP(pct_from_ma20) OVER w60, 0)
+             ELSE NULL END                                          AS zscore_price_vs_ma20,
+        CASE WHEN COUNT(pct_from_ma50) OVER w60 >= 60
+             THEN (pct_from_ma50 - AVG(pct_from_ma50) OVER w60)
+                  / NULLIF(STDDEV_SAMP(pct_from_ma50) OVER w60, 0)
+             ELSE NULL END                                          AS zscore_price_vs_ma50,
+        CASE WHEN COUNT(rv_20d) OVER w60 >= 60
+             THEN (rv_20d - AVG(rv_20d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(rv_20d) OVER w60, 0)
+             ELSE NULL END                                          AS zscore_underlying_vol_20d
+    FROM derived
+    WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 )
 SELECT
-    trade_date,
-    STDDEV_SAMP(log_ret) OVER w5  * SQRT(252)                              AS rv_5d,
-    STDDEV_SAMP(log_ret) OVER w20 * SQRT(252)                              AS rv_20d,
-    close                         / NULLIF(open, 0) - 1                    AS ret_1d_fwd_oc,
-    LEAD(close,  2) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_3d_fwd_oc,
-    LEAD(close,  4) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_5d_fwd_oc,
-    LEAD(close,  6) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_7d_fwd_oc,
-    LEAD(close,  9) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_10d_fwd_oc,
-    LEAD(close, 19) OVER w_t      / NULLIF(open, 0) - 1                    AS ret_20d_fwd_oc
-FROM ret
-WINDOW
-    w_t AS (ORDER BY trade_date),
-    w5  AS (ORDER BY trade_date ROWS BETWEEN 4  PRECEDING AND CURRENT ROW),
-    w20 AS (ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+    d.trade_date,
+    d.rv_5d,
+    d.rv_20d,
+    d.ret_1d_fwd_oc, d.ret_3d_fwd_oc,  d.ret_5d_fwd_oc,
+    d.ret_7d_fwd_oc, d.ret_10d_fwd_oc, d.ret_20d_fwd_oc,
+    d.ret_5d,
+    d.ret_10d,
+    d.ret_20d,
+    d.pct_from_ma20,
+    d.pct_from_ma50,
+    d.pct_from_52w_high,
+    d.pct_from_52w_low,
+    d.donchian_pos_20d,
+    d.ma20_slope_5d,
+    d.pct_up_days_20d,
+    d.rv_ratio_5d_20d,
+    d.cum_signed_vol_20d,
+    d.atr_normalized_ret_5d,
+    z.zscore_price_vs_ma20,
+    z.zscore_price_vs_ma50,
+    z.zscore_underlying_vol_20d
+FROM derived d
+JOIN zscores z USING (trade_date)
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bucket 2: Option volume EOD features
+# Inputs registered by the caller:
+#   vol_daily   pandas DF from option_volume_daily (trade_date + aggregates)
+#   base_feats  merged oi+ohlc DF (trade_date, total_oi, call_oi, put_oi,
+#               spot_co, d1_total_oi_change, ...)
+# ---------------------------------------------------------------------------
+VOL_FEATURES_SQL = """
+WITH vol_joined AS (
+    SELECT
+        v.trade_date,
+        v.total_call_vol,
+        v.total_put_vol,
+        v.total_vol,
+        v.vol_0_30d,
+        v.vol_31_90d,
+        v.vol_weighted_strike_call,
+        v.vol_weighted_strike_put,
+        v.vol_weighted_strike_all,
+        v.vol_above_spot,
+        v.vol_below_spot,
+        v.vol_within_5pct,
+        v.vol_within_10pct,
+        f.total_oi,
+        f.call_oi,
+        f.put_oi,
+        f.spot_co,
+        f.d1_total_oi_change
+    FROM vol_daily v
+    LEFT JOIN base_feats f ON v.trade_date = f.trade_date
+),
+ratios AS (
+    SELECT
+        trade_date,
+        total_put_vol::DOUBLE  / NULLIF(total_call_vol, 0)     AS put_call_ratio_vol,
+        total_vol::DOUBLE      / NULLIF(total_oi, 0)           AS vol_oi_ratio_all,
+        total_call_vol::DOUBLE / NULLIF(call_oi, 0)            AS vol_oi_ratio_call,
+        total_put_vol::DOUBLE  / NULLIF(put_oi, 0)             AS vol_oi_ratio_put,
+        vol_weighted_strike_call / NULLIF(spot_co, 0)          AS vol_weighted_call_div_spot_co,
+        vol_weighted_strike_put  / NULLIF(spot_co, 0)          AS vol_weighted_put_div_spot_co,
+        vol_weighted_strike_all  / NULLIF(spot_co, 0)          AS vol_weighted_all_div_spot_co,
+        vol_above_spot::DOUBLE / NULLIF(vol_below_spot, 0)     AS vol_above_below_ratio_co,
+        vol_within_5pct::DOUBLE  / NULLIF(total_vol, 0)        AS pct_vol_within_5pct_co,
+        vol_within_10pct::DOUBLE / NULLIF(total_vol, 0)        AS pct_vol_within_10pct_co,
+        vol_0_30d::DOUBLE  / NULLIF(total_vol, 0)              AS pct_vol_0_30d,
+        vol_31_90d::DOUBLE / NULLIF(total_vol, 0)              AS pct_vol_31_90d,
+        d1_total_oi_change::DOUBLE / NULLIF(total_vol, 0)      AS net_new_oi_div_vol
+    FROM vol_joined
+),
+zscores AS (
+    SELECT
+        trade_date,
+        CASE WHEN COUNT(put_call_ratio_vol) OVER w60 >= 60
+             THEN (put_call_ratio_vol - AVG(put_call_ratio_vol) OVER w60)
+                  / NULLIF(STDDEV_SAMP(put_call_ratio_vol) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_put_call_ratio_vol,
+        CASE WHEN COUNT(vol_oi_ratio_all) OVER w60 >= 60
+             THEN (vol_oi_ratio_all - AVG(vol_oi_ratio_all) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vol_oi_ratio_all) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_vol_oi_ratio_all,
+        CASE WHEN COUNT(vol_oi_ratio_call) OVER w60 >= 60
+             THEN (vol_oi_ratio_call - AVG(vol_oi_ratio_call) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vol_oi_ratio_call) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_vol_oi_ratio_call,
+        CASE WHEN COUNT(vol_oi_ratio_put) OVER w60 >= 60
+             THEN (vol_oi_ratio_put - AVG(vol_oi_ratio_put) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vol_oi_ratio_put) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_vol_oi_ratio_put,
+        CASE WHEN COUNT(vol_above_below_ratio_co) OVER w60 >= 60
+             THEN (vol_above_below_ratio_co - AVG(vol_above_below_ratio_co) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vol_above_below_ratio_co) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_vol_above_below_ratio_co
+    FROM ratios
+    WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
+)
+SELECT
+    r.trade_date,
+    r.put_call_ratio_vol,
+    r.vol_oi_ratio_all, r.vol_oi_ratio_call, r.vol_oi_ratio_put,
+    r.vol_weighted_call_div_spot_co, r.vol_weighted_put_div_spot_co,
+    r.vol_weighted_all_div_spot_co,
+    r.vol_above_below_ratio_co,
+    r.pct_vol_within_5pct_co, r.pct_vol_within_10pct_co,
+    r.pct_vol_0_30d, r.pct_vol_31_90d,
+    r.net_new_oi_div_vol,
+    z.zscore_put_call_ratio_vol,
+    z.zscore_vol_oi_ratio_all, z.zscore_vol_oi_ratio_call, z.zscore_vol_oi_ratio_put,
+    z.zscore_vol_above_below_ratio_co
+FROM ratios r
+JOIN zscores z USING (trade_date)
+"""
+
+# ---------------------------------------------------------------------------
+# Bucket 3: IV chain (15:45) features
+# Inputs registered by the caller:
+#   iv_daily    pandas DF from option_iv_daily (trade_date + 5 IV metrics)
+#   base_feats  merged oi+ohlc DF (for rv_20d used in VRP / iv_rv_ratio)
+# ---------------------------------------------------------------------------
+IV_FEATURES_SQL = """
+WITH iv_joined AS (
+    SELECT
+        i.trade_date,
+        i.atm_iv_7d,
+        i.atm_iv_30d,
+        i.atm_iv_90d,
+        i.iv_25d_call_30d,
+        i.iv_25d_put_30d,
+        f.rv_20d
+    FROM iv_daily i
+    LEFT JOIN base_feats f ON i.trade_date = f.trade_date
+),
+derived AS (
+    SELECT
+        trade_date,
+        atm_iv_7d,
+        atm_iv_30d,
+        atm_iv_90d,
+        iv_25d_call_30d,
+        iv_25d_put_30d,
+        rv_20d,
+        iv_25d_call_30d - iv_25d_put_30d                                AS rr_25d_30d,
+        0.5 * (iv_25d_call_30d + iv_25d_put_30d) - atm_iv_30d          AS bf_25d_30d,
+        iv_25d_put_30d - atm_iv_30d                                     AS skew_25p_atm_30d,
+        atm_iv_30d - iv_25d_call_30d                                    AS skew_atm_25c_30d,
+        atm_iv_7d  - atm_iv_30d                                         AS term_7d_30d,
+        atm_iv_30d - atm_iv_90d                                         AS term_30d_90d,
+        atm_iv_30d - rv_20d                                             AS vrp_30d,
+        atm_iv_30d / NULLIF(rv_20d, 0)                                  AS iv_rv_ratio_30d,
+        atm_iv_7d  - LAG(atm_iv_7d,  1) OVER (ORDER BY trade_date)      AS d1_atm_iv_7d_change,
+        atm_iv_7d  - LAG(atm_iv_7d,  5) OVER (ORDER BY trade_date)      AS d5_atm_iv_7d_change,
+        atm_iv_30d - LAG(atm_iv_30d, 1) OVER (ORDER BY trade_date)      AS d1_atm_iv_30d_change,
+        atm_iv_30d - LAG(atm_iv_30d, 5) OVER (ORDER BY trade_date)      AS d5_atm_iv_30d_change
+    FROM iv_joined
+),
+zscores AS (
+    SELECT
+        trade_date,
+        CASE WHEN COUNT(atm_iv_7d) OVER w60 >= 60
+             THEN (atm_iv_7d - AVG(atm_iv_7d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(atm_iv_7d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_iv_7d,
+        CASE WHEN COUNT(atm_iv_30d) OVER w60 >= 60
+             THEN (atm_iv_30d - AVG(atm_iv_30d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(atm_iv_30d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_iv_30d,
+        CASE WHEN COUNT(atm_iv_90d) OVER w60 >= 60
+             THEN (atm_iv_90d - AVG(atm_iv_90d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(atm_iv_90d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_iv_90d,
+        CASE WHEN COUNT(rr_25d_30d) OVER w60 >= 60
+             THEN (rr_25d_30d - AVG(rr_25d_30d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(rr_25d_30d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_rr_25d_30d,
+        CASE WHEN COUNT(term_7d_30d) OVER w60 >= 60
+             THEN (term_7d_30d - AVG(term_7d_30d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(term_7d_30d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_term_7d_30d,
+        CASE WHEN COUNT(term_30d_90d) OVER w60 >= 60
+             THEN (term_30d_90d - AVG(term_30d_90d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(term_30d_90d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_term_30d_90d,
+        CASE WHEN COUNT(vrp_30d) OVER w60 >= 60
+             THEN (vrp_30d - AVG(vrp_30d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vrp_30d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_vrp_30d,
+        CASE WHEN COUNT(iv_rv_ratio_30d) OVER w60 >= 60
+             THEN (iv_rv_ratio_30d - AVG(iv_rv_ratio_30d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(iv_rv_ratio_30d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_iv_rv_ratio_30d
+    FROM derived
+    WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
+)
+SELECT
+    d.trade_date,
+    d.atm_iv_7d, d.atm_iv_30d, d.atm_iv_90d,
+    d.iv_25d_call_30d, d.iv_25d_put_30d,
+    d.rr_25d_30d, d.bf_25d_30d,
+    d.skew_25p_atm_30d, d.skew_atm_25c_30d,
+    d.term_7d_30d, d.term_30d_90d,
+    d.vrp_30d, d.iv_rv_ratio_30d,
+    d.d1_atm_iv_7d_change, d.d5_atm_iv_7d_change,
+    d.d1_atm_iv_30d_change, d.d5_atm_iv_30d_change,
+    z.zscore_iv_7d, z.zscore_iv_30d, z.zscore_iv_90d,
+    z.zscore_rr_25d_30d,
+    z.zscore_term_7d_30d, z.zscore_term_30d_90d,
+    z.zscore_vrp_30d, z.zscore_iv_rv_ratio_30d
+FROM derived d
+JOIN zscores z USING (trade_date)
 """
 
 
@@ -511,6 +797,44 @@ INSERT_COLS = [
     "zscore_oi_weighted_all_div_spot_3m_pc", "zscore_oi_weighted_all_div_spot_3m_co",
     "zscore_put_call_oi_ratio_3m",
     "zscore_oi_above_below_ratio_3m_pc", "zscore_oi_above_below_ratio_3m_co",
+    # Bucket 1: OHLC-derived
+    "ret_5d", "ret_10d", "ret_20d",
+    "pct_from_ma20", "pct_from_ma50",
+    "pct_from_52w_high", "pct_from_52w_low",
+    "donchian_pos_20d",
+    "ma20_slope_5d",
+    "pct_up_days_20d",
+    "rv_ratio_5d_20d",
+    "cum_signed_vol_20d",
+    "atr_normalized_ret_5d",
+    "zscore_price_vs_ma20", "zscore_price_vs_ma50",
+    "zscore_underlying_vol_20d",
+    "relative_strength_vs_spy_20d",
+    # Bucket 2: option volume EOD
+    "put_call_ratio_vol",
+    "vol_oi_ratio_all", "vol_oi_ratio_call", "vol_oi_ratio_put",
+    "vol_weighted_call_div_spot_co", "vol_weighted_put_div_spot_co",
+    "vol_weighted_all_div_spot_co",
+    "vol_above_below_ratio_co",
+    "pct_vol_within_5pct_co", "pct_vol_within_10pct_co",
+    "pct_vol_0_30d", "pct_vol_31_90d",
+    "net_new_oi_div_vol",
+    "zscore_put_call_ratio_vol",
+    "zscore_vol_oi_ratio_all", "zscore_vol_oi_ratio_call", "zscore_vol_oi_ratio_put",
+    "zscore_vol_above_below_ratio_co",
+    # Bucket 3: IV chain (15:45)
+    "atm_iv_7d", "atm_iv_30d", "atm_iv_90d",
+    "iv_25d_call_30d", "iv_25d_put_30d",
+    "rr_25d_30d", "bf_25d_30d",
+    "skew_25p_atm_30d", "skew_atm_25c_30d",
+    "term_7d_30d", "term_30d_90d",
+    "vrp_30d", "iv_rv_ratio_30d",
+    "d1_atm_iv_7d_change", "d5_atm_iv_7d_change",
+    "d1_atm_iv_30d_change", "d5_atm_iv_30d_change",
+    "zscore_iv_7d", "zscore_iv_30d", "zscore_iv_90d",
+    "zscore_rr_25d_30d",
+    "zscore_term_7d_30d", "zscore_term_30d_90d",
+    "zscore_vrp_30d", "zscore_iv_rv_ratio_30d",
 ]
 
 INSERT_SQL = f"INSERT INTO daily_features ({', '.join(INSERT_COLS)}) VALUES %s"
@@ -522,14 +846,75 @@ CLEAR_SQL  = "DELETE FROM daily_features WHERE ticker = %(ticker)s"
 # ---------------------------------------------------------------------------
 
 def load_ohlc(conn, ticker: str) -> pd.DataFrame:
-    """Pull (trade_date, open, close) for one ticker out of underlying_ohlc."""
+    """Pull OHLC + volume for one ticker out of underlying_ohlc."""
     df = read_sql_df(
         conn,
-        "SELECT trade_date, open, close FROM underlying_ohlc "
+        "SELECT trade_date, open, high, low, close, volume FROM underlying_ohlc "
         "WHERE ticker = %(ticker)s ORDER BY trade_date",
         {"ticker": ticker},
     )
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    return df
+
+
+def load_ohlc_spy(conn) -> pd.DataFrame:
+    """Return (trade_date, spy_ret_20d) for all available SPY history."""
+    df = read_sql_df(
+        conn,
+        "SELECT trade_date, close FROM underlying_ohlc "
+        "WHERE ticker = 'SPY' ORDER BY trade_date",
+    )
+    if df.empty:
+        return df
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    df["spy_ret_20d"] = df["close"] / df["close"].shift(20) - 1
+    return df[["trade_date", "spy_ret_20d"]]
+
+
+def load_vol_daily(conn, ticker: str,
+                   start: date | None, end: date) -> pd.DataFrame:
+    """Pull option_volume_daily rows for one ticker within [start, end]."""
+    if start is not None:
+        df = read_sql_df(
+            conn,
+            "SELECT * FROM option_volume_daily "
+            "WHERE ticker = %(t)s AND trade_date >= %(s)s AND trade_date <= %(e)s "
+            "ORDER BY trade_date",
+            {"t": ticker, "s": start, "e": end},
+        )
+    else:
+        df = read_sql_df(
+            conn,
+            "SELECT * FROM option_volume_daily "
+            "WHERE ticker = %(t)s ORDER BY trade_date",
+            {"t": ticker},
+        )
+    if not df.empty:
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    return df
+
+
+def load_iv_daily(conn, ticker: str,
+                  start: date | None, end: date) -> pd.DataFrame:
+    """Pull option_iv_daily rows for one ticker within [start, end]."""
+    if start is not None:
+        df = read_sql_df(
+            conn,
+            "SELECT * FROM option_iv_daily "
+            "WHERE ticker = %(t)s AND trade_date >= %(s)s AND trade_date <= %(e)s "
+            "ORDER BY trade_date",
+            {"t": ticker, "s": start, "e": end},
+        )
+    else:
+        df = read_sql_df(
+            conn,
+            "SELECT * FROM option_iv_daily "
+            "WHERE ticker = %(t)s ORDER BY trade_date",
+            {"t": ticker},
+        )
+    if not df.empty:
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     return df
 
 
@@ -610,16 +995,19 @@ def build_for_ticker(pg_conn, ticker: str,
 
     end_eff = end or date.today()
     if start is not None:
-        buffer_start = start - timedelta(days=LOOKBACK_BUFFER_DAYS)
+        oi_buffer_start   = start - timedelta(days=LOOKBACK_BUFFER_DAYS)
+        ohlc_buffer_start = start - timedelta(days=OHLC_LOOKBACK_BUFFER_DAYS)
         ohlc = ohlc_full_df[
-            (ohlc_full_df["trade_date"] >= buffer_start)
+            (ohlc_full_df["trade_date"] >= ohlc_buffer_start)
             & (ohlc_full_df["trade_date"] <= end_eff)
         ].reset_index(drop=True)
         date_filter_sql = (
-            f" WHERE trade_date >= DATE '{buffer_start.isoformat()}'"
+            f" WHERE trade_date >= DATE '{oi_buffer_start.isoformat()}'"
             f" AND trade_date <= DATE '{end_eff.isoformat()}'"
         )
     else:
+        oi_buffer_start   = None
+        ohlc_buffer_start = None
         ohlc = ohlc_full_df
         date_filter_sql = ""
 
@@ -660,9 +1048,9 @@ def build_for_ticker(pg_conn, ticker: str,
                  len(splits_df),
                  ", ".join(f"{r.trade_date}×{r.splits}" for r in splits_df.itertuples()))
 
-    # Register the raw OHLC. spot_pc and spot_co are resolved via two JOINs in
-    # OI_FEATURES_SQL — see the comment in the joined CTE for the asymmetry.
-    con.register("ohlc",            ohlc[["trade_date", "open", "close"]])
+    # Register the raw OHLC. OI_FEATURES_SQL uses (trade_date, open, close);
+    # OHLC_FEATURES_SQL also uses high, low, volume for Bucket 1 metrics.
+    con.register("ohlc",            ohlc[["trade_date", "open", "high", "low", "close", "volume"]])
     con.register("next_monthly_df", nm_df)
     con.register("split_factors",   sf_df)
     # The oi view applies split-adjustment to strike via a LEFT JOIN on split_factors.
@@ -676,14 +1064,18 @@ def build_for_ticker(pg_conn, ticker: str,
         f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
     )
 
+    # Load vol and IV data (include OI lookback buffer for z-score warm-up).
+    vol_daily_df = load_vol_daily(pg_conn, ticker, oi_buffer_start, end_eff)
+    iv_daily_df  = load_iv_daily(pg_conn, ticker,  oi_buffer_start, end_eff)
+
     log.info("  computing OI features ...")
     oi_feats = con.execute(OI_FEATURES_SQL).df()
     log.info("  computing OHLC features ...")
     ohlc_feats = con.execute(OHLC_FEATURES_SQL).df()
-    con.close()
 
     if oi_feats.empty:
         log.warning("  no OI rows in range for %s — skipping", ticker)
+        con.close()
         return 0
 
     feats = oi_feats.merge(ohlc_feats, on="trade_date", how="left")
@@ -692,6 +1084,37 @@ def build_for_ticker(pg_conn, ticker: str,
     # DATE value at INSERT time.
     feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
     feats.insert(0, "ticker", ticker)
+
+    # Register the merged base for vol/IV queries, then compute Bucket 2 & 3.
+    con.register("base_feats", feats)
+
+    if not vol_daily_df.empty:
+        log.info("  computing vol features ...")
+        con.register("vol_daily", vol_daily_df)
+        vol_feats = con.execute(VOL_FEATURES_SQL).df()
+        vol_feats["trade_date"] = pd.to_datetime(vol_feats["trade_date"]).dt.date
+        feats = feats.merge(vol_feats, on="trade_date", how="left")
+
+    if not iv_daily_df.empty:
+        log.info("  computing IV features ...")
+        con.register("iv_daily", iv_daily_df)
+        iv_feats = con.execute(IV_FEATURES_SQL).df()
+        iv_feats["trade_date"] = pd.to_datetime(iv_feats["trade_date"]).dt.date
+        feats = feats.merge(iv_feats, on="trade_date", how="left")
+
+    con.close()
+
+    # SPY relative strength: ret_20d(ticker) - ret_20d(SPY).
+    spy_df = load_ohlc_spy(pg_conn)
+    if not spy_df.empty:
+        if ticker == "SPY":
+            feats["relative_strength_vs_spy_20d"] = 0.0
+        else:
+            feats = feats.merge(spy_df, on="trade_date", how="left")
+            feats["relative_strength_vs_spy_20d"] = (
+                feats["ret_20d"] - feats["spy_ret_20d"]
+            )
+            feats = feats.drop(columns=["spy_ret_20d"], errors="ignore")
 
     # Drop the lookback buffer rows — they were only there for window context.
     if start is not None:

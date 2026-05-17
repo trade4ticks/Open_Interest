@@ -26,3 +26,12 @@ def last_trading_day(today: date | None = None) -> date:
         end_date=today,
     )
     return sched.index[-1].date() if len(sched) else today
+
+
+def next_trading_day(ref: date) -> date:
+    """Return the first NYSE trading day strictly after ref."""
+    sched = _nyse().schedule(
+        start_date=ref + timedelta(days=1),
+        end_date=ref + timedelta(days=10),
+    )
+    return sched.index[0].date()
