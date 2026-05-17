@@ -45,10 +45,14 @@ _STATUS_EXC = {
 # --- HTTP layer ------------------------------------------------------------
 
 def _get(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict | list:
-    url    = f"{THETADATA_BASE_URL}{endpoint}"
+    base   = f"{THETADATA_BASE_URL}{endpoint}"
     params = {**params, "format": "json"}
+    # Build query string manually so wildcard (*) is not percent-encoded to %2A.
+    # All our param values are symbols, dates, numbers, or * — none need encoding.
+    qs   = "&".join(f"{k}={v}" for k, v in params.items())
+    url  = f"{base}?{qs}"
     try:
-        resp = requests.get(url, params=params, timeout=timeout)
+        resp = requests.get(url, timeout=timeout)
     except requests.exceptions.ReadTimeout:
         raise TerminalTimeoutError(f"Read timeout after {timeout}s")
     except requests.exceptions.ConnectionError:
