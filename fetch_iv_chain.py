@@ -45,7 +45,7 @@ import pandas as pd
 
 from db import get_connection, read_sql_df
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
-from lib.parquet_store import list_tickers as list_oi_tickers
+from lib.parquet_store import list_tickers as list_oi_tickers, read_range as read_oi_range
 from lib.thetadata import (
     NoDataError,
     TerminalServerError,
@@ -125,25 +125,14 @@ def _get_expirations(conn, ticker: str, fetch_dates: list[date]) -> list[date]:
     min_date = min(fetch_dates)
     max_date = max(fetch_dates)
 
-    # Pull all distinct expirations from option_oi_raw that overlap the window.
-    # These are the expirations ThetaData has data for.
-    df = read_sql_df(
-        conn,
-        """
-        SELECT DISTINCT expiration FROM option_oi_raw
-        WHERE ticker = %(t)s
-          AND expiration >= %(min_exp)s
-          AND trade_date  >= %(min_td)s
-          AND trade_date  <= %(max_td)s
-        ORDER BY expiration
-        """,
-        {"t": ticker, "min_exp": min_date, "min_td": min_date, "max_td": max_date},
-    )
-    if df.empty:
+    # Pull all distinct expirations from the OI parquet store for this window.
+    oi = read_oi_range(ticker, min_date, max_date)
+    if oi.empty:
         log.warning("  %s: no expirations found in option_oi_raw for window", ticker)
         return []
 
-    all_exps = sorted(pd.to_datetime(df["expiration"]).dt.date.tolist())
+    oi["expiration"] = pd.to_datetime(oi["expiration"]).dt.date
+    all_exps = sorted(oi["expiration"].unique().tolist())
 
     needed: set[date] = set()
     for fd in fetch_dates:
