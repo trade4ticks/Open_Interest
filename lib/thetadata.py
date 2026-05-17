@@ -480,10 +480,12 @@ def fetch_greeks_eod(symbol: str, trade_date: date,
                       implied_vol, delta, underlying_price].
     Empty DataFrame if terminal returned no data.
     """
+    date_str = trade_date.strftime("%Y%m%d")
     params = {
         "symbol":     symbol.upper(),
         "expiration": "*",
-        "date":       trade_date.strftime("%Y%m%d"),
+        "start_date": date_str,
+        "end_date":   date_str,
     }
 
     try:
