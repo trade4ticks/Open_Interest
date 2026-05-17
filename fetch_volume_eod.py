@@ -119,7 +119,7 @@ def _aggregate(df: pd.DataFrame, prior_close: dict[date, float]) -> list[dict]:
         trade_date = next_trading_day(fetch_date)
 
         grp = grp.copy()
-        grp["dte"] = (grp["expiration"] - fetch_date).dt.days
+        grp["dte"] = grp["expiration"].apply(lambda x: (x - fetch_date).days)
 
         calls = grp[grp["option_type"] == "C"]
         puts  = grp[grp["option_type"] == "P"]
