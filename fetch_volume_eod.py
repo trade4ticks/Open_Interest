@@ -188,40 +188,63 @@ def _load_prior_close(conn, ticker: str, fetch_dates: list[date]) -> dict[date, 
     return dict(zip(df["trade_date"], df["close"]))
 
 
+# Maximum calendar-day span per API call. A year of full-chain EOD data in
+# one request is too large and reliably times out; 28-day chunks keep each
+# response to ~4 weeks of data.
+_CHUNK_DAYS = 28
+
+
+def _chunk_date_ranges(fetch_dates: list[date]) -> list[tuple[date, date]]:
+    """Split fetch_dates into (start, end) pairs each spanning ≤_CHUNK_DAYS."""
+    if not fetch_dates:
+        return []
+    chunks: list[tuple[date, date]] = []
+    chunk_start = fetch_dates[0]
+    for i, d in enumerate(fetch_dates):
+        if (d - chunk_start).days >= _CHUNK_DAYS:
+            chunks.append((chunk_start, fetch_dates[i - 1]))
+            chunk_start = d
+    chunks.append((chunk_start, fetch_dates[-1]))
+    return chunks
+
+
 # --- Per-ticker pipeline ---------------------------------------------------
 
 def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     """
-    Fetch EOD volume for all fetch_dates in one call, aggregate per-day,
+    Fetch EOD volume for all fetch_dates in ≤28-day chunks, aggregate per-day,
     upsert to option_volume_daily. Returns number of rows upserted.
     """
     if not fetch_dates:
         return 0
 
-    start = min(fetch_dates)
-    end   = max(fetch_dates)
-
-    try:
-        raw = fetch_volume_eod(ticker, start, end)
-    except (TerminalTimeoutError, TerminalServerError) as exc:
-        log.warning("  TIMEOUT/ERROR %s: %s", ticker, exc)
-        return 0
-
-    if raw.empty:
-        log.info("  %s: no volume data for %s → %s", ticker, start, end)
-        return 0
-
-    raw["trade_date"]  = pd.to_datetime(raw["trade_date"]).dt.date
-    raw["expiration"]  = pd.to_datetime(raw["expiration"]).dt.date
-
-    # Filter to only the requested fetch dates (API may return extra).
-    fetch_set = set(fetch_dates)
-    raw = raw[raw["trade_date"].isin(fetch_set)]
-    if raw.empty:
-        return 0
-
+    fetch_set   = set(fetch_dates)
     prior_close = _load_prior_close(conn, ticker, fetch_dates)
-    records     = _aggregate(raw, prior_close)
+    chunks      = _chunk_date_ranges(fetch_dates)
+    all_frames: list[pd.DataFrame] = []
+
+    for chunk_start, chunk_end in chunks:
+        try:
+            raw = fetch_volume_eod(ticker, chunk_start, chunk_end)
+        except (TerminalTimeoutError, TerminalServerError) as exc:
+            log.warning("  TIMEOUT/ERROR %s %s→%s: %s", ticker, chunk_start, chunk_end, exc)
+            continue
+
+        if raw.empty:
+            continue
+
+        raw["trade_date"] = pd.to_datetime(raw["trade_date"]).dt.date
+        raw["expiration"] = pd.to_datetime(raw["expiration"]).dt.date
+        raw = raw[raw["trade_date"].isin(fetch_set)]
+        if not raw.empty:
+            all_frames.append(raw)
+
+    if not all_frames:
+        log.info("  %s: no volume data in range", ticker)
+        return 0
+
+    combined = pd.concat(all_frames, ignore_index=True)
+    records  = _aggregate(combined, prior_close)
     if not records:
         return 0
 
