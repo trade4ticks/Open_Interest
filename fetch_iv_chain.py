@@ -63,8 +63,9 @@ log = logging.getLogger(__name__)
 
 # Target tenors in calendar days
 _TARGET_DTES = [7, 30, 90]
-# Maximum days per API call (≤1 month)
-_CHUNK_DAYS  = 28
+# Maximum calendar-day span per greeks API call. Greeks endpoint is slower
+# than OI; 14-day chunks keep each response to ~2 weeks of data.
+_CHUNK_DAYS  = 14
 
 _UPSERT_SQL = """
 INSERT INTO option_iv_daily (
@@ -366,7 +367,7 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     for exp in expirations:
         for chunk_start, chunk_end in chunks:
             try:
-                raw = fetch_greeks_1545(ticker, exp, chunk_start, chunk_end, timeout=120)
+                raw = fetch_greeks_1545(ticker, exp, chunk_start, chunk_end, timeout=180)
             except (TerminalTimeoutError, TerminalServerError) as exc:
                 log.warning("  TIMEOUT %s exp=%s %s→%s: %s",
                             ticker, exp, chunk_start, chunk_end, exc)
