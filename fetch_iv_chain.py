@@ -366,7 +366,7 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     for exp in expirations:
         for chunk_start, chunk_end in chunks:
             try:
-                raw = fetch_greeks_1545(ticker, exp, chunk_start, chunk_end)
+                raw = fetch_greeks_1545(ticker, exp, chunk_start, chunk_end, timeout=120)
             except (TerminalTimeoutError, TerminalServerError) as exc:
                 log.warning("  TIMEOUT %s exp=%s %s→%s: %s",
                             ticker, exp, chunk_start, chunk_end, exc)
