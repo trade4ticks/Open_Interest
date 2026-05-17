@@ -322,7 +322,14 @@ def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
 
     records = []
     for row in rows:
-        d = _parse_ymd(row.get("date"))
+        # The EOD endpoint has no explicit "date" field — the trade date is
+        # embedded in the "last_trade" or "created" ISO timestamp (e.g.
+        # "2019-01-02T17:40:02.160").  Extract the YYYY-MM-DD prefix.
+        date_val = row.get("date") or row.get("trade_date")
+        if date_val is None:
+            ts = str(row.get("last_trade") or row.get("created") or "")
+            date_val = ts[:10] if len(ts) >= 10 else None
+        d = _parse_ymd(date_val)
         if d is None:
             continue
 
@@ -358,6 +365,7 @@ def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
     df = df.dropna(subset=["strike", "volume"])
+    df = df.drop_duplicates(subset=["trade_date", "expiration", "strike", "option_type"])
     return df
 
 
