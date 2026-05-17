@@ -464,6 +464,83 @@ def fetch_greeks_1545(symbol: str, expiration: date,
     return df
 
 
+def fetch_greeks_eod(symbol: str, trade_date: date,
+                     timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Fetch EOD greeks for the entire option chain on one trading day.
+
+    Endpoint: /v3/option/history/greeks/eod with expiration=* (all expirations).
+    Values are pre-computed from closing prices — faster than first_order.
+
+    Returns DataFrame[trade_date, expiration, strike, option_type,
+                      implied_vol, delta, underlying_price].
+    Empty DataFrame if terminal returned no data.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+        "date":       trade_date.strftime("%Y%m%d"),
+    }
+
+    try:
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (greeks_eod %s)", symbol)
+        time.sleep(60)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (greeks_eod %s)", symbol)
+        time.sleep(10)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for row in rows:
+        exp = _parse_ymd(row.get("expiration"))
+        if exp is None:
+            continue
+
+        iv = row.get("implied_vol")
+        if iv is None or iv == 0:
+            continue
+
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
+        )
+        if option_type not in ("C", "P"):
+            continue
+
+        records.append({
+            "trade_date":       trade_date,
+            "expiration":       exp,
+            "strike":           row.get("strike"),
+            "option_type":      option_type,
+            "implied_vol":      iv,
+            "delta":            row.get("delta"),
+            "underlying_price": row.get("underlying_price"),
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["strike"]           = pd.to_numeric(df["strike"],           errors="coerce")
+    df["implied_vol"]      = pd.to_numeric(df["implied_vol"],      errors="coerce")
+    df["delta"]            = pd.to_numeric(df["delta"],            errors="coerce")
+    df["underlying_price"] = pd.to_numeric(df["underlying_price"], errors="coerce")
+    df = df.dropna(subset=["strike", "implied_vol"])
+    df = df.drop_duplicates(subset=["expiration", "strike", "option_type"])
+    return df
+
+
 def test_connection() -> bool:
     try:
         return bool(list_expirations("SPY"))
