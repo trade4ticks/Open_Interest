@@ -547,6 +547,82 @@ def fetch_greeks_eod(symbol: str, trade_date: date,
     return df
 
 
+def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
+                           time_str: str, interval: str = "5m",
+                           timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Fetch option bid/ask quotes for one expiration at a specific intraday time.
+
+    Endpoint: /v3/option/history/quote
+    Use interval=5m + time_str='09:35' for entry snapshot.
+    Use interval=30m + time_str='15:30' for exit snapshot.
+
+    Returns DataFrame[strike, option_type, bid, ask].
+    Empty DataFrame if no data.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": expiration.strftime("%Y%m%d"),
+        "date":       trade_date.strftime("%Y%m%d"),
+        "interval":   interval,
+        "start_time": time_str,
+        "end_time":   time_str,
+    }
+
+    try:
+        data = _get("/v3/option/history/quote", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (quote %s %s)",
+                    symbol, trade_date)
+        time.sleep(60)
+        data = _get("/v3/option/history/quote", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (quote %s %s)",
+                    symbol, trade_date)
+        time.sleep(10)
+        data = _get("/v3/option/history/quote", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for row in rows:
+        bid = row.get("bid")
+        ask = row.get("ask")
+        if bid is None or ask is None:
+            continue
+
+        raw = str(row.get("right") or "").strip().lower()
+        option_type = (
+            "C" if raw in ("c", "call") else
+            "P" if raw in ("p", "put") else
+            raw.upper()
+        )
+        if option_type not in ("C", "P"):
+            continue
+
+        records.append({
+            "strike":      row.get("strike"),
+            "option_type": option_type,
+            "bid":         bid,
+            "ask":         ask,
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["bid"]    = pd.to_numeric(df["bid"],    errors="coerce")
+    df["ask"]    = pd.to_numeric(df["ask"],    errors="coerce")
+    df = df.dropna(subset=["strike", "bid", "ask"])
+    df = df.drop_duplicates(subset=["strike", "option_type"])
+    return df
+
+
 def test_connection() -> bool:
     try:
         return bool(list_expirations("SPY"))
