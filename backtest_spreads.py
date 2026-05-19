@@ -222,8 +222,11 @@ def _run_trade(conn, ticker: str, trade_date: date, exit_date: date,
         ticker, expiration, exit_date, time_str="15:30", interval="30m", timeout=120
     )
 
-    lx = _leg_quotes(exit_chain, long_strike,  "C")
-    sx = _leg_quotes(exit_chain, short_strike, "C")
+    if exit_chain.empty:
+        lx = sx = {"bid": None, "ask": None, "mid": None, "spread": None}
+    else:
+        lx = _leg_quotes(exit_chain, long_strike,  "C")
+        sx = _leg_quotes(exit_chain, short_strike, "C")
 
     if lx["mid"] is None or sx["mid"] is None:
         net_exit_value = None
