@@ -153,7 +153,7 @@ def _run_trade(ticker: str, trade_date: date, exit_date: date,
 
     # --- Entry: 09:35 on trade_date, 5-minute interval ---
     entry_chain = fetch_option_quotes_at(
-        ticker, expiration, trade_date, time_str="09:35", interval="5m"
+        ticker, expiration, trade_date, time_str="09:35", interval="5m", timeout=120
     )
     if entry_chain.empty:
         return {"status": "no_entry_data"}
@@ -174,6 +174,9 @@ def _run_trade(ticker: str, trade_date: date, exit_date: date,
 
     net_entry_debit = le["mid"] - se["mid"]
     if net_entry_debit <= 0:
+        log.warning("  invalid_entry_debit: long_strike=%.2f mid=%.4f  "
+                    "short_strike=%.2f mid=%.4f  debit=%.4f",
+                    long_strike, le["mid"], short_strike, se["mid"], net_entry_debit)
         return {"status": "invalid_entry_debit"}
 
     max_risk   = net_entry_debit * 100
@@ -186,7 +189,7 @@ def _run_trade(ticker: str, trade_date: date, exit_date: date,
 
     # --- Exit: 15:30 on exit_date, 30-minute interval ---
     exit_chain = fetch_option_quotes_at(
-        ticker, expiration, exit_date, time_str="15:30", interval="30m"
+        ticker, expiration, exit_date, time_str="15:30", interval="30m", timeout=120
     )
 
     lx = _leg_quotes(exit_chain, long_strike,  "C")
