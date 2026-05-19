@@ -250,6 +250,19 @@ def main() -> None:
     trades["exit_date"]  = pd.to_datetime(trades["exit_date"]).dt.date
 
     print(f"Loaded {len(trades)} trades from {CSV_PATH.name}")
+
+    # Optional date range filter
+    raw_start = input("Start trade_date (YYYY-MM-DD, blank = all): ").strip()
+    raw_end   = input("End   trade_date (YYYY-MM-DD, blank = all): ").strip()
+    if raw_start:
+        start_filter = pd.to_datetime(raw_start).date()
+        trades = trades[trades["trade_date"] >= start_filter]
+    if raw_end:
+        end_filter = pd.to_datetime(raw_end).date()
+        trades = trades[trades["trade_date"] <= end_filter]
+    trades = trades.reset_index(drop=True)
+    print(f"{len(trades)} trades in range.\n")
+
     print("Checking ThetaData ...", end=" ", flush=True)
     if not test_connection():
         raise SystemExit("FAILED — terminal not reachable.")
