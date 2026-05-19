@@ -208,6 +208,11 @@ def _run_trade(conn, ticker: str, trade_date: date, exit_date: date,
                     "short_strike=%.2f mid=%.4f  debit=%.4f",
                     long_strike, le["mid"], short_strike, se["mid"], net_entry_debit)
         return {"status": "invalid_entry_debit"}
+    if net_entry_debit < 0.01:
+        log.warning("  debit_below_tick: long_strike=%.2f mid=%.4f  "
+                    "short_strike=%.2f mid=%.4f  debit=%.6f",
+                    long_strike, le["mid"], short_strike, se["mid"], net_entry_debit)
+        return {"status": "debit_below_tick"}
 
     max_risk   = net_entry_debit * 100
     max_profit = (short_strike - long_strike - net_entry_debit) * 100
