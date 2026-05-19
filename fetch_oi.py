@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MAX_WORKERS = 6
+MAX_WORKERS = 4
 
 
 # --- Prompts ---------------------------------------------------------------
