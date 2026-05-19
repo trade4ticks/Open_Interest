@@ -310,8 +310,7 @@ def main() -> None:
                 })
 
                 cur.execute(_UPSERT_SQL, full_rec)
-
-        conn.commit()
+                conn.commit()
 
     total = sum(counts.values())
     print(f"\nDone.  {total} trades processed.")
