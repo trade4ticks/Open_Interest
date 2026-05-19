@@ -284,6 +284,12 @@ def main() -> None:
 
     print(f"Loaded {len(trades)} trades from {CSV_PATH.name}")
 
+    # Optional ticker filter
+    raw_tickers = input("Tickers (comma-separated; blank = all): ").strip()
+    if raw_tickers:
+        wanted = {t.strip().upper() for t in raw_tickers.split(",") if t.strip()}
+        trades = trades[trades["ticker"].str.upper().isin(wanted)]
+
     # Optional date range filter
     raw_start = input("Start trade_date (YYYY-MM-DD, blank = all): ").strip()
     raw_end   = input("End   trade_date (YYYY-MM-DD, blank = all): ").strip()
