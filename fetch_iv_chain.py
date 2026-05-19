@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 import pandas as pd
+from tqdm import tqdm
 
 from db import get_connection, read_sql_df
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
@@ -48,6 +50,8 @@ from lib.thetadata import (
     fetch_greeks_eod,
     test_connection,
 )
+
+MAX_WORKERS = 4
 
 logging.basicConfig(
     level=logging.INFO,
@@ -247,6 +251,12 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     return rows_upserted
 
 
+def _fetch_ticker_isolated(ticker: str, fetch_dates: list[date]) -> int:
+    """Open a per-thread DB connection and run fetch_ticker for one ticker."""
+    with get_connection() as conn:
+        return fetch_ticker(conn, ticker, fetch_dates)
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> None:
@@ -273,10 +283,19 @@ def main() -> None:
         raise SystemExit("FAILED — terminal not reachable.")
     print("OK\n")
 
-    with get_connection() as conn:
-        for t in tickers:
-            print(f"--- {t} ---")
-            fetch_ticker(conn, t, fetch_dates)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_ticker_isolated, t, fetch_dates): t
+                   for t in tickers}
+        with tqdm(total=len(futures), unit="tk", ncols=90, desc="iv") as bar:
+            for fut in as_completed(futures):
+                t = futures[fut]
+                try:
+                    fut.result()
+                except (TerminalTimeoutError, TerminalServerError) as exc:
+                    log.warning("  TIMEOUT %s: %s", t, exc)
+                except Exception as exc:
+                    log.warning("  FAIL    %s: %s", t, exc)
+                bar.update(1)
 
     print("\nDone. Run build_features.py next to refresh daily_features.")
 

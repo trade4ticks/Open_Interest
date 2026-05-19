@@ -20,9 +20,11 @@ close of the fetch date (T-1) as spot. That equals spot_pc for T (prior close).
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 import pandas as pd
+from tqdm import tqdm
 
 from db import get_connection, read_sql_df
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
@@ -32,6 +34,8 @@ from lib.thetadata import (
     fetch_volume_eod,
     test_connection,
 )
+
+MAX_WORKERS = 4
 
 logging.basicConfig(
     level=logging.INFO,
@@ -260,6 +264,12 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     return len(records)
 
 
+def _fetch_ticker_isolated(ticker: str, fetch_dates: list[date]) -> int:
+    """Open a per-thread DB connection and run fetch_ticker for one ticker."""
+    with get_connection() as conn:
+        return fetch_ticker(conn, ticker, fetch_dates)
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> None:
@@ -267,30 +277,41 @@ def main() -> None:
 
     with get_connection() as conn:
         tickers = _prompt_tickers(conn)
-        start   = _prompt_date("Fetch start date (T-1 perspective)")
-        end     = _prompt_date("Fetch end   date (T-1 perspective)")
-        if end < start:
-            raise SystemExit("End date must be >= start date.")
 
-        end = min(end, last_trading_day())
-        if end < start:
-            raise SystemExit("No completed trading days in the requested range.")
+    start   = _prompt_date("Fetch start date (T-1 perspective)")
+    end     = _prompt_date("Fetch end   date (T-1 perspective)")
+    if end < start:
+        raise SystemExit("End date must be >= start date.")
 
-        fetch_dates = get_trading_days(start, end)
-        if not fetch_dates:
-            raise SystemExit("No NYSE trading days in the requested range.")
+    end = min(end, last_trading_day())
+    if end < start:
+        raise SystemExit("No completed trading days in the requested range.")
 
-        print(f"\nFetching {len(tickers)} tickers × {len(fetch_dates)} trading days "
-              f"({start} → {end})")
+    fetch_dates = get_trading_days(start, end)
+    if not fetch_dates:
+        raise SystemExit("No NYSE trading days in the requested range.")
 
-        print("Checking ThetaData ...", end=" ", flush=True)
-        if not test_connection():
-            raise SystemExit("FAILED — terminal not reachable.")
-        print("OK\n")
+    print(f"\nFetching {len(tickers)} tickers × {len(fetch_dates)} trading days "
+          f"({start} → {end})")
 
-        for t in tickers:
-            print(f"--- {t} ---")
-            fetch_ticker(conn, t, fetch_dates)
+    print("Checking ThetaData ...", end=" ", flush=True)
+    if not test_connection():
+        raise SystemExit("FAILED — terminal not reachable.")
+    print("OK\n")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_ticker_isolated, t, fetch_dates): t
+                   for t in tickers}
+        with tqdm(total=len(futures), unit="tk", ncols=90, desc="vol") as bar:
+            for fut in as_completed(futures):
+                t = futures[fut]
+                try:
+                    fut.result()
+                except (TerminalTimeoutError, TerminalServerError) as exc:
+                    log.warning("  TIMEOUT %s: %s", t, exc)
+                except Exception as exc:
+                    log.warning("  FAIL    %s: %s", t, exc)
+                bar.update(1)
 
     print("\nDone. Run build_features.py next to refresh daily_features.")
 
