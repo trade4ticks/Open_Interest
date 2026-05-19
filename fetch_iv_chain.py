@@ -94,11 +94,11 @@ def _prompt_tickers() -> list[str]:
 
 def _prompt_date(label: str) -> date:
     while True:
-        raw = input(f"{label} (YYYY-MM-DD): ").strip()
+        raw = input(f"{label} (YYYYMMDD): ").strip()
         try:
-            return datetime.strptime(raw, "%Y-%m-%d").date()
+            return datetime.strptime(raw, "%Y%m%d").date()
         except ValueError:
-            print("  Use YYYY-MM-DD (e.g. 2024-01-02)")
+            print("  Use YYYYMMDD (e.g. 20240102)")
 
 
 # --- IV interpolation helpers ----------------------------------------------

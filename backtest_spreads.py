@@ -296,13 +296,13 @@ def main() -> None:
         trades = trades[trades["ticker"].str.upper().isin(wanted)]
 
     # Optional date range filter
-    raw_start = input("Start trade_date (YYYY-MM-DD, blank = all): ").strip()
-    raw_end   = input("End   trade_date (YYYY-MM-DD, blank = all): ").strip()
+    raw_start = input("Start trade_date (YYYYMMDD, blank = all): ").strip()
+    raw_end   = input("End   trade_date (YYYYMMDD, blank = all): ").strip()
     if raw_start:
-        start_filter = pd.to_datetime(raw_start).date()
+        start_filter = pd.to_datetime(raw_start, format="%Y%m%d").date()
         trades = trades[trades["trade_date"] >= start_filter]
     if raw_end:
-        end_filter = pd.to_datetime(raw_end).date()
+        end_filter = pd.to_datetime(raw_end, format="%Y%m%d").date()
         trades = trades[trades["trade_date"] <= end_filter]
     trades = trades.reset_index(drop=True)
     print(f"{len(trades)} trades in range.\n")

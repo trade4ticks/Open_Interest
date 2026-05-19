@@ -1182,19 +1182,19 @@ def prompt_tickers() -> list[str]:
 
 def prompt_date_range() -> tuple[date | None, date | None]:
     """Returns (start, end) or (None, None) for a full-history rebuild."""
-    raw_start = input("Start date (blank = full history rebuild): ").strip()
+    raw_start = input("Start date YYYYMMDD (blank = full history rebuild): ").strip()
     if not raw_start:
         return None, None
     try:
-        start = datetime.strptime(raw_start, "%Y-%m-%d").date()
+        start = datetime.strptime(raw_start, "%Y%m%d").date()
     except ValueError:
-        raise SystemExit("Start date must be YYYY-MM-DD.")
-    raw_end = input("End date   (blank = today): ").strip()
+        raise SystemExit("Start date must be YYYYMMDD.")
+    raw_end = input("End date YYYYMMDD   (blank = today): ").strip()
     if raw_end:
         try:
-            end = datetime.strptime(raw_end, "%Y-%m-%d").date()
+            end = datetime.strptime(raw_end, "%Y%m%d").date()
         except ValueError:
-            raise SystemExit("End date must be YYYY-MM-DD.")
+            raise SystemExit("End date must be YYYYMMDD.")
     else:
         end = date.today()
     if end < start:
