@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from db import get_connection
+from db import get_connection, read_sql_df
 from lib.parquet_store import read_range as read_oi_range
 from lib.thetadata import (
     TerminalServerError,
@@ -137,6 +137,29 @@ def _find_expiration(ticker: str, exit_date: date) -> date | None:
     return candidates[0] if candidates else None
 
 
+def _split_factor(conn, ticker: str, trade_date: date) -> float:
+    """
+    Cumulative split factor from trade_date forward.
+    Multiply adjusted spot_entry by this to get the unadjusted (historical) price
+    that ThetaData's option strikes reflect.
+
+    Example: AAPL 4-for-1 split on 2020-08-31 → factor = 4.0 for any trade
+    before that date, so spot 38.72 → 154.88 (the actual pre-split price).
+    """
+    df = read_sql_df(
+        conn,
+        "SELECT splits FROM underlying_ohlc "
+        "WHERE ticker = %(t)s AND trade_date >= %(d)s AND splits > 1",
+        {"t": ticker, "d": trade_date},
+    )
+    if df.empty:
+        return 1.0
+    factor = 1.0
+    for v in df["splits"]:
+        factor *= float(v)
+    return factor
+
+
 def _leg_quotes(chain: pd.DataFrame, strike: float, option_type: str) -> dict:
     """Extract bid/ask/mid/spread for one strike from a chain DataFrame."""
     row = chain[(chain["strike"] == strike) & (chain["option_type"] == option_type)]
@@ -147,9 +170,16 @@ def _leg_quotes(chain: pd.DataFrame, strike: float, option_type: str) -> dict:
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2.0, "spread": ask - bid}
 
 
-def _run_trade(ticker: str, trade_date: date, exit_date: date,
+def _run_trade(conn, ticker: str, trade_date: date, exit_date: date,
                spot_entry: float, expiration: date) -> dict:
     """Fetch quotes and compute all spread metrics for one trade."""
+
+    # Unadjust spot: CSV prices are split-adjusted; ThetaData strikes are not.
+    factor = _split_factor(conn, ticker, trade_date)
+    spot_unadj = spot_entry * factor
+    if factor != 1.0:
+        log.info("  split factor=%.4f  spot %.2f → %.2f (unadjusted)",
+                 factor, spot_entry, spot_unadj)
 
     # --- Entry: 09:35 on trade_date, 5-minute interval ---
     entry_chain = fetch_option_quotes_at(
@@ -159,7 +189,7 @@ def _run_trade(ticker: str, trade_date: date, exit_date: date,
         return {"status": "no_entry_data"}
 
     calls = entry_chain[entry_chain["option_type"] == "C"].sort_values("strike")
-    above = calls[calls["strike"] > spot_entry]
+    above = calls[calls["strike"] > spot_unadj]
     if len(above) < 2:
         return {"status": "insufficient_strikes"}
 
@@ -291,7 +321,7 @@ def main() -> None:
                 else:
                     log.info("  expiration=%s", expiration)
                     try:
-                        rec = _run_trade(ticker, trade_date, exit_date,
+                        rec = _run_trade(conn, ticker, trade_date, exit_date,
                                          spot_entry, expiration)
                     except (TerminalTimeoutError, TerminalServerError) as exc:
                         log.warning("  API error: %s", exc)
