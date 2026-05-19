@@ -149,7 +149,7 @@ def _split_factor(conn, ticker: str, trade_date: date) -> float:
     df = read_sql_df(
         conn,
         "SELECT splits FROM underlying_ohlc "
-        "WHERE ticker = %(t)s AND trade_date >= %(d)s AND splits > 1",
+        "WHERE ticker = %(t)s AND trade_date >= %(d)s AND splits != 0 AND splits IS NOT NULL",
         {"t": ticker, "d": trade_date},
     )
     if df.empty:
