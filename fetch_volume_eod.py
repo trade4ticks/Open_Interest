@@ -229,6 +229,9 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
         except (TerminalTimeoutError, TerminalServerError) as exc:
             log.warning("  TIMEOUT/ERROR %s %s→%s: %s", ticker, chunk_start, chunk_end, exc)
             continue
+        except Exception as exc:
+            log.warning("  FAIL %s %s→%s: %s", ticker, chunk_start, chunk_end, exc)
+            continue
 
         if raw.empty:
             continue

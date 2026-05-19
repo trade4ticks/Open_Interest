@@ -124,9 +124,11 @@ def main() -> None:
             run_oi_snapshot_fetch(t, snapshot_td)
 
         # 2c. EOD option volume — yesterday's report (T-1), stored as today's
-        #     trade_date (T) to align with OI and OHLC. Report is available
-        #     by 17:15 ET so it's always ready for the 7am run.
-        vol_fetch_end   = last_trading_day(today)   # T-1 perspective
+        #     trade_date (T) to align with OI and OHLC. Today's EOD report
+        #     isn't ready until 17:15 ET, so the cron at 7am must request the
+        #     last fully-completed session (yesterday on a trading day, or
+        #     the most recent session on a Mon / post-holiday).
+        vol_fetch_end   = last_trading_day(today - timedelta(days=1))
         vol_fetch_start = vol_fetch_end - timedelta(days=OI_LOOKBACK_DAYS)
         vol_fetch_days  = get_trading_days(vol_fetch_start, vol_fetch_end)
         log.info("--- EOD vol fetch: %s → %s (%d trading days) ---",
@@ -136,7 +138,7 @@ def main() -> None:
             run_vol_eod_fetch(conn, t, vol_fetch_days)
 
         # 2d. IV chain (15:45 greeks) — same T-1/T date alignment as vol.
-        iv_fetch_end   = last_trading_day(today)
+        iv_fetch_end   = last_trading_day(today - timedelta(days=1))
         iv_fetch_start = iv_fetch_end - timedelta(days=OI_LOOKBACK_DAYS)
         iv_fetch_days  = get_trading_days(iv_fetch_start, iv_fetch_end)
         log.info("--- IV chain fetch: %s → %s (%d trading days) ---",
