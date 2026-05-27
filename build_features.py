@@ -26,6 +26,7 @@ import pandas as pd
 import psycopg2.extras
 
 from db import get_connection, read_sql_df
+from lib.chain_store import has_data as chain_has_data, parquet_glob as chain_parquet_glob
 from lib.expirations import build_next_monthly_lookup
 from lib.parquet_store import list_tickers, parquet_glob
 from lib.split_factors import load_splits, make_split_factors
@@ -564,36 +565,65 @@ JOIN zscores z USING (trade_date)
 
 
 # ---------------------------------------------------------------------------
-# Bucket 2: Option volume EOD features
+# Bucket 2: Option volume EOD features (refactored to read raw chain)
 # Inputs registered by the caller:
-#   vol_daily   pandas DF from option_volume_daily (trade_date + aggregates)
-#   base_feats  merged oi+ohlc DF (trade_date, total_oi, call_oi, put_oi,
-#               spot_co, d1_total_oi_change, ...)
+#   chain_adj   DuckDB view over data/chain_eod/{ticker}/*.parquet with
+#               strike already multiplied by split_factors.adj_factor.
+#               Columns: trade_date, source_session, feature_date, expiration,
+#                        strike (adjusted), option_type, volume, implied_vol,
+#                        delta, iv_error.
+#               trade_date = actual session the data is from (T-1 in pipeline
+#                            terms); feature_date = next_trading_day(trade_date)
+#                            = the daily_features trade_date (T) this row
+#                            contributes to.
+#   ohlc        pandas DF with [trade_date, open, high, low, close, volume]
+#               for the underlying (already registered for OHLC features).
+#               JOIN on ohlc.trade_date = chain_adj.trade_date gives spot_pc
+#               (the close of the actual session whose chain data this is).
+#   base_feats  merged oi+ohlc DF (used for vol_oi_ratio_* and net_new_oi_div_vol
+#               which need OI quantities at the consumer date T).
+#               JOIN on base_feats.trade_date = chain_adj.feature_date.
 # ---------------------------------------------------------------------------
 VOL_FEATURES_SQL = """
-WITH vol_joined AS (
-    SELECT
-        v.trade_date,
-        v.total_call_vol,
-        v.total_put_vol,
-        v.total_vol,
-        v.vol_0_30d,
-        v.vol_31_90d,
-        v.vol_weighted_strike_call,
-        v.vol_weighted_strike_put,
-        v.vol_weighted_strike_all,
-        v.vol_above_spot,
-        v.vol_below_spot,
-        v.vol_within_5pct,
-        v.vol_within_10pct,
-        v.weighted_avg_dte_vol,
-        f.total_oi,
-        f.call_oi,
-        f.put_oi,
-        f.spot_pc,
-        f.d1_total_oi_change
-    FROM vol_daily v
-    LEFT JOIN base_feats f ON v.trade_date = f.trade_date
+WITH chain AS (
+    SELECT c.trade_date,
+           c.feature_date,
+           c.expiration,
+           c.strike,
+           c.option_type,
+           c.volume,
+           o.close AS spot,
+           (c.expiration - c.trade_date)::INTEGER AS dte
+    FROM chain_adj c
+    JOIN ohlc o ON o.trade_date = c.trade_date
+),
+per_day AS (
+    -- All vol aggregates that used to live in fetch_volume_eod.py:_aggregate.
+    SELECT feature_date AS trade_date,
+           SUM(CASE WHEN option_type = 'C' THEN volume ELSE 0 END)::BIGINT  AS total_call_vol,
+           SUM(CASE WHEN option_type = 'P' THEN volume ELSE 0 END)::BIGINT  AS total_put_vol,
+           SUM(volume)::BIGINT                                              AS total_vol,
+           SUM(CASE WHEN dte BETWEEN 0  AND 30  THEN volume ELSE 0 END)::BIGINT AS vol_0_30d,
+           SUM(CASE WHEN dte BETWEEN 31 AND 90  THEN volume ELSE 0 END)::BIGINT AS vol_31_90d,
+           SUM(CASE WHEN option_type = 'C' THEN strike * volume ELSE 0 END)::DOUBLE
+               / NULLIF(SUM(CASE WHEN option_type = 'C' THEN volume ELSE 0 END), 0) AS vol_weighted_strike_call,
+           SUM(CASE WHEN option_type = 'P' THEN strike * volume ELSE 0 END)::DOUBLE
+               / NULLIF(SUM(CASE WHEN option_type = 'P' THEN volume ELSE 0 END), 0) AS vol_weighted_strike_put,
+           SUM(strike * volume)::DOUBLE / NULLIF(SUM(volume), 0)             AS vol_weighted_strike_all,
+           SUM(CASE WHEN strike > spot THEN volume ELSE 0 END)::BIGINT       AS vol_above_spot,
+           SUM(CASE WHEN strike < spot THEN volume ELSE 0 END)::BIGINT       AS vol_below_spot,
+           SUM(CASE WHEN ABS(strike / spot - 1) <= 0.05 THEN volume ELSE 0 END)::BIGINT AS vol_within_5pct,
+           SUM(CASE WHEN ABS(strike / spot - 1) <= 0.10 THEN volume ELSE 0 END)::BIGINT AS vol_within_10pct,
+           SUM(dte * volume)::DOUBLE / NULLIF(SUM(volume), 0)                AS weighted_avg_dte_vol,
+           ANY_VALUE(spot)                                                   AS spot_pc
+    FROM chain
+    GROUP BY feature_date
+),
+joined AS (
+    -- Pull OI quantities at the consumer date T for the vol/OI cross-metrics.
+    SELECT p.*, f.total_oi, f.call_oi, f.put_oi, f.d1_total_oi_change
+    FROM per_day p
+    LEFT JOIN base_feats f ON p.trade_date = f.trade_date
 ),
 ratios AS (
     SELECT
@@ -602,24 +632,20 @@ ratios AS (
         total_vol::DOUBLE      / NULLIF(total_oi, 0)           AS vol_oi_ratio_all,
         total_call_vol::DOUBLE / NULLIF(call_oi, 0)            AS vol_oi_ratio_call,
         total_put_vol::DOUBLE  / NULLIF(put_oi, 0)             AS vol_oi_ratio_put,
-        -- vol_weighted_*_div_spot_pc: divides by spot_pc (= C_{T-1}), consistent
-        -- with how vol_above_spot / vol_within_* were already computed upstream in
-        -- fetch_volume_eod.py (using prior_close). Suffix _pc, not _co.
+        -- vol_weighted_*_div_spot_pc: divides by spot_pc (= close of T-1 = the
+        -- close of chain_adj.trade_date), consistent with the strike-vs-spot
+        -- comparison above that produced vol_above_spot / vol_within_*.
         vol_weighted_strike_call / NULLIF(spot_pc, 0)          AS vol_weighted_call_div_spot_pc,
         vol_weighted_strike_put  / NULLIF(spot_pc, 0)          AS vol_weighted_put_div_spot_pc,
         vol_weighted_strike_all  / NULLIF(spot_pc, 0)          AS vol_weighted_all_div_spot_pc,
-        -- These three use vol_above_spot / vol_within_* which were already computed
-        -- against prior_close in fetch_volume_eod.py — suffix corrected from _co to _pc.
         vol_above_spot::DOUBLE / NULLIF(vol_below_spot, 0)     AS vol_above_below_ratio_pc,
         vol_within_5pct::DOUBLE  / NULLIF(total_vol, 0)        AS pct_vol_within_5pct_pc,
         vol_within_10pct::DOUBLE / NULLIF(total_vol, 0)        AS pct_vol_within_10pct_pc,
         vol_0_30d::DOUBLE  / NULLIF(total_vol, 0)              AS pct_vol_0_30d,
         vol_31_90d::DOUBLE / NULLIF(total_vol, 0)              AS pct_vol_31_90d,
-        -- net_new_oi_div_vol depends on d1_total_oi_change (OI-tier) — classified
-        -- as MORNING_COLS. The morning cron reads total_vol from option_volume_daily.
         d1_total_oi_change::DOUBLE / NULLIF(total_vol, 0)      AS net_new_oi_div_vol,
         weighted_avg_dte_vol
-    FROM vol_joined
+    FROM joined
 ),
 zscores AS (
     SELECT
@@ -666,23 +692,144 @@ JOIN zscores z USING (trade_date)
 """
 
 # ---------------------------------------------------------------------------
-# Bucket 3: IV chain (15:45) features
+# Bucket 3: IV chain features (refactored to read raw chain + interpolate in SQL)
 # Inputs registered by the caller:
-#   iv_daily    pandas DF from option_iv_daily (trade_date + 5 IV metrics)
-#   base_feats  merged oi+ohlc DF (for rv_20d used in VRP / iv_rv_ratio)
+#   chain_adj   DuckDB view over data/chain_eod/{ticker}/*.parquet with
+#               strike already split-adjusted. See VOL_FEATURES_SQL header
+#               for full schema notes.
+#   ohlc        pandas DF (already registered for OHLC features). spot_pc =
+#               ohlc.close at chain_adj.trade_date.
+#   base_feats  merged oi+ohlc DF — used here only for rv_20d (needed for
+#               vrp_30d and iv_rv_ratio_30d). JOIN on base_feats.trade_date
+#               = chain_adj.feature_date.
+#
+# ATM interpolation: bracket-and-interpolate. For each (feature_date, expiration)
+# find the two CALL strikes bracketing spot_pc, linearly interpolate IV at
+# strike=spot. Then for each (feature_date, target_dte in {7,30,90}) bracket
+# expirations around feature_date's target DTE and linearly interpolate.
+#
+# No boundary fallback: if either strikes or expirations don't bracket the
+# target, the metric is NULL. With split adjustment correct, bracketing
+# should rarely fail; failures indicate genuinely sparse / questionable data.
+# This is a deliberate change from the legacy Python (_atm_iv_for_expiration)
+# which returned the nearest-strike IV — that fallback masked the split bug.
+#
+# iv_25d_* / rr / bf / skew columns remain NULL pending a future 15:45
+# endpoint migration (see test_iv_endpoint.py); EOD greeks are not trusted
+# in the wings.
 # ---------------------------------------------------------------------------
 IV_FEATURES_SQL = """
-WITH iv_joined AS (
+WITH calls AS (
+    -- Calls only (matches legacy _compute_day_metrics:
+    -- calls = day_df[day_df['option_type'] == 'C']).
+    -- Filter on implied_vol > 0 only; iv_error filter is deferred per
+    -- initial-backfill decision — apply at this CTE later once threshold
+    -- is selected from the empirical distribution.
+    SELECT trade_date, feature_date, expiration, strike, implied_vol
+    FROM chain_adj
+    WHERE option_type = 'C'
+      AND implied_vol > 0
+),
+calls_with_spot AS (
+    SELECT c.feature_date,
+           c.expiration,
+           c.strike,
+           c.implied_vol,
+           o.close AS spot,
+           (c.expiration - c.trade_date)::INTEGER AS exp_dte
+    FROM calls c
+    JOIN ohlc o ON o.trade_date = c.trade_date
+),
+strike_brackets AS (
+    -- Per (feature_date, expiration): largest strike <= spot and smallest > spot.
+    SELECT feature_date,
+           expiration,
+           ANY_VALUE(spot)    AS spot,
+           ANY_VALUE(exp_dte) AS exp_dte,
+           MAX(strike) FILTER (WHERE strike <= spot) AS s_low,
+           MIN(strike) FILTER (WHERE strike >  spot) AS s_high
+    FROM calls_with_spot
+    GROUP BY feature_date, expiration
+),
+strike_brackets_iv AS (
+    -- Pull the IVs at the two bracketing strikes.
+    SELECT sb.feature_date, sb.expiration, sb.spot, sb.exp_dte,
+           sb.s_low, sb.s_high,
+           cl.implied_vol AS iv_low,
+           ch.implied_vol AS iv_high
+    FROM strike_brackets sb
+    LEFT JOIN calls_with_spot cl
+        ON cl.feature_date = sb.feature_date
+       AND cl.expiration   = sb.expiration
+       AND cl.strike       = sb.s_low
+    LEFT JOIN calls_with_spot ch
+        ON ch.feature_date = sb.feature_date
+       AND ch.expiration   = sb.expiration
+       AND ch.strike       = sb.s_high
+),
+atm_per_exp AS (
+    -- Linear interpolation in strike at x = spot. NULL when not bracketed.
+    SELECT feature_date, expiration, exp_dte, spot,
+           CASE
+             WHEN s_low IS NULL OR s_high IS NULL                       THEN NULL
+             WHEN s_low = s_high                                        THEN iv_low
+             ELSE iv_low + (iv_high - iv_low) * (spot - s_low) / (s_high - s_low)
+           END AS atm_iv
+    FROM strike_brackets_iv
+),
+targets AS (
+    SELECT * FROM (VALUES (7), (30), (90)) AS t(target_dte)
+),
+exp_brackets AS (
+    -- Per (feature_date, target_dte): largest exp_dte <= target and smallest > target,
+    -- restricted to expirations that produced a valid atm_iv.
+    SELECT a.feature_date, t.target_dte,
+           MAX(a.exp_dte) FILTER (WHERE a.exp_dte <= t.target_dte) AS d_low,
+           MIN(a.exp_dte) FILTER (WHERE a.exp_dte >  t.target_dte) AS d_high
+    FROM atm_per_exp a CROSS JOIN targets t
+    WHERE a.atm_iv IS NOT NULL
+    GROUP BY a.feature_date, t.target_dte
+),
+exp_brackets_iv AS (
+    SELECT eb.feature_date, eb.target_dte, eb.d_low, eb.d_high,
+           al.atm_iv AS iv_low,
+           ah.atm_iv AS iv_high
+    FROM exp_brackets eb
+    LEFT JOIN atm_per_exp al
+        ON al.feature_date = eb.feature_date AND al.exp_dte = eb.d_low
+    LEFT JOIN atm_per_exp ah
+        ON ah.feature_date = eb.feature_date AND ah.exp_dte = eb.d_high
+),
+atm_by_dte AS (
+    -- Linear interpolation in DTE at x = target_dte. NULL when not bracketed.
+    SELECT feature_date, target_dte,
+           CASE
+             WHEN d_low IS NULL OR d_high IS NULL                       THEN NULL
+             WHEN d_low = d_high                                        THEN iv_low
+             ELSE iv_low + (iv_high - iv_low) * (target_dte - d_low) / (d_high - d_low)
+           END AS atm_iv_value
+    FROM exp_brackets_iv
+),
+atm_pivoted AS (
+    SELECT feature_date AS trade_date,
+           MAX(atm_iv_value) FILTER (WHERE target_dte =  7) AS atm_iv_7d,
+           MAX(atm_iv_value) FILTER (WHERE target_dte = 30) AS atm_iv_30d,
+           MAX(atm_iv_value) FILTER (WHERE target_dte = 90) AS atm_iv_90d
+    FROM atm_by_dte
+    GROUP BY feature_date
+),
+iv_joined AS (
+    -- Match the column shape the downstream `derived` CTE expects.
     SELECT
-        i.trade_date,
-        i.atm_iv_7d,
-        i.atm_iv_30d,
-        i.atm_iv_90d,
-        i.iv_25d_call_30d,
-        i.iv_25d_put_30d,
+        a.trade_date,
+        a.atm_iv_7d,
+        a.atm_iv_30d,
+        a.atm_iv_90d,
+        CAST(NULL AS DOUBLE) AS iv_25d_call_30d,
+        CAST(NULL AS DOUBLE) AS iv_25d_put_30d,
         f.rv_20d
-    FROM iv_daily i
-    LEFT JOIN base_feats f ON i.trade_date = f.trade_date
+    FROM atm_pivoted a
+    LEFT JOIN base_feats f ON a.trade_date = f.trade_date
 ),
 derived AS (
     SELECT
@@ -775,8 +922,8 @@ JOIN zscores z USING (trade_date)
 #                 ThetaData publishes OI for the upcoming session.  Also
 #                 includes vol/OI cross-metrics (vol_oi_ratio_*, net_new_oi_div_vol)
 #                 because they require T's OI, which is not available at the
-#                 evening run.  The morning cron reads total_vol from
-#                 option_volume_daily for those cross-metrics.
+#                 evening run.  Vol quantities for these come from the chain_adj
+#                 view over data/chain_eod/ (filtered to feature_date=T).
 #
 # EVENING_COLS  — Non-OI-tier.  Written by the evening cron (~5:30pm on T-1)
 #                 after the prior session's close.  Includes OHLC-derived
@@ -859,7 +1006,7 @@ MORNING_COLS = [
     "zscore_put_call_oi_ratio_3m",
     "zscore_oi_above_below_ratio_3m_pc", "zscore_oi_above_below_ratio_3m_co",
     # Vol/OI cross-metrics: require T's OI → morning cron only.
-    # Morning cron reads total_vol / call_vol / put_vol from option_volume_daily.
+    # Vol quantities are aggregated from the chain_adj view at build time.
     "vol_oi_ratio_all", "vol_oi_ratio_call", "vol_oi_ratio_put",
     "net_new_oi_div_vol",
     "zscore_vol_oi_ratio_all", "zscore_vol_oi_ratio_call", "zscore_vol_oi_ratio_put",
@@ -948,52 +1095,6 @@ def load_ohlc_spy(conn) -> pd.DataFrame:
     df = df.sort_values("trade_date").reset_index(drop=True)
     df["spy_ret_20d"] = df["close"] / df["close"].shift(20) - 1
     return df[["trade_date", "spy_ret_20d"]]
-
-
-def load_vol_daily(conn, ticker: str,
-                   start: date | None, end: date) -> pd.DataFrame:
-    """Pull option_volume_daily rows for one ticker within [start, end]."""
-    if start is not None:
-        df = read_sql_df(
-            conn,
-            "SELECT * FROM option_volume_daily "
-            "WHERE ticker = %(t)s AND trade_date >= %(s)s AND trade_date <= %(e)s "
-            "ORDER BY trade_date",
-            {"t": ticker, "s": start, "e": end},
-        )
-    else:
-        df = read_sql_df(
-            conn,
-            "SELECT * FROM option_volume_daily "
-            "WHERE ticker = %(t)s ORDER BY trade_date",
-            {"t": ticker},
-        )
-    if not df.empty:
-        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-    return df
-
-
-def load_iv_daily(conn, ticker: str,
-                  start: date | None, end: date) -> pd.DataFrame:
-    """Pull option_iv_daily rows for one ticker within [start, end]."""
-    if start is not None:
-        df = read_sql_df(
-            conn,
-            "SELECT * FROM option_iv_daily "
-            "WHERE ticker = %(t)s AND trade_date >= %(s)s AND trade_date <= %(e)s "
-            "ORDER BY trade_date",
-            {"t": ticker, "s": start, "e": end},
-        )
-    else:
-        df = read_sql_df(
-            conn,
-            "SELECT * FROM option_iv_daily "
-            "WHERE ticker = %(t)s ORDER BY trade_date",
-            {"t": ticker},
-        )
-    if not df.empty:
-        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-    return df
 
 
 def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,
@@ -1087,7 +1188,8 @@ def build_for_ticker(pg_conn, ticker: str,
                  ", ".join(f"{r.trade_date}×{r.splits}" for r in splits_df.itertuples()))
 
     # Register the raw OHLC. OI_FEATURES_SQL uses (trade_date, open, close);
-    # OHLC_FEATURES_SQL also uses high, low, volume for Bucket 1 metrics.
+    # OHLC_FEATURES_SQL also uses high, low, volume for Bucket 1 metrics;
+    # VOL/IV SQL join on ohlc.trade_date = chain_adj.trade_date for spot_pc.
     con.register("ohlc",            ohlc[["trade_date", "open", "high", "low", "close", "volume"]])
     con.register("next_monthly_df", nm_df)
     con.register("split_factors",   sf_df)
@@ -1102,9 +1204,27 @@ def build_for_ticker(pg_conn, ticker: str,
         f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
     )
 
-    # Load vol and IV data (include OI lookback buffer for z-score warm-up).
-    vol_daily_df = load_vol_daily(pg_conn, ticker, oi_buffer_start, end_eff)
-    iv_daily_df  = load_iv_daily(pg_conn, ticker,  oi_buffer_start, end_eff)
+    # The chain_adj view applies split-adjustment to strike via the same
+    # split_factors join. trade_date is the actual session (T-1); feature_date
+    # is the daily_features consumer date (T). Vol/IV SQL filters by feature_date
+    # against the build range. May not exist for tickers not yet backfilled.
+    chain_present = chain_has_data(ticker)
+    if chain_present:
+        chain_date_filter = (
+            f" WHERE feature_date >= DATE '{oi_buffer_start.isoformat()}'"
+            f"   AND feature_date <= DATE '{end_eff.isoformat()}'"
+            if start is not None else ""
+        )
+        con.execute(
+            f"CREATE OR REPLACE VIEW chain_adj AS "
+            f"SELECT raw.trade_date, raw.source_session, raw.feature_date, "
+            f"       raw.expiration, "
+            f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
+            f"       raw.option_type, raw.volume, raw.implied_vol, "
+            f"       raw.delta, raw.iv_error "
+            f"FROM (SELECT * FROM read_parquet('{chain_parquet_glob(ticker)}'){chain_date_filter}) raw "
+            f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
+        )
 
     log.info("  computing OI features ...")
     oi_feats = con.execute(OI_FEATURES_SQL).df()
@@ -1123,22 +1243,23 @@ def build_for_ticker(pg_conn, ticker: str,
     feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
     feats.insert(0, "ticker", ticker)
 
-    # Register the merged base for vol/IV queries, then compute Bucket 2 & 3.
+    # Register the merged base for vol/IV queries.
     con.register("base_feats", feats)
 
-    if not vol_daily_df.empty:
+    if chain_present:
         log.info("  computing vol features ...")
-        con.register("vol_daily", vol_daily_df)
         vol_feats = con.execute(VOL_FEATURES_SQL).df()
         vol_feats["trade_date"] = pd.to_datetime(vol_feats["trade_date"]).dt.date
+        # LEFT MERGE: missing chain data for a date leaves vol columns NULL
+        # rather than dropping the daily_features row.
         feats = feats.merge(vol_feats, on="trade_date", how="left")
 
-    if not iv_daily_df.empty:
         log.info("  computing IV features ...")
-        con.register("iv_daily", iv_daily_df)
         iv_feats = con.execute(IV_FEATURES_SQL).df()
         iv_feats["trade_date"] = pd.to_datetime(iv_feats["trade_date"]).dt.date
         feats = feats.merge(iv_feats, on="trade_date", how="left")
+    else:
+        log.warning("  no chain_eod parquet for %s — vol/IV columns will be NULL", ticker)
 
     con.close()
 

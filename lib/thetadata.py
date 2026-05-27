@@ -547,6 +547,48 @@ def fetch_greeks_eod(symbol: str, trade_date: date,
     return df
 
 
+def fetch_greeks_eod_raw(symbol: str, trade_date: date,
+                         timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """
+    Same endpoint as fetch_greeks_eod, but returns ALL fields from the
+    response with NO field-filtering and NO row-filtering.
+
+    Used by fetch_chain_eod.py to populate the raw chain parquet store.
+    The legacy fetch_greeks_eod drops volume, iv_error, and any other
+    field its 7-column projection didn't list; the raw variant preserves
+    everything for downstream projection in the new fetcher.
+
+    Returns a DataFrame whose columns match the vendor's field names
+    exactly (whatever the EOD greeks response includes). Empty DataFrame
+    on NoDataError or empty response.
+    """
+    date_str = trade_date.strftime("%Y%m%d")
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+        "start_date": date_str,
+        "end_date":   date_str,
+    }
+
+    try:
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (greeks_eod_raw %s)", symbol)
+        time.sleep(60)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (greeks_eod_raw %s)", symbol)
+        time.sleep(10)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
                            time_str: str, interval: str = "5m",
                            timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
