@@ -47,14 +47,14 @@ log = logging.getLogger(__name__)
 
 _UPSERT_SQL = """
 INSERT INTO option_volume_daily (
-    ticker, trade_date,
+    ticker, trade_date, source_session,
     total_call_vol, total_put_vol, total_vol,
     vol_0_30d, vol_31_90d,
     vol_weighted_strike_call, vol_weighted_strike_put, vol_weighted_strike_all,
     vol_above_spot, vol_below_spot, vol_within_5pct, vol_within_10pct,
     weighted_avg_dte_vol
 ) VALUES (
-    %(ticker)s, %(trade_date)s,
+    %(ticker)s, %(trade_date)s, %(source_session)s,
     %(total_call_vol)s, %(total_put_vol)s, %(total_vol)s,
     %(vol_0_30d)s, %(vol_31_90d)s,
     %(vol_weighted_strike_call)s, %(vol_weighted_strike_put)s,
@@ -64,6 +64,7 @@ INSERT INTO option_volume_daily (
     %(weighted_avg_dte_vol)s
 )
 ON CONFLICT (ticker, trade_date) DO UPDATE SET
+    source_session            = EXCLUDED.source_session,
     total_call_vol            = EXCLUDED.total_call_vol,
     total_put_vol             = EXCLUDED.total_put_vol,
     total_vol                 = EXCLUDED.total_vol,
@@ -171,6 +172,7 @@ def _aggregate(df: pd.DataFrame, prior_close: dict[date, float],
 
         records.append({
             "trade_date":              trade_date,
+            "source_session":          fetch_date,
             "total_call_vol":          total_call_vol,
             "total_put_vol":           total_put_vol,
             "total_vol":               total_vol,

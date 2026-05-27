@@ -12,6 +12,7 @@
 CREATE TABLE IF NOT EXISTS option_volume_daily (
     ticker                      TEXT             NOT NULL,
     trade_date                  DATE             NOT NULL,
+    source_session              DATE,            -- fetch_date = T-1 for the trade_date = T row
     total_call_vol              BIGINT,
     total_put_vol               BIGINT,
     total_vol                   BIGINT,
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS option_volume_daily (
 CREATE TABLE IF NOT EXISTS option_iv_daily (
     ticker          TEXT             NOT NULL,
     trade_date      DATE             NOT NULL,
+    source_session  DATE,            -- fetch_date = T-1 for the trade_date = T row
     atm_iv_7d       DOUBLE PRECISION,
     atm_iv_30d      DOUBLE PRECISION,
     atm_iv_90d      DOUBLE PRECISION,

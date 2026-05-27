@@ -66,15 +66,16 @@ _TARGET_DTES = [7, 30, 90]
 
 _UPSERT_SQL = """
 INSERT INTO option_iv_daily (
-    ticker, trade_date,
+    ticker, trade_date, source_session,
     atm_iv_7d, atm_iv_30d, atm_iv_90d,
     iv_25d_call_30d, iv_25d_put_30d
 ) VALUES (
-    %(ticker)s, %(trade_date)s,
+    %(ticker)s, %(trade_date)s, %(source_session)s,
     %(atm_iv_7d)s, %(atm_iv_30d)s, %(atm_iv_90d)s,
     %(iv_25d_call_30d)s, %(iv_25d_put_30d)s
 )
 ON CONFLICT (ticker, trade_date) DO UPDATE SET
+    source_session  = EXCLUDED.source_session,
     atm_iv_7d       = EXCLUDED.atm_iv_7d,
     atm_iv_30d      = EXCLUDED.atm_iv_30d,
     atm_iv_90d      = EXCLUDED.atm_iv_90d,
@@ -255,8 +256,9 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
             trade_date = next_trading_day(fetch_date)
 
             cur.execute(_UPSERT_SQL, {
-                "ticker":     ticker,
-                "trade_date": trade_date,
+                "ticker":         ticker,
+                "trade_date":     trade_date,
+                "source_session": fetch_date,
                 **metrics,
             })
             rows_upserted += 1

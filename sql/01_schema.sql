@@ -372,3 +372,14 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_5d_fwd_cc   DOUBLE PRECI
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_7d_fwd_cc   DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_10d_fwd_cc  DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_20d_fwd_cc  DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- 10. source_session columns on vol/IV upstream tables
+--     Both option_volume_daily and option_iv_daily store rows under
+--     trade_date = next_trading_day(fetch_date), so the fetched session
+--     (T-1) is otherwise invisible once the row lands. source_session
+--     records the actual session whose data this row contains.
+--     Existing rows: NULL until the next re-fetch overwrites them.
+-- ---------------------------------------------------------------------------
+ALTER TABLE option_volume_daily ADD COLUMN IF NOT EXISTS source_session DATE;
+ALTER TABLE option_iv_daily     ADD COLUMN IF NOT EXISTS source_session DATE;
