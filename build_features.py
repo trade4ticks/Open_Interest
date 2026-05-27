@@ -18,7 +18,6 @@ Usage:
 """
 from __future__ import annotations
 
-import bisect
 import logging
 from datetime import date, datetime, timedelta
 
@@ -29,6 +28,7 @@ import psycopg2.extras
 from db import get_connection, read_sql_df
 from lib.expirations import build_next_monthly_lookup
 from lib.parquet_store import list_tickers, parquet_glob
+from lib.split_factors import load_splits, make_split_factors
 
 # Backward window buffer (calendar days) when running with a date range.
 # 60-day z-scores need ~65 trading-day inputs; 130 calendar days covers that
@@ -433,12 +433,6 @@ ORDER BY p.trade_date
 #   _cc  entry = prior close C_{T-1}. Pair with _oc to isolate the overnight
 #        gap from the intraday component. NOT named _pc — the _pc/_co suffix
 #        convention elsewhere means spot-reference, not entry-price anchor.
-#
-# NOTE: underlying_ohlc stores raw (unadjusted) closes (auto_adjust=False in
-# fetch_ohlc.py). All OHLC-derived metrics including atr_14d, ret_Nd, and the
-# true-range components are therefore in unadjusted price terms. atr_14d's
-# LAG(close) component will be unreliable on the single day straddling a
-# forward split — flagged for a separate fix (split-boundary ATR artifact).
 # ---------------------------------------------------------------------------
 OHLC_FEATURES_SQL = """
 WITH base AS (
@@ -517,7 +511,8 @@ derived AS (
         -- atr_14d / close normalises ATR from dollar-units to a fraction of
         -- current price, making the ratio dimensionless and cross-ticker-comparable.
         -- Both numerator (ret_5d) and denominator (atr_14d / close) share close_T
-        -- as their price anchor. See flag above re: split-boundary ATR artifact.
+        -- as their price anchor, so the ratio is split-safe (close is yfinance-
+        -- adjusted, true_range uses adjusted high/low/LAG(close) consistently).
         ret_5d / NULLIF(atr_14d / NULLIF(close, 0), 0)              AS atr_normalized_ret_5d
     FROM windowed
 ),
@@ -999,46 +994,6 @@ def load_iv_daily(conn, ticker: str,
     if not df.empty:
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     return df
-
-
-def load_splits(conn, ticker: str) -> pd.DataFrame:
-    """Pull non-zero split events for one ticker, sorted ascending by date."""
-    df = read_sql_df(
-        conn,
-        "SELECT trade_date, splits FROM underlying_ohlc "
-        "WHERE ticker = %(ticker)s AND splits IS NOT NULL AND splits != 0 "
-        "ORDER BY trade_date",
-        {"ticker": ticker},
-    )
-    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-    return df
-
-
-def make_split_factors(splits_df: pd.DataFrame, oi_dates: list) -> pd.DataFrame:
-    """Return DataFrame(trade_date, adj_factor) for each date in oi_dates.
-
-    adj_factor = product of (1/ratio) for all splits on or after trade_date.
-    Converts pre-split strikes to current (post-split) terms.
-    Handles forward splits (ratio > 1) and reverse splits (ratio < 1) uniformly.
-    For tickers with no splits every factor is 1.0 (no-op).
-    """
-    if splits_df.empty:
-        return pd.DataFrame({"trade_date": oi_dates,
-                             "adj_factor":  [1.0] * len(oi_dates)})
-
-    split_dates  = splits_df["trade_date"].tolist()   # sorted asc by query
-    split_ratios = splits_df["splits"].tolist()
-
-    # Build suffix cumulative product: suffix_factors[i] = prod(1/ratio for splits[i:])
-    # Boundary: trade_date <= split_date → adjust (bisect_left returns that split's idx)
-    #           trade_date >  split_date → no adjustment (idx past the split)
-    n = len(split_dates)
-    suffix_factors = [1.0] * (n + 1)
-    for i in range(n - 1, -1, -1):
-        suffix_factors[i] = suffix_factors[i + 1] / split_ratios[i]
-
-    factors = [suffix_factors[bisect.bisect_left(split_dates, td)] for td in oi_dates]
-    return pd.DataFrame({"trade_date": oi_dates, "adj_factor": factors})
 
 
 def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,

@@ -44,6 +44,7 @@ from tqdm import tqdm
 from db import get_connection, read_sql_df
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
+from lib.split_factors import load_splits, make_split_factor_map
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
@@ -212,6 +213,14 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
         spot_df["trade_date"] = pd.to_datetime(spot_df["trade_date"]).dt.date
         spot_map = dict(zip(spot_df["trade_date"], spot_df["close"]))
 
+    # Split factors: raw ThetaData strikes need to be multiplied by adj_factor
+    # to match the split-adjusted spot from underlying_ohlc. Without this,
+    # _atm_iv_for_expiration on a pre-split date finds spot below every strike,
+    # falls back to the lowest-strike (deep-ITM) IV, and produces garbage
+    # (e.g. atm_iv_30d ~ 1.4-2.6 for 2019 AAPL).
+    splits_df     = load_splits(conn, ticker)
+    split_factors = make_split_factor_map(splits_df, fetch_dates)
+
     rows_upserted = 0
     with conn.cursor() as cur:
         for fetch_date in fetch_dates:
@@ -234,6 +243,13 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
                 continue
 
             chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.date
+
+            # Split-adjust strikes so _atm_iv_for_expiration's strike-vs-spot
+            # comparison is in consistent units.
+            adj_factor = split_factors.get(fetch_date, 1.0)
+            if adj_factor != 1.0:
+                chain = chain.copy()
+                chain["strike"] = chain["strike"] * adj_factor
 
             metrics    = _compute_day_metrics(chain, fetch_date, spot)
             trade_date = next_trading_day(fetch_date)

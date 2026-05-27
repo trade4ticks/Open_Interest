@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from db import get_connection, read_sql_df
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
+from lib.split_factors import load_splits, make_split_factor_map
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
@@ -106,13 +107,17 @@ def _prompt_date(label: str) -> date:
 
 # --- Aggregation -----------------------------------------------------------
 
-def _aggregate(df: pd.DataFrame, prior_close: dict[date, float]) -> list[dict]:
+def _aggregate(df: pd.DataFrame, prior_close: dict[date, float],
+               split_factors: dict[date, float]) -> list[dict]:
     """
     Aggregate a raw volume DataFrame into one dict per trade_date.
 
     df columns: trade_date, expiration, strike, option_type, volume
     trade_date here is the ThetaData fetch date (T-1 in pipeline terms).
-    prior_close: {fetch_date: close_price}
+    prior_close: {fetch_date: close_price} — split-adjusted (yfinance).
+    split_factors: {fetch_date: adj_factor} — multiply raw strike by this to
+                   get adjusted strike (1.0 = no split between this date and now).
+                   Required to make strike-vs-spot comparisons valid on pre-split dates.
     """
     if df.empty:
         return []
@@ -123,6 +128,13 @@ def _aggregate(df: pd.DataFrame, prior_close: dict[date, float]) -> list[dict]:
         trade_date = next_trading_day(fetch_date)
 
         grp = grp.copy()
+        # Adjust strikes to match the split-adjusted spot. Without this, raw
+        # ThetaData strikes (e.g. AAPL $200 pre-2020-08-31 4:1 split) are
+        # compared against adjusted spot (~$50), corrupting every spot-
+        # dependent metric below.
+        adj_factor = split_factors.get(fetch_date, 1.0)
+        if adj_factor != 1.0:
+            grp["strike"] = grp["strike"] * adj_factor
         grp["dte"] = grp["expiration"].apply(lambda x: (x - fetch_date).days)
 
         calls = grp[grp["option_type"] == "C"]
@@ -222,9 +234,11 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
     if not fetch_dates:
         return 0
 
-    fetch_set   = set(fetch_dates)
-    prior_close = _load_prior_close(conn, ticker, fetch_dates)
-    chunks      = _chunk_date_ranges(fetch_dates)
+    fetch_set     = set(fetch_dates)
+    prior_close   = _load_prior_close(conn, ticker, fetch_dates)
+    splits_df     = load_splits(conn, ticker)
+    split_factors = make_split_factor_map(splits_df, fetch_dates)
+    chunks        = _chunk_date_ranges(fetch_dates)
     all_frames: list[pd.DataFrame] = []
 
     for chunk_start, chunk_end in chunks:
@@ -251,7 +265,7 @@ def fetch_ticker(conn, ticker: str, fetch_dates: list[date]) -> int:
         return 0
 
     combined = pd.concat(all_frames, ignore_index=True)
-    records  = _aggregate(combined, prior_close)
+    records  = _aggregate(combined, prior_close, split_factors)
     if not records:
         return 0
 
