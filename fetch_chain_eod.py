@@ -133,10 +133,16 @@ def _project_chain(raw: pd.DataFrame, fetch_date: date) -> pd.DataFrame:
             _IV_ERROR_WARNED = True
         iv_err = pd.Series([float("nan")] * len(raw))
 
+    # Compute feature_date once per unique session, not per row. A single
+    # fetch uses start_date == end_date so there's typically just one
+    # unique value; the per-row .apply() was calling pandas_market_calendars
+    # ~10k times per dense-chain response, dominating wall-clock and
+    # holding the GIL (which also serialized the 4-worker pool).
+    fd_map = {d: next_trading_day(d) for d in td.unique() if d is not None}
     out = pd.DataFrame({
         "trade_date":     td,
         "source_session": td,
-        "feature_date":   td.apply(next_trading_day),
+        "feature_date":   td.map(fd_map),
         "expiration":     pd.to_datetime(raw["expiration"], errors="coerce").dt.date,
         "strike":         pd.to_numeric(raw["strike"], errors="coerce"),
         "option_type":    otype,
