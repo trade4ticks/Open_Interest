@@ -71,6 +71,16 @@ import pandas as pd
 import pandas_market_calendars as mcal
 import requests
 
+# Load .env (alongside this script) before reading env vars — matches the
+# production pipeline's dotenv behavior. Without this, THETADATA_BASE_URL
+# silently defaults to localhost on machines where the terminal is on a
+# different host (Tailscale IP, etc.).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants — edit here to change the sample.
 # ---------------------------------------------------------------------------
@@ -102,37 +112,54 @@ def _get(endpoint: str, params: dict, timeout: int = TIMEOUT):
 
 
 def _parse_rows(data) -> list[dict]:
-    """Normalize ThetaData v3 response shapes to a list of dicts.
-    Mirrors lib/thetadata.py:_parse_rows behavior but standalone."""
+    """Normalize the THREE ThetaData v3 response shapes to a list of dicts.
+    Mirrors lib/thetadata.py:_parse_rows exactly (including the columnar-dict
+    shape that /v3/option/list/expirations returns — earlier version of this
+    parser missed that and silently returned []). Standalone copy on purpose."""
     if not data:
         return []
+    # Shape 1: {"header": {"format": [...]}, "response": [[...], ...]}
     if isinstance(data, dict) and "header" in data and "response" in data:
         fields = data["header"].get("format", []) or []
         return [dict(zip(fields, row)) for row in (data.get("response") or []) if row]
+    # Shape 2: columnar dict of parallel lists: {"col1": [...], "col2": [...]}
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        first_list = next((data[k] for k in keys if isinstance(data[k], list)), None)
+        if first_list is None:
+            return []
+        n = len(first_list)
+        return [
+            {k: (data[k][i] if isinstance(data[k], list) and i < len(data[k]) else data[k])
+             for k in keys}
+            for i in range(n)
+        ]
+    # Shape 3: bare list of row dicts
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
-    if isinstance(data, dict):
-        # Some endpoints return single-dict or {symbol: rows} shapes — best-effort.
-        keys = list(data.keys())
-        if keys and isinstance(data[keys[0]], list):
-            return [r for r in data[keys[0]] if isinstance(r, dict)]
     return []
 
 
-def _parse_ymd(s) -> Optional[date]:
-    """Parse YYYYMMDD or YYYY-MM-DD into a date. Returns None on failure."""
-    if s is None:
+def _parse_ymd(raw) -> Optional[date]:
+    """Accept 'YYYY-MM-DD', 'YYYYMMDD', or integer 20240102 → date."""
+    if raw is None:
         return None
-    s = str(s).strip()
-    if len(s) == 8 and s.isdigit():
+    s = str(raw)
+    if len(s) >= 10 and s[4] == "-":
+        try:
+            return date(int(s[:4]), int(s[5:7]), int(s[8:10]))
+        except ValueError:
+            return None
+    try:
+        s = str(int(s))
+    except ValueError:
+        return None
+    if len(s) == 8:
         try:
             return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
         except ValueError:
             return None
-    try:
-        return date.fromisoformat(s[:10])
-    except (ValueError, IndexError):
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -141,16 +168,23 @@ def _parse_ymd(s) -> Optional[date]:
 # ---------------------------------------------------------------------------
 
 def list_expirations(ticker: str) -> tuple[list[date], Optional[str]]:
-    """All expirations the terminal knows for this symbol. Returns ([], err) on failure."""
+    """All expirations the terminal knows for this symbol. Returns ([], err) on failure.
+    On any zero-rows / unparseable response, includes a snippet of the raw response
+    in the error so the user can diagnose URL / format mismatches."""
     try:
         data = _get("/v3/option/list/expirations", {"symbol": ticker.upper()})
     except Exception as e:
-        return [], str(e)[:200]
+        return [], f"http_failure: {type(e).__name__}: {str(e)[:200]}"
+    rows = _parse_rows(data)
+    if not rows:
+        return [], f"response_unparseable_or_empty | raw: {repr(data)[:300]}"
     out: list[date] = []
-    for r in _parse_rows(data):
+    for r in rows:
         d = _parse_ymd(r.get("expiration") if isinstance(r, dict) else r)
         if d:
             out.append(d)
+    if not out:
+        return [], f"rows_returned_but_no_valid_dates | sample row: {repr(rows[0])[:200]}"
     return sorted(set(out)), None
 
 
