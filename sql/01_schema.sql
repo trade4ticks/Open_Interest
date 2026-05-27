@@ -322,3 +322,53 @@ ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_weighted_all_div_
 ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_weighted_all_div_spot_3m_co   DOUBLE PRECISION;
 ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m_pc       DOUBLE PRECISION;
 ALTER TABLE daily_features ADD  COLUMN IF NOT EXISTS zscore_oi_above_below_ratio_3m_co       DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- 8. Vol spot-reference standardization (2026-05-26)
+--    The six vol _co derived columns in daily_features had wrong suffixes:
+--    - vol_above_below_ratio_co / pct_vol_within_*_co: upstream computation in
+--      fetch_volume_eod.py used prior_close (= C_{T-1} = spot_pc) as the spot
+--      reference, so _co suffix was incorrect from the start.
+--    - vol_weighted_*_div_spot_co: denominator changed from O_T (spot_co) to
+--      C_{T-1} (spot_pc) for consistency with the standardized spot reference.
+--    Upstream option_volume_daily columns (vol_above_spot, vol_within_*) keep
+--    their names — only the derived daily_features columns are renamed/changed.
+--    CASCADE: v_features_with_returns uses SELECT f.* — drop+recreate via
+--    02_views.sql after running this file.
+-- ---------------------------------------------------------------------------
+
+-- 8a. Drop old _co named columns (stale data; rebuild daily_features after).
+ALTER TABLE daily_features DROP COLUMN IF EXISTS vol_weighted_call_div_spot_co   CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS vol_weighted_put_div_spot_co    CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS vol_weighted_all_div_spot_co    CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS vol_above_below_ratio_co        CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_vol_within_5pct_co          CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS pct_vol_within_10pct_co         CASCADE;
+ALTER TABLE daily_features DROP COLUMN IF EXISTS zscore_vol_above_below_ratio_co CASCADE;
+
+-- 8b. Add new _pc named replacements.
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_call_div_spot_pc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_put_div_spot_pc    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_all_div_spot_pc    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_above_below_ratio_pc        DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_5pct_pc          DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_10pct_pc         DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_above_below_ratio_pc DOUBLE PRECISION;
+
+-- 8c. weighted_avg_dte_vol: present in option_volume_daily since 03_new_metrics,
+--     now surfaced in daily_features as an evening-tier feature.
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS weighted_avg_dte_vol            DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- 9. Forward-return close-to-close columns re-added (2026-05-26)
+--    Previously dropped in section 6 with a different entry-anchor rationale.
+--    Re-added with entry = C_{T-1} (prior close). Suffix _cc = close-to-close
+--    entry anchor. The _pc/_co suffix convention is reserved for spot-reference
+--    meaning elsewhere and is NOT used here.
+-- ---------------------------------------------------------------------------
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_1d_fwd_cc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_3d_fwd_cc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_5d_fwd_cc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_7d_fwd_cc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_10d_fwd_cc  DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_20d_fwd_cc  DOUBLE PRECISION;

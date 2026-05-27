@@ -82,29 +82,37 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_oi_ratio_all            
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_oi_ratio_call               DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_oi_ratio_put                DOUBLE PRECISION;
 
--- volume-weighted strike vs spot (spot_co variant only — _pc is spot-independent)
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_call_div_spot_co   DOUBLE PRECISION;
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_put_div_spot_co    DOUBLE PRECISION;
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_all_div_spot_co    DOUBLE PRECISION;
+-- volume-weighted strike vs spot_pc (= C_{T-1}, prior close).
+-- Note: original column names used _co suffix but spot reference was always
+-- prior_close upstream. Renamed to _pc in schema section 8 of 01_schema.sql.
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_call_div_spot_pc   DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_put_div_spot_pc    DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_weighted_all_div_spot_pc    DOUBLE PRECISION;
 
--- directional volume split
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_above_below_ratio_co        DOUBLE PRECISION;
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_5pct_co          DOUBLE PRECISION;
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_10pct_co         DOUBLE PRECISION;
+-- directional volume split (computed against prior_close = spot_pc upstream)
+-- Original _co suffix corrected to _pc in schema section 8 of 01_schema.sql.
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS vol_above_below_ratio_pc        DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_5pct_pc          DOUBLE PRECISION;
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_within_10pct_pc         DOUBLE PRECISION;
 
 -- term structure of volume
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_0_30d                   DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS pct_vol_31_90d                  DOUBLE PRECISION;
 
 -- OI absorption: how much of daily OI change is explained by volume
+-- (morning-tier: requires T's OI delta; morning cron reads total_vol from DB)
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS net_new_oi_div_vol              DOUBLE PRECISION;
+
+-- volume-weighted average DTE (counterpart to OI-weighted weighted_avg_dte)
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS weighted_avg_dte_vol            DOUBLE PRECISION;
 
 -- z-scores (60-day window)
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_put_call_ratio_vol        DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_oi_ratio_all          DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_oi_ratio_call         DOUBLE PRECISION;
 ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_oi_ratio_put          DOUBLE PRECISION;
-ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_above_below_ratio_co  DOUBLE PRECISION;
+-- _pc suffix: corrected from _co, see section 8 of 01_schema.sql
+ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS zscore_vol_above_below_ratio_pc  DOUBLE PRECISION;
 
 -- ---------------------------------------------------------------------------
 -- Bucket 3: IV chain (15:45 snapshot) columns added to daily_features

@@ -14,7 +14,7 @@ from pathlib import Path
 from db import get_connection
 
 SQL_DIR = Path(__file__).parent / "sql"
-FILES   = ["01_schema.sql", "02_views.sql", "03_new_metrics.sql", "04_backtest.sql"]
+FILES   = ["01_schema.sql", "03_new_metrics.sql", "02_views.sql", "04_backtest.sql"]
 
 
 def main() -> None:

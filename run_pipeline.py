@@ -21,7 +21,7 @@ Behaviour
   OI row for today, (b) keep ret_*_fwd_oc up-to-date as new OHLC arrives in
   the prior 20 days. The DuckDB query reads a 130-day buffer behind the
   range so window functions still see correct history; only the [start,end]
-  slice is DELETE+INSERTed.
+  slice is upserted (ON CONFLICT DO UPDATE).
 
 Today's row at 7am will have OI-only features populated and spot-derived
 ones NULL — they fill in tomorrow when today's OHLC becomes available.

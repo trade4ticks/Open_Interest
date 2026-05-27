@@ -424,13 +424,21 @@ ORDER BY p.trade_date
 
 
 # ---------------------------------------------------------------------------
-# OHLC-derived features (rv, fwd oc returns) — DuckDB on the unified ohlc DF.
-# Input: ohlc pandas DF [trade_date, open, close, prev_close]
+# OHLC-derived features (rv, fwd oc/cc returns) — DuckDB on the unified ohlc DF.
+# Input: ohlc pandas DF [trade_date, open, high, low, close, volume]
 #
-# Forward returns: entry = open of trade_date (OI for trade_date is published
-# overnight and visible on broker platforms when the market opens), exit =
-# close of trade_date + (N-1). So ret_1d is intraday open-to-close on
-# trade_date itself, ret_3d is from trade_date open to close[+2], etc.
+# Two forward-return series, same exit closes, different entry anchors:
+#   _oc  entry = open of trade_date (O_T). OI is published overnight and visible
+#        when the market opens, so O_T is the realistic entry price.
+#   _cc  entry = prior close C_{T-1}. Pair with _oc to isolate the overnight
+#        gap from the intraday component. NOT named _pc — the _pc/_co suffix
+#        convention elsewhere means spot-reference, not entry-price anchor.
+#
+# NOTE: underlying_ohlc stores raw (unadjusted) closes (auto_adjust=False in
+# fetch_ohlc.py). All OHLC-derived metrics including atr_14d, ret_Nd, and the
+# true-range components are therefore in unadjusted price terms. atr_14d's
+# LAG(close) component will be unreliable on the single day straddling a
+# forward split — flagged for a separate fix (split-boundary ATR artifact).
 # ---------------------------------------------------------------------------
 OHLC_FEATURES_SQL = """
 WITH base AS (
@@ -468,13 +476,20 @@ windowed AS (
         close / NULLIF(LAG(close,  5) OVER w_t, 0) - 1             AS ret_5d,
         close / NULLIF(LAG(close, 10) OVER w_t, 0) - 1             AS ret_10d,
         close / NULLIF(LAG(close, 20) OVER w_t, 0) - 1             AS ret_20d,
-        -- Forward returns (entry = open of trade_date)
+        -- Forward returns — _oc: entry = open of trade_date (O_T)
         close                      / NULLIF(open, 0) - 1           AS ret_1d_fwd_oc,
         LEAD(close,  2) OVER w_t   / NULLIF(open, 0) - 1           AS ret_3d_fwd_oc,
         LEAD(close,  4) OVER w_t   / NULLIF(open, 0) - 1           AS ret_5d_fwd_oc,
         LEAD(close,  6) OVER w_t   / NULLIF(open, 0) - 1           AS ret_7d_fwd_oc,
         LEAD(close,  9) OVER w_t   / NULLIF(open, 0) - 1           AS ret_10d_fwd_oc,
         LEAD(close, 19) OVER w_t   / NULLIF(open, 0) - 1           AS ret_20d_fwd_oc,
+        -- Forward returns — _cc: entry = prior close C_{T-1} (same exit closes)
+        close                        / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_1d_fwd_cc,
+        LEAD(close,  2) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_3d_fwd_cc,
+        LEAD(close,  4) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_5d_fwd_cc,
+        LEAD(close,  6) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_7d_fwd_cc,
+        LEAD(close,  9) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_10d_fwd_cc,
+        LEAD(close, 19) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_20d_fwd_cc,
         -- Up-day frequency (20-day)
         AVG(CASE WHEN log_ret > 0 THEN 1.0 ELSE 0.0 END) OVER w20  AS pct_up_days_20d,
         -- Volume-weighted directional indicator (OBV-style, normalized)
@@ -499,7 +514,11 @@ derived AS (
         (close - lo20) / NULLIF(hi20 - lo20, 0)                     AS donchian_pos_20d,
         ma20 / NULLIF(LAG(ma20, 5) OVER (ORDER BY trade_date), 0) - 1 AS ma20_slope_5d,
         rv_5d / NULLIF(rv_20d, 0)                                   AS rv_ratio_5d_20d,
-        ret_5d / NULLIF(atr_14d, 0)                                 AS atr_normalized_ret_5d
+        -- atr_14d / close normalises ATR from dollar-units to a fraction of
+        -- current price, making the ratio dimensionless and cross-ticker-comparable.
+        -- Both numerator (ret_5d) and denominator (atr_14d / close) share close_T
+        -- as their price anchor. See flag above re: split-boundary ATR artifact.
+        ret_5d / NULLIF(atr_14d / NULLIF(close, 0), 0)              AS atr_normalized_ret_5d
     FROM windowed
 ),
 zscores AS (
@@ -526,6 +545,8 @@ SELECT
     d.rv_20d,
     d.ret_1d_fwd_oc, d.ret_3d_fwd_oc,  d.ret_5d_fwd_oc,
     d.ret_7d_fwd_oc, d.ret_10d_fwd_oc, d.ret_20d_fwd_oc,
+    d.ret_1d_fwd_cc, d.ret_3d_fwd_cc,  d.ret_5d_fwd_cc,
+    d.ret_7d_fwd_cc, d.ret_10d_fwd_cc, d.ret_20d_fwd_cc,
     d.ret_5d,
     d.ret_10d,
     d.ret_20d,
@@ -570,10 +591,11 @@ WITH vol_joined AS (
         v.vol_below_spot,
         v.vol_within_5pct,
         v.vol_within_10pct,
+        v.weighted_avg_dte_vol,
         f.total_oi,
         f.call_oi,
         f.put_oi,
-        f.spot_co,
+        f.spot_pc,
         f.d1_total_oi_change
     FROM vol_daily v
     LEFT JOIN base_feats f ON v.trade_date = f.trade_date
@@ -585,15 +607,23 @@ ratios AS (
         total_vol::DOUBLE      / NULLIF(total_oi, 0)           AS vol_oi_ratio_all,
         total_call_vol::DOUBLE / NULLIF(call_oi, 0)            AS vol_oi_ratio_call,
         total_put_vol::DOUBLE  / NULLIF(put_oi, 0)             AS vol_oi_ratio_put,
-        vol_weighted_strike_call / NULLIF(spot_co, 0)          AS vol_weighted_call_div_spot_co,
-        vol_weighted_strike_put  / NULLIF(spot_co, 0)          AS vol_weighted_put_div_spot_co,
-        vol_weighted_strike_all  / NULLIF(spot_co, 0)          AS vol_weighted_all_div_spot_co,
-        vol_above_spot::DOUBLE / NULLIF(vol_below_spot, 0)     AS vol_above_below_ratio_co,
-        vol_within_5pct::DOUBLE  / NULLIF(total_vol, 0)        AS pct_vol_within_5pct_co,
-        vol_within_10pct::DOUBLE / NULLIF(total_vol, 0)        AS pct_vol_within_10pct_co,
+        -- vol_weighted_*_div_spot_pc: divides by spot_pc (= C_{T-1}), consistent
+        -- with how vol_above_spot / vol_within_* were already computed upstream in
+        -- fetch_volume_eod.py (using prior_close). Suffix _pc, not _co.
+        vol_weighted_strike_call / NULLIF(spot_pc, 0)          AS vol_weighted_call_div_spot_pc,
+        vol_weighted_strike_put  / NULLIF(spot_pc, 0)          AS vol_weighted_put_div_spot_pc,
+        vol_weighted_strike_all  / NULLIF(spot_pc, 0)          AS vol_weighted_all_div_spot_pc,
+        -- These three use vol_above_spot / vol_within_* which were already computed
+        -- against prior_close in fetch_volume_eod.py — suffix corrected from _co to _pc.
+        vol_above_spot::DOUBLE / NULLIF(vol_below_spot, 0)     AS vol_above_below_ratio_pc,
+        vol_within_5pct::DOUBLE  / NULLIF(total_vol, 0)        AS pct_vol_within_5pct_pc,
+        vol_within_10pct::DOUBLE / NULLIF(total_vol, 0)        AS pct_vol_within_10pct_pc,
         vol_0_30d::DOUBLE  / NULLIF(total_vol, 0)              AS pct_vol_0_30d,
         vol_31_90d::DOUBLE / NULLIF(total_vol, 0)              AS pct_vol_31_90d,
-        d1_total_oi_change::DOUBLE / NULLIF(total_vol, 0)      AS net_new_oi_div_vol
+        -- net_new_oi_div_vol depends on d1_total_oi_change (OI-tier) — classified
+        -- as MORNING_COLS. The morning cron reads total_vol from option_volume_daily.
+        d1_total_oi_change::DOUBLE / NULLIF(total_vol, 0)      AS net_new_oi_div_vol,
+        weighted_avg_dte_vol
     FROM vol_joined
 ),
 zscores AS (
@@ -615,10 +645,10 @@ zscores AS (
              THEN (vol_oi_ratio_put - AVG(vol_oi_ratio_put) OVER w60)
                   / NULLIF(STDDEV_SAMP(vol_oi_ratio_put) OVER w60, 0)
              ELSE NULL END                                      AS zscore_vol_oi_ratio_put,
-        CASE WHEN COUNT(vol_above_below_ratio_co) OVER w60 >= 60
-             THEN (vol_above_below_ratio_co - AVG(vol_above_below_ratio_co) OVER w60)
-                  / NULLIF(STDDEV_SAMP(vol_above_below_ratio_co) OVER w60, 0)
-             ELSE NULL END                                      AS zscore_vol_above_below_ratio_co
+        CASE WHEN COUNT(vol_above_below_ratio_pc) OVER w60 >= 60
+             THEN (vol_above_below_ratio_pc - AVG(vol_above_below_ratio_pc) OVER w60)
+                  / NULLIF(STDDEV_SAMP(vol_above_below_ratio_pc) OVER w60, 0)
+             ELSE NULL END                                      AS zscore_vol_above_below_ratio_pc
     FROM ratios
     WINDOW w60 AS (ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 )
@@ -626,15 +656,16 @@ SELECT
     r.trade_date,
     r.put_call_ratio_vol,
     r.vol_oi_ratio_all, r.vol_oi_ratio_call, r.vol_oi_ratio_put,
-    r.vol_weighted_call_div_spot_co, r.vol_weighted_put_div_spot_co,
-    r.vol_weighted_all_div_spot_co,
-    r.vol_above_below_ratio_co,
-    r.pct_vol_within_5pct_co, r.pct_vol_within_10pct_co,
+    r.vol_weighted_call_div_spot_pc, r.vol_weighted_put_div_spot_pc,
+    r.vol_weighted_all_div_spot_pc,
+    r.vol_above_below_ratio_pc,
+    r.pct_vol_within_5pct_pc, r.pct_vol_within_10pct_pc,
     r.pct_vol_0_30d, r.pct_vol_31_90d,
     r.net_new_oi_div_vol,
+    r.weighted_avg_dte_vol,
     z.zscore_put_call_ratio_vol,
     z.zscore_vol_oi_ratio_all, z.zscore_vol_oi_ratio_call, z.zscore_vol_oi_ratio_put,
-    z.zscore_vol_above_below_ratio_co
+    z.zscore_vol_above_below_ratio_pc
 FROM ratios r
 JOIN zscores z USING (trade_date)
 """
@@ -739,14 +770,52 @@ JOIN zscores z USING (trade_date)
 
 
 # ---------------------------------------------------------------------------
-# Postgres write
+# Postgres write — two-cron column partition
 # ---------------------------------------------------------------------------
-INSERT_COLS = [
+# Two crons write disjoint column sets to the same (ticker, trade_date) row
+# using INSERT … ON CONFLICT DO UPDATE SET.  Each cron's DO UPDATE SET clause
+# lists ONLY that cron's own columns, so neither cron can wipe the other's data.
+#
+# MORNING_COLS  — OI-tier.  Written by the morning cron (~7am on T) after
+#                 ThetaData publishes OI for the upcoming session.  Also
+#                 includes vol/OI cross-metrics (vol_oi_ratio_*, net_new_oi_div_vol)
+#                 because they require T's OI, which is not available at the
+#                 evening run.  The morning cron reads total_vol from
+#                 option_volume_daily for those cross-metrics.
+#
+# EVENING_COLS  — Non-OI-tier.  Written by the evening cron (~5:30pm on T-1)
+#                 after the prior session's close.  Includes OHLC-derived
+#                 features, all IV metrics, and vol metrics that do not need
+#                 today's OI (pure vol ratios, spot-referenced vol strikes, etc.).
+#
+# HARD RULE: never add DELETE before either upsert.  A DELETE+INSERT would
+# wipe whichever cron's columns were written first.  See F1/F2/F6 design notes.
+# ---------------------------------------------------------------------------
+
+def _make_upsert_sql(cols: list) -> str:
+    """
+    Build an execute_values-compatible upsert for the given column list.
+    cols must start with ["ticker", "trade_date"] (the conflict key);
+    those two are excluded from the DO UPDATE SET clause.
+    """
+    data_cols = [c for c in cols if c not in ("ticker", "trade_date")]
+    set_clause = ",\n        ".join(f"{c} = EXCLUDED.{c}" for c in data_cols)
+    return (
+        f"INSERT INTO daily_features ({', '.join(cols)}) VALUES %s\n"
+        f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
+        f"    {set_clause}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MORNING_COLS — OI-tier (morning cron, ~7am on T)
+# ---------------------------------------------------------------------------
+MORNING_COLS = [
     "ticker", "trade_date",
     "spot_pc", "spot_co",
     "total_oi", "call_oi", "put_oi", "put_call_oi_ratio",
     "max_oi_strike_call", "max_oi_strike_put",
-    # OI-weighted strikes (no spot — same value regardless of pc/co)
+    # OI-weighted strikes (spot-independent)
     "oi_weighted_call", "oi_weighted_put", "oi_weighted_all",
     # minus_spot pc / co
     "oi_weighted_call_minus_spot_pc", "oi_weighted_call_minus_spot_co",
@@ -763,7 +832,7 @@ INSERT_COLS = [
     "oi_above_spot_pc",   "oi_above_spot_co",
     "oi_below_spot_pc",   "oi_below_spot_co",
     "oi_above_below_ratio_pc", "oi_above_below_ratio_co",
-    # DTE-bucketed weighted strikes (no spot)
+    # DTE-bucketed weighted strikes (spot-independent)
     "oi_weighted_all_0_30d",  "oi_weighted_call_0_30d",  "oi_weighted_put_0_30d",
     # DTE-bucketed div_spot pc / co
     "oi_weighted_all_0_30d_div_spot_pc",   "oi_weighted_all_0_30d_div_spot_co",
@@ -774,9 +843,6 @@ INSERT_COLS = [
     "oi_weighted_call_31_90d_div_spot_pc", "oi_weighted_call_31_90d_div_spot_co",
     "oi_weighted_put_31_90d_div_spot_pc",  "oi_weighted_put_31_90d_div_spot_co",
     "d1_total_oi_change", "d5_total_oi_change", "d20_total_oi_change",
-    "rv_5d", "rv_20d",
-    "ret_1d_fwd_oc",  "ret_3d_fwd_oc",  "ret_5d_fwd_oc",
-    "ret_7d_fwd_oc",  "ret_10d_fwd_oc", "ret_20d_fwd_oc",
     # pct features (denominator = total_oi)
     "pct_oi_within_5pct_pc",  "pct_oi_within_5pct_co",
     "pct_oi_within_10pct_pc", "pct_oi_within_10pct_co",
@@ -787,7 +853,7 @@ INSERT_COLS = [
     "pct_oi_0_30d", "pct_oi_31_90d", "pct_oi_91_365d",
     "pct_oi_next_monthly",
     "oi_weighted_next_monthly_div_spot_pc", "oi_weighted_next_monthly_div_spot_co",
-    # pct changes / derived-ratio changes / 60-day z-scores
+    # pct changes / derived-ratio changes / 60-day z-scores (OI)
     "d1_total_oi_pct_change", "d5_total_oi_pct_change",
     "d1_d5_ratio_total_oi_pct_change",
     "d1_oi_weighted_all_div_spot_change_pc", "d1_oi_weighted_all_div_spot_change_co",
@@ -797,7 +863,25 @@ INSERT_COLS = [
     "zscore_oi_weighted_all_div_spot_3m_pc", "zscore_oi_weighted_all_div_spot_3m_co",
     "zscore_put_call_oi_ratio_3m",
     "zscore_oi_above_below_ratio_3m_pc", "zscore_oi_above_below_ratio_3m_co",
-    # Bucket 1: OHLC-derived
+    # Vol/OI cross-metrics: require T's OI → morning cron only.
+    # Morning cron reads total_vol / call_vol / put_vol from option_volume_daily.
+    "vol_oi_ratio_all", "vol_oi_ratio_call", "vol_oi_ratio_put",
+    "net_new_oi_div_vol",
+    "zscore_vol_oi_ratio_all", "zscore_vol_oi_ratio_call", "zscore_vol_oi_ratio_put",
+]
+
+# ---------------------------------------------------------------------------
+# EVENING_COLS — Non-OI-tier (evening cron, ~5:30pm on T-1)
+# ---------------------------------------------------------------------------
+EVENING_COLS = [
+    "ticker", "trade_date",
+    # Bucket 1: OHLC-derived (all use only closes / opens / OHLC available at T-1)
+    "rv_5d", "rv_20d",
+    # _oc = entry O_T, _cc = entry C_{T-1}; both self-heal as future closes land
+    "ret_1d_fwd_oc",  "ret_3d_fwd_oc",  "ret_5d_fwd_oc",
+    "ret_7d_fwd_oc",  "ret_10d_fwd_oc", "ret_20d_fwd_oc",
+    "ret_1d_fwd_cc",  "ret_3d_fwd_cc",  "ret_5d_fwd_cc",
+    "ret_7d_fwd_cc",  "ret_10d_fwd_cc", "ret_20d_fwd_cc",
     "ret_5d", "ret_10d", "ret_20d",
     "pct_from_ma20", "pct_from_ma50",
     "pct_from_52w_high", "pct_from_52w_low",
@@ -810,19 +894,18 @@ INSERT_COLS = [
     "zscore_price_vs_ma20", "zscore_price_vs_ma50",
     "zscore_underlying_vol_20d",
     "relative_strength_vs_spy_20d",
-    # Bucket 2: option volume EOD
+    # Bucket 2: option volume EOD (pure vol metrics — no OI denominator)
     "put_call_ratio_vol",
-    "vol_oi_ratio_all", "vol_oi_ratio_call", "vol_oi_ratio_put",
-    "vol_weighted_call_div_spot_co", "vol_weighted_put_div_spot_co",
-    "vol_weighted_all_div_spot_co",
-    "vol_above_below_ratio_co",
-    "pct_vol_within_5pct_co", "pct_vol_within_10pct_co",
+    # _pc suffix: upstream vol_above_spot / vol_within_* used prior_close = spot_pc
+    "vol_weighted_call_div_spot_pc", "vol_weighted_put_div_spot_pc",
+    "vol_weighted_all_div_spot_pc",
+    "vol_above_below_ratio_pc",
+    "pct_vol_within_5pct_pc", "pct_vol_within_10pct_pc",
     "pct_vol_0_30d", "pct_vol_31_90d",
-    "net_new_oi_div_vol",
+    "weighted_avg_dte_vol",
     "zscore_put_call_ratio_vol",
-    "zscore_vol_oi_ratio_all", "zscore_vol_oi_ratio_call", "zscore_vol_oi_ratio_put",
-    "zscore_vol_above_below_ratio_co",
-    # Bucket 3: IV chain (15:45)
+    "zscore_vol_above_below_ratio_pc",
+    # Bucket 3: IV chain (15:45 snapshot)
     "atm_iv_7d", "atm_iv_30d", "atm_iv_90d",
     "iv_25d_call_30d", "iv_25d_put_30d",
     "rr_25d_30d", "bf_25d_30d",
@@ -837,8 +920,8 @@ INSERT_COLS = [
     "zscore_vrp_30d", "zscore_iv_rv_ratio_30d",
 ]
 
-INSERT_SQL = f"INSERT INTO daily_features ({', '.join(INSERT_COLS)}) VALUES %s"
-CLEAR_SQL  = "DELETE FROM daily_features WHERE ticker = %(ticker)s"
+MORNING_UPSERT_SQL = _make_upsert_sql(MORNING_COLS)
+EVENING_UPSERT_SQL = _make_upsert_sql(EVENING_COLS)
 
 
 # ---------------------------------------------------------------------------
@@ -1123,26 +1206,21 @@ def build_for_ticker(pg_conn, ticker: str,
             log.info("  no rows in [%s, %s] for %s", start, end_eff, ticker)
             return 0
 
-    rows = [
-        tuple(_pgify(r.get(c)) for c in INSERT_COLS)
-        for r in feats.to_dict(orient="records")
-    ]
+    records      = feats.to_dict(orient="records")
+    morning_rows = [tuple(_pgify(r.get(c)) for c in MORNING_COLS) for r in records]
+    evening_rows = [tuple(_pgify(r.get(c)) for c in EVENING_COLS) for r in records]
 
     with pg_conn.cursor() as cur:
-        if start is None:
-            cur.execute(CLEAR_SQL, {"ticker": ticker})
-        else:
-            cur.execute(
-                "DELETE FROM daily_features "
-                "WHERE ticker = %(ticker)s "
-                "  AND trade_date BETWEEN %(start)s AND %(end)s",
-                {"ticker": ticker, "start": start, "end": end_eff},
-            )
-        psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+        # CONTRACT: MORNING_UPSERT_SQL updates ONLY MORNING_COLS; EVENING_UPSERT_SQL
+        # updates ONLY EVENING_COLS.  Neither upsert touches the other cron's columns.
+        # Do NOT add DELETE before either upsert — that would wipe whichever cron's
+        # data landed first, breaking the two-cron write contract (F1/F2/F6).
+        psycopg2.extras.execute_values(cur, MORNING_UPSERT_SQL, morning_rows, page_size=500)
+        psycopg2.extras.execute_values(cur, EVENING_UPSERT_SQL, evening_rows, page_size=500)
     pg_conn.commit()
 
-    log.info("  wrote %d rows to daily_features", len(rows))
-    return len(rows)
+    log.info("  wrote %d rows to daily_features", len(records))
+    return len(records)
 
 
 def _pgify(v):
