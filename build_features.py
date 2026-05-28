@@ -1193,21 +1193,43 @@ def build_for_ticker(pg_conn, ticker: str,
     con.register("ohlc",            ohlc[["trade_date", "open", "high", "low", "close", "volume"]])
     con.register("next_monthly_df", nm_df)
     con.register("split_factors",   sf_df)
-    # The oi view applies split-adjustment to strike via a LEFT JOIN on split_factors.
-    # Rows with no split event in their history get adj_factor=1.0 (COALESCE guard).
+    # The oi view applies split-adjustment to strike AND open_interest via a
+    # LEFT JOIN on split_factors. Rows with no split event in their history get
+    # adj_factor=1.0 (COALESCE guard), so both scalings collapse to no-ops.
+    #
+    # Count adjustment is the algebraic inverse of strike adjustment:
+    #   strike     := raw_strike     * adj_factor       (4:1 → ×0.25)
+    #   count      := raw_count      / adj_factor       (4:1 → ×4   )
+    # Applied universally to every row. Metrics expressed as ratios or
+    # weighted averages (e.g. put_call_oi_ratio, oi_weighted_*, pct_oi_*)
+    # cancel the factor between numerator and denominator and are unchanged.
+    # Only raw-count metrics (total_oi, call_oi, put_oi, max_oi_strike_*,
+    # d{1,5,20}_total_oi_change) become continuous across split boundaries —
+    # the intended effect.
+    #
+    # Pre-split count values are now expressed in current (post-split-
+    # equivalent) contract units. The raw parquet retains the as-of-date
+    # counts underneath, so original values remain recoverable.
     con.execute(
         f"CREATE OR REPLACE VIEW oi AS "
         f"SELECT raw.trade_date, raw.expiration, "
         f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
-        f"       raw.option_type, raw.open_interest "
+        f"       raw.option_type, "
+        f"       raw.open_interest / COALESCE(sf.adj_factor, 1.0) AS open_interest "
         f"FROM (SELECT * FROM read_parquet('{parquet_glob(ticker)}'){date_filter_sql}) raw "
         f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
     )
 
-    # The chain_adj view applies split-adjustment to strike via the same
-    # split_factors join. trade_date is the actual session (T-1); feature_date
-    # is the daily_features consumer date (T). Vol/IV SQL filters by feature_date
-    # against the build range. May not exist for tickers not yet backfilled.
+    # The chain_adj view applies the same strike + count adjustments (count
+    # here is `volume`). trade_date is the actual session (T-1); feature_date
+    # is the daily_features consumer date (T). Vol/IV SQL filters by
+    # feature_date against the build range. May not exist for tickers not yet
+    # backfilled.
+    #
+    # Scaling OI and volume TOGETHER is required, not optional:
+    # vol_oi_ratio_* = volume / OI. Both quantities mechanically multiply at
+    # a split; scaling both keeps the ratio continuous via cancellation.
+    # Scaling only one would inject a discontinuity into the ratio.
     chain_present = chain_has_data(ticker)
     if chain_present:
         chain_date_filter = (
@@ -1220,8 +1242,9 @@ def build_for_ticker(pg_conn, ticker: str,
             f"SELECT raw.trade_date, raw.source_session, raw.feature_date, "
             f"       raw.expiration, "
             f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
-            f"       raw.option_type, raw.volume, raw.implied_vol, "
-            f"       raw.delta, raw.iv_error "
+            f"       raw.option_type, "
+            f"       raw.volume / COALESCE(sf.adj_factor, 1.0) AS volume, "
+            f"       raw.implied_vol, raw.delta, raw.iv_error "
             f"FROM (SELECT * FROM read_parquet('{chain_parquet_glob(ticker)}'){chain_date_filter}) raw "
             f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
         )
