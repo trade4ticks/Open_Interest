@@ -428,6 +428,11 @@ ORDER BY p.trade_date
 # OHLC-derived features (rv, fwd oc/cc returns) — DuckDB on the unified ohlc DF.
 # Input: ohlc pandas DF [trade_date, open, high, low, close, volume]
 #
+# Timing convention (lookahead-free): every OHLC signal in row T uses only
+# data through C_{T-1} (prior session's close). The named windows all end at
+# 1 PRECEDING so the most recent close included is always C_{T-1}, never C_T.
+# prev_close = LAG(close) is the shared price anchor for derived ratios.
+#
 # Two forward-return series, same exit closes, different entry anchors:
 #   _oc  entry = open of trade_date (O_T). OI is published overnight and visible
 #        when the market opens, so O_T is the realistic entry price.
@@ -447,30 +452,31 @@ WITH base AS (
             high - low,
             ABS(high - LAG(close) OVER (ORDER BY trade_date)),
             ABS(low  - LAG(close) OVER (ORDER BY trade_date))
-        ) AS true_range
+        ) AS true_range,
+        LAG(close) OVER (ORDER BY trade_date)                       AS prev_close
     FROM ohlc
 ),
 windowed AS (
     SELECT
-        trade_date, open, close, volume, log_ret, true_range,
-        -- Realized vol
+        trade_date, open, close, prev_close, volume, log_ret, true_range,
+        -- Realized vol (sessions T-5..T-1 and T-20..T-1 — lookahead-free)
         STDDEV_SAMP(log_ret) OVER w5  * SQRT(252)                  AS rv_5d,
         STDDEV_SAMP(log_ret) OVER w20 * SQRT(252)                  AS rv_20d,
-        -- Moving averages
+        -- Moving averages (windows end at T-1)
         AVG(close) OVER w20                                         AS ma20,
         AVG(close) OVER w50                                         AS ma50,
-        -- 52-week extremes
+        -- 52-week extremes (window ends at T-1)
         MAX(close) OVER w252                                        AS hi52,
         MIN(close) OVER w252                                        AS lo52,
-        -- Donchian channel components
+        -- Donchian channel components (window ends at T-1)
         MAX(high)  OVER w20                                         AS hi20,
         MIN(low)   OVER w20                                         AS lo20,
-        -- Average true range (14-day)
+        -- Average true range (14 sessions ending at T-1)
         AVG(true_range) OVER w14                                    AS atr_14d,
-        -- Backward returns
-        close / NULLIF(LAG(close,  5) OVER w_t, 0) - 1             AS ret_5d,
-        close / NULLIF(LAG(close, 10) OVER w_t, 0) - 1             AS ret_10d,
-        close / NULLIF(LAG(close, 20) OVER w_t, 0) - 1             AS ret_20d,
+        -- Backward returns (entry C_{T-6}/C_{T-11}/C_{T-21}, exit C_{T-1})
+        prev_close / NULLIF(LAG(close,  6) OVER w_t, 0) - 1        AS ret_5d,
+        prev_close / NULLIF(LAG(close, 11) OVER w_t, 0) - 1        AS ret_10d,
+        prev_close / NULLIF(LAG(close, 21) OVER w_t, 0) - 1        AS ret_20d,
         -- Forward returns — _oc: entry = open of trade_date (O_T)
         close                      / NULLIF(open, 0) - 1           AS ret_1d_fwd_oc,
         LEAD(close,  2) OVER w_t   / NULLIF(open, 0) - 1           AS ret_3d_fwd_oc,
@@ -485,36 +491,37 @@ windowed AS (
         LEAD(close,  6) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_7d_fwd_cc,
         LEAD(close,  9) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_10d_fwd_cc,
         LEAD(close, 19) OVER w_t     / NULLIF(LAG(close, 1) OVER w_t, 0) - 1   AS ret_20d_fwd_cc,
-        -- Up-day frequency (20-day)
+        -- Up-day frequency (20 sessions ending at T-1)
         AVG(CASE WHEN log_ret > 0 THEN 1.0 ELSE 0.0 END) OVER w20  AS pct_up_days_20d,
-        -- Volume-weighted directional indicator (OBV-style, normalized)
+        -- Volume-weighted directional indicator (OBV-style, normalized; T-1..T-20)
         SUM(SIGN(log_ret) * volume::DOUBLE) OVER w20
             / NULLIF(SUM(volume::DOUBLE) OVER w20, 0)               AS cum_signed_vol_20d
     FROM base
     WINDOW
         w_t  AS (ORDER BY trade_date),
-        w5   AS (ORDER BY trade_date ROWS BETWEEN   4 PRECEDING AND CURRENT ROW),
-        w14  AS (ORDER BY trade_date ROWS BETWEEN  13 PRECEDING AND CURRENT ROW),
-        w20  AS (ORDER BY trade_date ROWS BETWEEN  19 PRECEDING AND CURRENT ROW),
-        w50  AS (ORDER BY trade_date ROWS BETWEEN  49 PRECEDING AND CURRENT ROW),
-        w252 AS (ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
+        w5   AS (ORDER BY trade_date ROWS BETWEEN   5 PRECEDING AND 1 PRECEDING),
+        w14  AS (ORDER BY trade_date ROWS BETWEEN  14 PRECEDING AND 1 PRECEDING),
+        w20  AS (ORDER BY trade_date ROWS BETWEEN  20 PRECEDING AND 1 PRECEDING),
+        w50  AS (ORDER BY trade_date ROWS BETWEEN  50 PRECEDING AND 1 PRECEDING),
+        w252 AS (ORDER BY trade_date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING)
 ),
 derived AS (
     SELECT
         *,
-        close / NULLIF(ma20, 0) - 1                                 AS pct_from_ma20,
-        close / NULLIF(ma50, 0) - 1                                 AS pct_from_ma50,
-        close / NULLIF(hi52, 0) - 1                                 AS pct_from_52w_high,
-        close / NULLIF(lo52, 0) - 1                                 AS pct_from_52w_low,
-        (close - lo20) / NULLIF(hi20 - lo20, 0)                     AS donchian_pos_20d,
+        -- All ratios use prev_close = C_{T-1} so no session-T data is required.
+        prev_close / NULLIF(ma20, 0) - 1                            AS pct_from_ma20,
+        prev_close / NULLIF(ma50, 0) - 1                            AS pct_from_ma50,
+        prev_close / NULLIF(hi52, 0) - 1                            AS pct_from_52w_high,
+        prev_close / NULLIF(lo52, 0) - 1                            AS pct_from_52w_low,
+        (prev_close - lo20) / NULLIF(hi20 - lo20, 0)                AS donchian_pos_20d,
         ma20 / NULLIF(LAG(ma20, 5) OVER (ORDER BY trade_date), 0) - 1 AS ma20_slope_5d,
         rv_5d / NULLIF(rv_20d, 0)                                   AS rv_ratio_5d_20d,
-        -- atr_14d / close normalises ATR from dollar-units to a fraction of
-        -- current price, making the ratio dimensionless and cross-ticker-comparable.
-        -- Both numerator (ret_5d) and denominator (atr_14d / close) share close_T
-        -- as their price anchor, so the ratio is split-safe (close is yfinance-
-        -- adjusted, true_range uses adjusted high/low/LAG(close) consistently).
-        ret_5d / NULLIF(atr_14d / NULLIF(close, 0), 0)              AS atr_normalized_ret_5d
+        -- atr_14d / prev_close normalises ATR from dollar-units to a fraction of
+        -- prior-session price, making the ratio dimensionless and cross-ticker-
+        -- comparable. Both numerator (ret_5d: C_{T-1}/C_{T-6}-1) and denominator
+        -- (atr_14d / prev_close) share prev_close = C_{T-1} as their price anchor,
+        -- so the ratio is split-safe and lookahead-free.
+        ret_5d / NULLIF(atr_14d / NULLIF(prev_close, 0), 0)         AS atr_normalized_ret_5d
     FROM windowed
 ),
 zscores AS (
@@ -1083,7 +1090,12 @@ def load_ohlc(conn, ticker: str) -> pd.DataFrame:
 
 
 def load_ohlc_spy(conn) -> pd.DataFrame:
-    """Return (trade_date, spy_ret_20d) for all available SPY history."""
+    """Return (trade_date, spy_ret_20d) for all available SPY history.
+
+    spy_ret_20d = C_{T-1} / C_{T-21} - 1 (lookahead-free, matching the shifted
+    ret_20d convention in OHLC_FEATURES_SQL).  relative_strength_vs_spy_20d is
+    then ret_20d(ticker) - spy_ret_20d, both anchored to the same T-1 close.
+    """
     df = read_sql_df(
         conn,
         "SELECT trade_date, close FROM underlying_ohlc "
@@ -1093,7 +1105,7 @@ def load_ohlc_spy(conn) -> pd.DataFrame:
         return df
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     df = df.sort_values("trade_date").reset_index(drop=True)
-    df["spy_ret_20d"] = df["close"] / df["close"].shift(20) - 1
+    df["spy_ret_20d"] = df["close"].shift(1) / df["close"].shift(21) - 1
     return df[["trade_date", "spy_ret_20d"]]
 
 
