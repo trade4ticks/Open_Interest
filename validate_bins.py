@@ -211,14 +211,25 @@ def check_3_wf_warmup_boundary(conn, verbose: bool) -> tuple:
             continue
         rows = {pd.to_datetime(r["trade_date"]).date(): r["frac"]
                 for _, r in wf.iterrows()}
-        prev_frac = rows.get(prev_td) if prev_td is not None else None
-        first_frac = rows.get(first_non_warmup_td)
-        if prev_td is not None and prev_frac is not None:
-            failures.append(
-                f"{ticker}/{metric}: 251st valid row ({prev_td}) has frac="
-                f"{prev_frac} (expected NULL)"
-            )
-        if first_frac is None:
+        # Postgres NULL becomes pandas NaN when read into a float64 column,
+        # so the row-present-but-NULL case must be checked with pd.isna(),
+        # not `is not None`.  Distinguish three states:
+        #   key missing from dict      → wf_bins row absent (real failure)
+        #   value is NaN               → DB NULL (expected for warmup)
+        #   value is a real float      → DB has a value (failure for warmup)
+        prev_frac  = rows.get(prev_td, "MISSING") if prev_td is not None else "MISSING"
+        first_frac = rows.get(first_non_warmup_td, "MISSING")
+        if prev_td is not None:
+            if prev_frac == "MISSING":
+                failures.append(f"{ticker}/{metric}: 251st valid row ({prev_td}) — wf_bins row missing")
+            elif not pd.isna(prev_frac):
+                failures.append(
+                    f"{ticker}/{metric}: 251st valid row ({prev_td}) has frac="
+                    f"{prev_frac} (expected NULL)"
+                )
+        if first_frac == "MISSING":
+            failures.append(f"{ticker}/{metric}: 252nd valid row ({first_non_warmup_td}) — wf_bins row missing")
+        elif pd.isna(first_frac):
             failures.append(
                 f"{ticker}/{metric}: 252nd valid row ({first_non_warmup_td}) "
                 f"has frac=NULL (expected non-NULL)"

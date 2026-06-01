@@ -169,6 +169,18 @@ def _build_tt_thresholds(conn, cutoff: str = TRAIN_TEST_CUTOFF_DEFAULT) -> int:
     eligible = [m for m in eligible if m in df_cols]
     log.info("  %d eligible metric(s).", len(eligible))
 
+    # All tickers in daily_features — used to emit a row for tickers with zero
+    # pre-cutoff data (n_train = 0, history_vals = []).  Without this step,
+    # tickers that started trading on/after the cutoff (e.g. APLD) would have
+    # no tt_thresholds rows at all, and the dashboard's read query would have
+    # to defensively treat "row missing" the same as "row present, n_train < k".
+    # Emitting empty rows keeps that contract single-source: the read side
+    # always finds a row and applies n_train < k → None uniformly.
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT ticker FROM daily_features ORDER BY ticker")
+        all_tickers = [r[0] for r in cur.fetchall()]
+    log.info("  %d ticker(s) in daily_features.", len(all_tickers))
+
     cols_sql = ", ".join(eligible)
     t0 = time.time()
     df = read_sql_df(
@@ -179,17 +191,26 @@ def _build_tt_thresholds(conn, cutoff: str = TRAIN_TEST_CUTOFF_DEFAULT) -> int:
         {"cutoff": cutoff},
     )
     log.info("  loaded %d pre-cutoff rows in %.1fs.", len(df), time.time() - t0)
-    if df.empty:
-        log.warning("No pre-cutoff rows — nothing to build.")
-        return 0
+
+    # Group pre-cutoff data by ticker (empty dict if no pre-cutoff rows at all).
+    by_ticker: dict = {}
+    if not df.empty:
+        for ticker, sub in df.groupby("ticker", sort=False):
+            by_ticker[ticker] = sub
 
     t0 = time.time()
     records: list = []
-    for ticker, sub in df.groupby("ticker", sort=False):
+    n_empty = 0
+    for ticker in all_tickers:
+        sub = by_ticker.get(ticker)
         for m in eligible:
-            history_vals, n_train = train_test_history(sub[m].tolist())
-            # Always emit a row, even with empty history.  Read-side returns
-            # None when n_train < n_bins; we shouldn't filter on the write side.
+            if sub is None:
+                history_vals: list = []
+                n_train = 0
+            else:
+                history_vals, n_train = train_test_history(sub[m].tolist())
+            if n_train == 0:
+                n_empty += 1
             records.append({
                 "metric":       m,
                 "ticker":       ticker,
@@ -197,8 +218,9 @@ def _build_tt_thresholds(conn, cutoff: str = TRAIN_TEST_CUTOFF_DEFAULT) -> int:
                 "history_vals": history_vals,
                 "n_train":      n_train,
             })
-    log.info("  computed %d (metric, ticker) rows in %.1fs.",
-             len(records), time.time() - t0)
+    log.info("  computed %d (metric, ticker) rows in %.1fs "
+             "(%d with n_train=0).",
+             len(records), time.time() - t0, n_empty)
 
     upsert_sql = """
     INSERT INTO tt_thresholds
