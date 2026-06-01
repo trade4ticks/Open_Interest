@@ -1119,7 +1119,8 @@ def listed_expirations_from_parquet(con: duckdb.DuckDBPyConnection,
 
 def build_for_ticker(pg_conn, ticker: str,
                      start: date | None = None,
-                     end:   date | None = None) -> int:
+                     end:   date | None = None,
+                     tier:  str = "BOTH") -> int:
     """
     Recompute daily_features for one ticker.
 
@@ -1317,20 +1318,30 @@ def build_for_ticker(pg_conn, ticker: str,
             log.info("  no rows in [%s, %s] for %s", start, end_eff, ticker)
             return 0
 
-    records      = feats.to_dict(orient="records")
-    morning_rows = [tuple(_pgify(r.get(c)) for c in MORNING_COLS) for r in records]
-    evening_rows = [tuple(_pgify(r.get(c)) for c in EVENING_COLS) for r in records]
+    tier_norm = (tier or "BOTH").strip().upper()
+    if tier_norm not in ("MORNING", "EVENING", "BOTH"):
+        raise ValueError(f"tier must be MORNING / EVENING / BOTH; got {tier!r}")
+
+    records = feats.to_dict(orient="records")
 
     with pg_conn.cursor() as cur:
         # CONTRACT: MORNING_UPSERT_SQL updates ONLY MORNING_COLS; EVENING_UPSERT_SQL
-        # updates ONLY EVENING_COLS.  Neither upsert touches the other cron's columns.
-        # Do NOT add DELETE before either upsert — that would wipe whichever cron's
-        # data landed first, breaking the two-cron write contract (F1/F2/F6).
-        psycopg2.extras.execute_values(cur, MORNING_UPSERT_SQL, morning_rows, page_size=500)
-        psycopg2.extras.execute_values(cur, EVENING_UPSERT_SQL, evening_rows, page_size=500)
+        # updates ONLY EVENING_COLS.  Neither upsert touches the other tier's columns.
+        # Do NOT add DELETE before either upsert — that would wipe whichever tier's
+        # data landed first, breaking the two-cron write contract.
+        #
+        # tier='MORNING' or 'EVENING' fires ONLY that tier's upsert (used by the
+        # two-cron orchestrator in run_pipeline.py).  tier='BOTH' fires both in
+        # one transaction and is preserved for ad-hoc / interactive rebuilds.
+        if tier_norm in ("MORNING", "BOTH"):
+            morning_rows = [tuple(_pgify(r.get(c)) for c in MORNING_COLS) for r in records]
+            psycopg2.extras.execute_values(cur, MORNING_UPSERT_SQL, morning_rows, page_size=500)
+        if tier_norm in ("EVENING", "BOTH"):
+            evening_rows = [tuple(_pgify(r.get(c)) for c in EVENING_COLS) for r in records]
+            psycopg2.extras.execute_values(cur, EVENING_UPSERT_SQL, evening_rows, page_size=500)
     pg_conn.commit()
 
-    log.info("  wrote %d rows to daily_features", len(records))
+    log.info("  wrote %d rows to daily_features (tier=%s)", len(records), tier_norm)
     return len(records)
 
 
