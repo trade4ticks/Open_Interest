@@ -14,7 +14,13 @@ from pathlib import Path
 from db import get_connection
 
 SQL_DIR = Path(__file__).parent / "sql"
-FILES   = ["01_schema.sql", "03_new_metrics.sql", "02_views.sql", "04_backtest.sql"]
+FILES   = [
+    "01_schema.sql",
+    "03_new_metrics.sql",
+    "02_views.sql",
+    "04_backtest.sql",
+    "05_bin_tables.sql",
+]
 
 
 def main() -> None:
@@ -26,6 +32,21 @@ def main() -> None:
                 cur.execute(path.read_text())
                 print("OK")
         conn.commit()
+
+        # Dynamic per-metric column sync for wf_bins.  Reads
+        # metric_classification.eligible_as_metric = TRUE and adds
+        # frac_<metric> / bin20_<metric> column pairs idempotently.
+        # Done AFTER the static SQL files so the wf_bins skeleton + the
+        # metric_classification table both exist.
+        try:
+            from lib.bin_schema import sync_wf_bins_schema
+            print("Syncing wf_bins per-metric columns ...", end=" ", flush=True)
+            n_added, _ = sync_wf_bins_schema(conn)
+            print(f"OK ({n_added} new column pair(s))")
+        except Exception as e:
+            print(f"SKIPPED ({type(e).__name__}: {e})")
+            print("  (Run `python build_bin_tables.py --tier EVENING` later "
+                  "to sync; metric_classification may not be populated yet.)")
     print("\nDatabase initialised.")
 
 
