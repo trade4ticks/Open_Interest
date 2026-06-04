@@ -39,12 +39,14 @@ import psycopg2.extras
 from db import get_connection, read_sql_df
 from lib.bin_compute import (
     TRAIN_TEST_CUTOFF_DEFAULT,
+    in_sample_series,
     train_test_history,
     walk_forward_series,
 )
 from lib.bin_schema import (
     existing_daily_features_columns,
     get_metrics_by_tier,
+    sync_is_bins_schema,
     sync_wf_bins_schema,
 )
 
@@ -144,6 +146,114 @@ def _build_wf_bins_for_tier(conn, tier: str) -> int:
     )
 
     log.info("Upserting to wf_bins ...")
+    t0 = time.time()
+    rows = [tuple(_pgify(r.get(c)) for c in write_cols)
+            for r in result.to_dict(orient="records")]
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, insert_sql, rows, page_size=500)
+    conn.commit()
+    log.info("  upserted %d rows in %.1fs.", len(rows), time.time() - t0)
+    return len(rows)
+
+
+# In-sample build ------------------------------------------------------------
+
+def _build_is_bins_for_tier(conn, tier: str) -> int:
+    """Full rebuild of is_bins for one tier's eligible metrics.
+
+    In-sample semantics: each trade's bin is computed by ranking its metric
+    value against that ticker's ENTIRE history (full date range, fixed
+    population).  No warmup — every row with a valid metric value gets a
+    frac and bin20.
+
+    Mirrors _build_wf_bins_for_tier exactly except:
+      - Uses in_sample_series instead of walk_forward_series.
+      - Calls sync_is_bins_schema and writes to is_bins, not wf_bins.
+
+    Returns the number of (ticker, trade_date) rows upserted.
+    """
+    tier = tier.upper()
+    if tier not in ("MORNING", "EVENING"):
+        raise ValueError(f"tier must be MORNING or EVENING; got {tier!r}")
+
+    log.info("Syncing is_bins schema ...")
+    sync_is_bins_schema(conn)
+
+    metrics_by_tier = get_metrics_by_tier(conn)
+    metrics = metrics_by_tier.get(tier, [])
+    if not metrics:
+        log.warning("No eligible metrics for tier %s — nothing to do.", tier)
+        return 0
+    log.info("Tier %s: %d eligible metric(s).", tier, len(metrics))
+
+    df_cols = existing_daily_features_columns(conn)
+    metrics = [m for m in metrics if m in df_cols]
+    if not metrics:
+        log.warning("All %s-tier metrics are absent from daily_features. "
+                    "Aborting.", tier)
+        return 0
+
+    cols_sql = ", ".join(metrics)
+    log.info("Reading daily_features (ticker, trade_date, %d metric cols) ...",
+             len(metrics))
+    t0 = time.time()
+    df = read_sql_df(
+        conn,
+        f"SELECT ticker, trade_date, {cols_sql} FROM daily_features "
+        f"ORDER BY ticker, trade_date"
+    )
+    log.info("  loaded %d rows in %.1fs.", len(df), time.time() - t0)
+    if df.empty:
+        log.warning("daily_features returned no rows — nothing to bin.")
+        return 0
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+
+    # Compute in-sample bins per (ticker, metric).  The ranking population is
+    # the ticker's full history — no expanding window, no warmup.
+    log.info("Computing in-sample bins for %d metrics × %d tickers ...",
+             len(metrics), df["ticker"].nunique())
+    t0 = time.time()
+    out_frames: list = []
+    for ticker, sub in df.groupby("ticker", sort=False):
+        sub   = sub.sort_values("trade_date").reset_index(drop=True)
+        dates = sub["trade_date"].tolist()
+        row: dict = {"ticker": ticker, "trade_date": dates}
+        for m in metrics:
+            vals = sub[m].tolist()
+            fracs, bin20s = in_sample_series(vals, dates)
+            row[f"frac_{m}"]  = fracs
+            row[f"bin20_{m}"] = bin20s
+        n = len(dates)
+        ticker_df = pd.DataFrame({
+            "ticker":     [ticker] * n,
+            "trade_date": dates,
+            **{f"frac_{m}":  row[f"frac_{m}"]  for m in metrics},
+            **{f"bin20_{m}": row[f"bin20_{m}"] for m in metrics},
+        })
+        out_frames.append(ticker_df)
+    result = pd.concat(out_frames, ignore_index=True)
+    log.info("  computed %d rows × %d metric pairs in %.1fs.",
+             len(result), len(metrics), time.time() - t0)
+
+    # Upsert.  Tier-specific SET clause; never touches the other tier's cols.
+    write_cols = ["ticker", "trade_date"]
+    for m in metrics:
+        write_cols.append(f"frac_{m}")
+        write_cols.append(f"bin20_{m}")
+    set_clauses = []
+    for m in metrics:
+        set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
+        set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
+    set_sql = ",\n        ".join(set_clauses)
+
+    insert_sql = (
+        f"INSERT INTO is_bins ({', '.join(write_cols)}) VALUES %s\n"
+        f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
+        f"    {set_sql}"
+    )
+
+    log.info("Upserting to is_bins ...")
     t0 = time.time()
     rows = [tuple(_pgify(r.get(c)) for c in write_cols)
             for r in result.to_dict(orient="records")]
@@ -282,6 +392,8 @@ def main() -> int:
         if args.tier:
             n = _build_wf_bins_for_tier(conn, args.tier)
             log.info("wf_bins (%s): %d rows upserted.", args.tier, n)
+            n = _build_is_bins_for_tier(conn, args.tier)
+            log.info("is_bins (%s): %d rows upserted.", args.tier, n)
         if args.build_tt:
             n = _build_tt_thresholds(conn)
             log.info("tt_thresholds: %d rows upserted.", n)

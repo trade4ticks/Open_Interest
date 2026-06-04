@@ -31,3 +31,13 @@ CREATE TABLE IF NOT EXISTS tt_thresholds (
 
 CREATE INDEX IF NOT EXISTS ix_tt_thresholds_ticker
     ON tt_thresholds (ticker, metric, cutoff_date);
+
+-- is_bins: in-sample bin table.  Same shape as wf_bins; one row per
+-- (ticker, trade_date) with frac_<metric> / bin20_<metric> per eligible metric.
+-- Populated by build_bin_tables.py --tier {MORNING,EVENING}.
+-- Per-metric column pairs are added dynamically by lib/bin_schema.sync_is_bins_schema.
+CREATE TABLE IF NOT EXISTS is_bins (
+    ticker     TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    PRIMARY KEY (ticker, trade_date)
+);

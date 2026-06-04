@@ -1,11 +1,11 @@
 """
-Dynamic schema sync for wf_bins.
+Dynamic schema sync for wf_bins and is_bins.
 
-The set of columns in wf_bins is driven by metric_classification, filtered to
-eligible_as_metric = TRUE.  For every eligible metric we ensure two columns
-exist:
-    frac_<metric>   DOUBLE PRECISION  (nullable; NULL on warmup)
-    bin20_<metric>  SMALLINT NOT NULL DEFAULT 0  (0 on warmup)
+The set of columns in each bin table is driven by metric_classification,
+filtered to eligible_as_metric = TRUE.  For every eligible metric we ensure
+two columns exist in each table:
+    frac_<metric>   DOUBLE PRECISION  (nullable; NULL when value absent)
+    bin20_<metric>  SMALLINT NOT NULL DEFAULT 0  (0 when value absent)
 
 Idempotent.  Never auto-drops columns when a metric becomes ineligible —
 orphan columns from deprecated metrics are harmless and a destructive
@@ -83,6 +83,16 @@ def existing_wf_bins_columns(conn) -> set:
         return {r[0] for r in cur.fetchall()}
 
 
+def existing_is_bins_columns(conn) -> set:
+    """Set of column names currently in is_bins."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'is_bins' AND table_schema = 'public'"
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
 def existing_daily_features_columns(conn) -> set:
     """Set of column names in daily_features.  Used to defensively filter the
     eligible-metric list to only those that exist as columns in the source
@@ -142,5 +152,54 @@ def sync_wf_bins_schema(conn) -> tuple:
         )
     if added:
         log.info("Added wf_bins column pairs for %d metric(s): %s",
+                 len(added), added[:10])
+    return len(added), added
+
+
+def sync_is_bins_schema(conn) -> tuple:
+    """Add missing (frac_<m>, bin20_<m>) column pairs to is_bins for every
+    eligible metric.  Exact mirror of sync_wf_bins_schema targeting is_bins.
+
+    Returns (added_pair_count, added_metric_names).  Idempotent.  Never drops.
+    """
+    existing = existing_is_bins_columns(conn)
+    df_cols  = existing_daily_features_columns(conn)
+    eligible = get_eligible_metrics(conn)
+
+    added:           list = []
+    skipped_missing: list = []
+
+    with conn.cursor() as cur:
+        for metric, _tier in eligible:
+            if metric not in df_cols:
+                skipped_missing.append(metric)
+                continue
+            _validate_metric_name(metric)
+            frac_col = f"frac_{metric}"
+            bin_col  = f"bin20_{metric}"
+            need_frac = frac_col not in existing
+            need_bin  = bin_col  not in existing
+            if need_frac:
+                cur.execute(
+                    f'ALTER TABLE is_bins ADD COLUMN IF NOT EXISTS {frac_col} '
+                    f'DOUBLE PRECISION'
+                )
+            if need_bin:
+                cur.execute(
+                    f'ALTER TABLE is_bins ADD COLUMN IF NOT EXISTS {bin_col} '
+                    f'SMALLINT NOT NULL DEFAULT 0'
+                )
+            if need_frac or need_bin:
+                added.append(metric)
+    conn.commit()
+
+    if skipped_missing:
+        log.warning(
+            "Skipped %d metric(s) listed in metric_classification but absent "
+            "from daily_features (drift between catalog and schema): %s",
+            len(skipped_missing), skipped_missing[:10],
+        )
+    if added:
+        log.info("Added is_bins column pairs for %d metric(s): %s",
                  len(added), added[:10])
     return len(added), added

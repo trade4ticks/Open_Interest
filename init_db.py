@@ -39,9 +39,12 @@ def main() -> None:
         # Done AFTER the static SQL files so the wf_bins skeleton + the
         # metric_classification table both exist.
         try:
-            from lib.bin_schema import sync_wf_bins_schema
+            from lib.bin_schema import sync_is_bins_schema, sync_wf_bins_schema
             print("Syncing wf_bins per-metric columns ...", end=" ", flush=True)
             n_added, _ = sync_wf_bins_schema(conn)
+            print(f"OK ({n_added} new column pair(s))")
+            print("Syncing is_bins per-metric columns  ...", end=" ", flush=True)
+            n_added, _ = sync_is_bins_schema(conn)
             print(f"OK ({n_added} new column pair(s))")
         except Exception as e:
             print(f"SKIPPED ({type(e).__name__}: {e})")

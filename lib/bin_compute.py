@@ -1,5 +1,5 @@
 """
-Pure compute helpers for wf_bins and tt_thresholds.
+Pure compute helpers for wf_bins, is_bins, and tt_thresholds.
 
 These functions reproduce the dashboard's _walk_forward_bins and _bin_for_value
 conventions byte-for-byte. After the dashboard migrates to read the bin tables
@@ -14,13 +14,20 @@ Conventions (all confirmed in plan):
     - "Valid" observation = not None, not NaN, numeric. Inf is NOT excluded
       (dashboard uses math.isnan but not math.isinf — match exactly).
     - 0.0 is valid (not filtered).
-    - Walk-forward:
+    - Walk-forward (wf_bins):
         rank      = bisect_left(sorted_prior, value)   # strictly-less among prior
         n_after   = len(sorted_prior) + 1              # includes current row
         insert AFTER computing rank
         warmup    = n_after < max(252, n_bins) → None
         frac      = rank / n_after
         bin_k     = min(int(frac * k) + 1, k)
+    - In-sample (is_bins):
+        population = all valid values for the ticker×metric (full history, fixed)
+        rank       = bisect_left(sorted_all, value)
+        n_total    = len(sorted_all)          # includes current value
+        frac       = rank / n_total
+        bin_k      = min(int(frac * k) + 1, k)
+        NO warmup — every row with a valid value is binned.
     - Train-test (read-side, per-ticker pre-cutoff history):
         rank      = bisect_left(history_vals, value)
         n         = len(history_vals)
@@ -143,6 +150,61 @@ def reference_walk_forward_bins(values: list, dates: list, n_bins: int) -> list:
         frac = rank / n_after
         out[i] = min(int(frac * n_bins) + 1, n_bins)
     return out
+
+
+# In-sample -----------------------------------------------------------------
+
+def in_sample_series(values: list, dates: list) -> tuple[list, list]:
+    """Compute in-sample (frac, bin20) for one (ticker, metric) series.
+
+    Ranks each value against the ticker's FULL history — no expanding window,
+    no warmup.  Every row with a valid value gets a frac and bin20.
+
+    The ranking population is all valid values across the entire date range,
+    sorted ascending.  frac = rank / n_total where n_total includes the current
+    value itself (consistent with walk_forward_series where n_after includes
+    the current row).  bisect_left convention: ties resolve by rank = count of
+    strictly-less values.
+
+    Parameters
+    ----------
+    values : list
+        Metric values, parallel to `dates`.  Order is not used in ranking
+        (in-sample is date-agnostic); dates is accepted only for API symmetry
+        with walk_forward_series and to validate equal length.
+    dates  : list
+        Trade dates, parallel to `values`.
+
+    Returns
+    -------
+    fracs  : list[Optional[float]]
+        rank / n_total for each row.  None for invalid values.
+    bin20s : list[int]
+        min(int(frac * 20) + 1, 20) for each row.  0 for invalid values.
+    """
+    if len(values) != len(dates):
+        raise ValueError("values and dates must have equal length")
+
+    n = len(values)
+    fracs:  list = [None] * n
+    bin20s: list = [0]    * n
+
+    # Full-history population: all valid values sorted ascending (fixed).
+    all_valid = sorted(v for v in values if is_valid_value(v))
+    n_total = len(all_valid)
+    if n_total == 0:
+        return fracs, bin20s
+
+    for i, v in enumerate(values):
+        if not is_valid_value(v):
+            continue
+        rank    = bisect_left(all_valid, v)
+        frac    = rank / n_total
+        bin20   = min(int(frac * BIN20_BUCKETS) + 1, BIN20_BUCKETS)
+        fracs[i]  = frac
+        bin20s[i] = bin20
+
+    return fracs, bin20s
 
 
 # Train-test -----------------------------------------------------------------
