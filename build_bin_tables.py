@@ -58,6 +58,35 @@ logging.basicConfig(
 log = logging.getLogger("build_bin_tables")
 
 
+# Commit per N-ticker batch.  Lower = lower peak memory; higher = fewer
+# commits.  Sized for a ~8GB VPS with no swap — the previous unchunked
+# upsert built a 221k-row × 192-col DataFrame and then a 221k-tuple rows
+# list in memory simultaneously, peaking at ~3.2GB rss and getting
+# SIGKILL'd by the OOM-killer.  At batch=5 (each ticker contributes
+# ~1800 rows × ~190 cells), peak per-batch overhead stays well under
+# 150MB on top of the source df.
+UPSERT_TICKER_BATCH = 5
+
+
+def _flush_upsert(conn, insert_sql: str, write_cols: list, frames: list) -> int:
+    """Concatenate a batch of per-ticker DataFrames, materialise the rows
+    list, upsert via execute_values, commit, return rows upserted.
+
+    All intermediate objects (batch_df, batch_rows) go out of scope on
+    return, so the caller's GC can reclaim them before the next batch
+    builds its own.  This is the memory-bounding contract.
+    """
+    if not frames:
+        return 0
+    batch_df = pd.concat(frames, ignore_index=True)
+    batch_rows = [tuple(_pgify(r.get(c)) for c in write_cols)
+                  for r in batch_df.to_dict(orient="records")]
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, insert_sql, batch_rows, page_size=500)
+    conn.commit()
+    return len(batch_rows)
+
+
 # Walk-forward build ---------------------------------------------------------
 
 def _build_wf_bins_for_tier(conn, tier: str) -> int:
@@ -100,35 +129,10 @@ def _build_wf_bins_for_tier(conn, tier: str) -> int:
 
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
 
-    # Compute walk-forward per (ticker, metric).  Result accumulates as a wide
-    # frame with one row per (ticker, trade_date) and two cols per metric.
-    log.info("Computing walk-forward bins for %d metrics × %d tickers ...",
-             len(metrics), df["ticker"].nunique())
-    t0 = time.time()
-    out_frames: list = []
-    for ticker, sub in df.groupby("ticker", sort=False):
-        sub = sub.sort_values("trade_date").reset_index(drop=True)
-        row = {"ticker": ticker, "trade_date": sub["trade_date"].tolist()}
-        dates = sub["trade_date"].tolist()
-        for m in metrics:
-            vals = sub[m].tolist()
-            fracs, bin20s = walk_forward_series(vals, dates)
-            row[f"frac_{m}"] = fracs
-            row[f"bin20_{m}"] = bin20s
-        # Expand into rows.
-        n = len(dates)
-        ticker_df = pd.DataFrame({
-            "ticker":     [ticker] * n,
-            "trade_date": dates,
-            **{f"frac_{m}":  row[f"frac_{m}"]  for m in metrics},
-            **{f"bin20_{m}": row[f"bin20_{m}"] for m in metrics},
-        })
-        out_frames.append(ticker_df)
-    result = pd.concat(out_frames, ignore_index=True)
-    log.info("  computed %d rows × %d metric pairs in %.1fs.",
-             len(result), len(metrics), time.time() - t0)
-
-    # Upsert.  Tier-specific SET clause; never touches the other tier's cols.
+    # Build the tier-scoped upsert SQL once.  Names ONLY this tier's columns
+    # in DO UPDATE SET — does not touch the other tier's columns of the same
+    # (ticker, trade_date) row.  No DELETE; the two-cron write contract
+    # depends on neither tier's path ever wiping the other.
     write_cols = ["ticker", "trade_date"]
     for m in metrics:
         write_cols.append(f"frac_{m}")
@@ -138,22 +142,53 @@ def _build_wf_bins_for_tier(conn, tier: str) -> int:
         set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
         set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
     set_sql = ",\n        ".join(set_clauses)
-
     insert_sql = (
         f"INSERT INTO wf_bins ({', '.join(write_cols)}) VALUES %s\n"
         f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
         f"    {set_sql}"
     )
 
-    log.info("Upserting to wf_bins ...")
+    # Compute + upsert per ticker batch.  Each batch commits independently
+    # so peak memory stays bounded; ON CONFLICT DO UPDATE SET makes the
+    # operation idempotent on rerun if a later batch fails.
+    total_tickers = df["ticker"].nunique()
+    log.info("Computing + upserting wf_bins (%s) — %d metrics × %d tickers, "
+             "commit per %d-ticker batch ...",
+             tier, len(metrics), total_tickers, UPSERT_TICKER_BATCH)
     t0 = time.time()
-    rows = [tuple(_pgify(r.get(c)) for c in write_cols)
-            for r in result.to_dict(orient="records")]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, insert_sql, rows, page_size=500)
-    conn.commit()
-    log.info("  upserted %d rows in %.1fs.", len(rows), time.time() - t0)
-    return len(rows)
+
+    pending: list = []
+    total_rows = 0
+    n_tickers_done = 0
+
+    for ticker, sub in df.groupby("ticker", sort=False):
+        sub = sub.sort_values("trade_date").reset_index(drop=True)
+        dates = sub["trade_date"].tolist()
+        cols: dict = {"ticker": [ticker] * len(dates), "trade_date": dates}
+        for m in metrics:
+            vals = sub[m].tolist()
+            fracs, bin20s = walk_forward_series(vals, dates)
+            cols[f"frac_{m}"] = fracs
+            cols[f"bin20_{m}"] = bin20s
+        pending.append(pd.DataFrame(cols))
+
+        if len(pending) >= UPSERT_TICKER_BATCH:
+            total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+            n_tickers_done += len(pending)
+            log.info("  ... %d/%d tickers, %d rows upserted",
+                     n_tickers_done, total_tickers, total_rows)
+            pending = []
+
+    # Final partial batch.
+    if pending:
+        total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+        n_tickers_done += len(pending)
+        log.info("  ... %d/%d tickers, %d rows upserted",
+                 n_tickers_done, total_tickers, total_rows)
+
+    log.info("  wf_bins (%s) done: %d rows in %.1fs.",
+             tier, total_rows, time.time() - t0)
+    return total_rows
 
 
 # In-sample build ------------------------------------------------------------
@@ -209,34 +244,8 @@ def _build_is_bins_for_tier(conn, tier: str) -> int:
 
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
 
-    # Compute in-sample bins per (ticker, metric).  The ranking population is
-    # the ticker's full history — no expanding window, no warmup.
-    log.info("Computing in-sample bins for %d metrics × %d tickers ...",
-             len(metrics), df["ticker"].nunique())
-    t0 = time.time()
-    out_frames: list = []
-    for ticker, sub in df.groupby("ticker", sort=False):
-        sub   = sub.sort_values("trade_date").reset_index(drop=True)
-        dates = sub["trade_date"].tolist()
-        row: dict = {"ticker": ticker, "trade_date": dates}
-        for m in metrics:
-            vals = sub[m].tolist()
-            fracs, bin20s = in_sample_series(vals, dates)
-            row[f"frac_{m}"]  = fracs
-            row[f"bin20_{m}"] = bin20s
-        n = len(dates)
-        ticker_df = pd.DataFrame({
-            "ticker":     [ticker] * n,
-            "trade_date": dates,
-            **{f"frac_{m}":  row[f"frac_{m}"]  for m in metrics},
-            **{f"bin20_{m}": row[f"bin20_{m}"] for m in metrics},
-        })
-        out_frames.append(ticker_df)
-    result = pd.concat(out_frames, ignore_index=True)
-    log.info("  computed %d rows × %d metric pairs in %.1fs.",
-             len(result), len(metrics), time.time() - t0)
-
-    # Upsert.  Tier-specific SET clause; never touches the other tier's cols.
+    # Build the tier-scoped upsert SQL once.  Same two-cron contract as
+    # wf_bins — names ONLY this tier's columns in DO UPDATE SET.
     write_cols = ["ticker", "trade_date"]
     for m in metrics:
         write_cols.append(f"frac_{m}")
@@ -246,22 +255,51 @@ def _build_is_bins_for_tier(conn, tier: str) -> int:
         set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
         set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
     set_sql = ",\n        ".join(set_clauses)
-
     insert_sql = (
         f"INSERT INTO is_bins ({', '.join(write_cols)}) VALUES %s\n"
         f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
         f"    {set_sql}"
     )
 
-    log.info("Upserting to is_bins ...")
+    # Compute + upsert per ticker batch.  Mirrors wf_bins's path.
+    total_tickers = df["ticker"].nunique()
+    log.info("Computing + upserting is_bins (%s) — %d metrics × %d tickers, "
+             "commit per %d-ticker batch ...",
+             tier, len(metrics), total_tickers, UPSERT_TICKER_BATCH)
     t0 = time.time()
-    rows = [tuple(_pgify(r.get(c)) for c in write_cols)
-            for r in result.to_dict(orient="records")]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, insert_sql, rows, page_size=500)
-    conn.commit()
-    log.info("  upserted %d rows in %.1fs.", len(rows), time.time() - t0)
-    return len(rows)
+
+    pending: list = []
+    total_rows = 0
+    n_tickers_done = 0
+
+    for ticker, sub in df.groupby("ticker", sort=False):
+        sub = sub.sort_values("trade_date").reset_index(drop=True)
+        dates = sub["trade_date"].tolist()
+        cols: dict = {"ticker": [ticker] * len(dates), "trade_date": dates}
+        for m in metrics:
+            vals = sub[m].tolist()
+            fracs, bin20s = in_sample_series(vals, dates)
+            cols[f"frac_{m}"] = fracs
+            cols[f"bin20_{m}"] = bin20s
+        pending.append(pd.DataFrame(cols))
+
+        if len(pending) >= UPSERT_TICKER_BATCH:
+            total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+            n_tickers_done += len(pending)
+            log.info("  ... %d/%d tickers, %d rows upserted",
+                     n_tickers_done, total_tickers, total_rows)
+            pending = []
+
+    # Final partial batch.
+    if pending:
+        total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+        n_tickers_done += len(pending)
+        log.info("  ... %d/%d tickers, %d rows upserted",
+                 n_tickers_done, total_tickers, total_rows)
+
+    log.info("  is_bins (%s) done: %d rows in %.1fs.",
+             tier, total_rows, time.time() - t0)
+    return total_rows
 
 
 # Train-test build -----------------------------------------------------------
