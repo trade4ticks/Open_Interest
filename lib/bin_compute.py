@@ -209,6 +209,74 @@ def in_sample_series(values: list, dates: list) -> tuple[list, list]:
 
 # Train-test -----------------------------------------------------------------
 
+# Per-ticker minimum count of valid pre-cutoff observations required to
+# build a usable in-sample ruler for tt_bins.  Below this, the (ticker,
+# metric) returns bin=0 for ALL of that ticker's rows (train and test)
+# for that metric.  Train-window analog of wf_bins' warmup floor — a
+# late-listing ticker without enough pre-cutoff history shouldn't
+# contaminate the bins.  Spec sets this at 500 (~2 years of trading days)
+# rather than reusing wf's 252 because tt's ruler is computed ONCE and
+# frozen — we want materially more stability than wf's "hit-the-ground-
+# running" expanding window.
+TT_MIN_TRAIN_DEFAULT = 500
+
+
+def train_test_series(values: list, dates: list, cutoff,
+                      min_train: int = TT_MIN_TRAIN_DEFAULT) -> list:
+    """Compute tt_bins bin20 for one (ticker, metric) chronological series.
+
+    Algorithm
+    ---------
+    1. train_sorted = sorted valid values where trade_date < cutoff.
+    2. If len(train_sorted) < min_train: return all zeros (no usable ruler).
+    3. Otherwise, for each row in `values` (train AND test):
+         - if value invalid → bin20 = 0
+         - else:
+             rank   = bisect_left(train_sorted, value)
+             bin20  = min(int(rank / n_train * 20) + 1, 20)
+
+    Sentinel 0 has a SINGLE meaning here: NULL/invalid source value OR
+    (ticker, metric) had fewer than min_train pre-cutoff rows.  No warmup
+    — wf_bins' warmup is a walk-forward artifact and doesn't apply.
+
+    Returns
+    -------
+    bin20s : list[int]
+        Length-`len(values)` list of bin assignments, 0 or 1..20.
+        No frac output — tt_bins stores bin20 only.
+
+    Edge cases handled
+    ------------------
+    - Ticker with zero pre-cutoff rows (post-cutoff listing, e.g. QBTS):
+      train_sorted is empty, n_train = 0 < min_train, returns all-zeros
+      WITHOUT entering the bisect loop (no divide-by-zero, no empty-list
+      access).
+    - Ticker with some valid metrics and some invalid: per-metric check
+      is independent; each metric's series is evaluated on its own.
+    """
+    if len(values) != len(dates):
+        raise ValueError("values and dates must have equal length")
+
+    n = len(values)
+    bin20s: list = [0] * n
+
+    train_sorted = sorted(
+        v for v, d in zip(values, dates)
+        if d < cutoff and is_valid_value(v)
+    )
+    n_train = len(train_sorted)
+    if n_train < min_train:
+        return bin20s
+
+    for i, v in enumerate(values):
+        if not is_valid_value(v):
+            continue
+        rank = bisect_left(train_sorted, v)
+        bin20s[i] = min(int(rank / n_train * BIN20_BUCKETS) + 1, BIN20_BUCKETS)
+
+    return bin20s
+
+
 def train_test_history(values) -> tuple[list, int]:
     """Build one ticker's sorted pre-cutoff history for one metric.
 

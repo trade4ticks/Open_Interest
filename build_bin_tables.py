@@ -36,19 +36,28 @@ from datetime import date
 import pandas as pd
 import psycopg2.extras
 
+from datetime import date
+
 from db import get_connection, read_sql_df
 from lib.bin_compute import (
     TRAIN_TEST_CUTOFF_DEFAULT,
+    TT_MIN_TRAIN_DEFAULT,
     in_sample_series,
     train_test_history,
+    train_test_series,
     walk_forward_series,
 )
 from lib.bin_schema import (
     existing_daily_features_columns,
     get_metrics_by_tier,
     sync_is_bins_schema,
+    sync_tt_bins_schema,
     sync_wf_bins_schema,
 )
+
+# Cutoff stored as a date object for tt_bins (the bin compute compares date
+# objects, not strings).  Same calendar value as TRAIN_TEST_CUTOFF_DEFAULT.
+TT_CUTOFF_DATE = date.fromisoformat(TRAIN_TEST_CUTOFF_DEFAULT)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,6 +311,120 @@ def _build_is_bins_for_tier(conn, tier: str) -> int:
     return total_rows
 
 
+# tt_bins build (train-test, replaces what the dashboard reads from tt_thresholds)
+
+def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
+                   min_train: int = TT_MIN_TRAIN_DEFAULT) -> int:
+    """Full rebuild of tt_bins for the given cutoff.
+
+    Single-pass: all eligible metrics across all tickers, no tier separation.
+    Per (ticker, metric): build the frozen ruler from pre-cutoff valid
+    values, apply it to BOTH train (pre-cutoff) and test (post-cutoff) rows.
+    See lib.bin_compute.train_test_series for the algorithm.
+
+    Per-ticker safety: a ticker with no valid pre-cutoff rows for any metric
+    (e.g. a post-cutoff listing like QBTS) still gets its rows written, with
+    all bin20_<m> = 0.  train_test_series guards the empty-train_sorted /
+    n_train < min_train case before any bisect or division.
+
+    Mirrors the chunked-upsert pattern from wf/is builds — commit per
+    UPSERT_TICKER_BATCH tickers — so peak memory stays bounded.
+    """
+    log.info("Syncing tt_bins schema ...")
+    sync_tt_bins_schema(conn)
+
+    metrics_by_tier = get_metrics_by_tier(conn)
+    metrics = sorted(set(metrics_by_tier["MORNING"]) | set(metrics_by_tier["EVENING"]))
+    if not metrics:
+        log.warning("No eligible metrics — nothing to do.")
+        return 0
+
+    df_cols = existing_daily_features_columns(conn)
+    metrics = [m for m in metrics if m in df_cols]
+    log.info("tt_bins: %d eligible metric(s), cutoff = %s, min_train = %d.",
+             len(metrics), cutoff, min_train)
+
+    cols_sql = ", ".join(metrics)
+    log.info("Reading daily_features (ticker, trade_date, %d metric cols) ...",
+             len(metrics))
+    t0 = time.time()
+    df = read_sql_df(
+        conn,
+        f"SELECT ticker, trade_date, {cols_sql} FROM daily_features "
+        f"ORDER BY ticker, trade_date"
+    )
+    log.info("  loaded %d rows in %.1fs.", len(df), time.time() - t0)
+    if df.empty:
+        log.warning("daily_features returned no rows — nothing to bin.")
+        return 0
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+
+    # Build the upsert SQL once.  tt_bins is single-tier (no MORNING/EVENING
+    # split); the SET clause names cutoff_date + every metric's bin20 column.
+    write_cols = ["ticker", "trade_date", "cutoff_date"]
+    for m in metrics:
+        write_cols.append(f"bin20_{m}")
+    set_clauses = ["cutoff_date = EXCLUDED.cutoff_date"]
+    for m in metrics:
+        set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
+    set_sql = ",\n        ".join(set_clauses)
+    insert_sql = (
+        f"INSERT INTO tt_bins ({', '.join(write_cols)}) VALUES %s\n"
+        f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
+        f"    {set_sql}"
+    )
+
+    total_tickers = df["ticker"].nunique()
+    log.info("Computing + upserting tt_bins — %d metrics × %d tickers, "
+             "commit per %d-ticker batch ...",
+             len(metrics), total_tickers, UPSERT_TICKER_BATCH)
+    t0 = time.time()
+
+    pending: list = []
+    total_rows = 0
+    n_tickers_done = 0
+    n_thin_tickers = 0   # tickers where EVERY metric returned all-zero (insufficient train)
+
+    for ticker, sub in df.groupby("ticker", sort=False):
+        sub = sub.sort_values("trade_date").reset_index(drop=True)
+        dates = sub["trade_date"].tolist()
+        cols: dict = {
+            "ticker":      [ticker] * len(dates),
+            "trade_date":  dates,
+            "cutoff_date": [cutoff] * len(dates),
+        }
+        n_metrics_with_any_bin = 0
+        for m in metrics:
+            vals = sub[m].tolist()
+            bin20s = train_test_series(vals, dates, cutoff, min_train)
+            cols[f"bin20_{m}"] = bin20s
+            if any(b > 0 for b in bin20s):
+                n_metrics_with_any_bin += 1
+        if n_metrics_with_any_bin == 0:
+            n_thin_tickers += 1
+            log.info("  thin ticker (no binnable metric, all bin20=0): %s", ticker)
+        pending.append(pd.DataFrame(cols))
+
+        if len(pending) >= UPSERT_TICKER_BATCH:
+            total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+            n_tickers_done += len(pending)
+            log.info("  ... %d/%d tickers, %d rows upserted",
+                     n_tickers_done, total_tickers, total_rows)
+            pending = []
+
+    if pending:
+        total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+        n_tickers_done += len(pending)
+        log.info("  ... %d/%d tickers, %d rows upserted",
+                 n_tickers_done, total_tickers, total_rows)
+
+    log.info("  tt_bins done: %d rows in %.1fs.  "
+             "Thin tickers (zero binnable metrics): %d.",
+             total_rows, time.time() - t0, n_thin_tickers)
+    return total_rows
+
+
 # Train-test build -----------------------------------------------------------
 
 def _build_tt_thresholds(conn, cutoff: str = TRAIN_TEST_CUTOFF_DEFAULT) -> int:
@@ -416,12 +539,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tier", choices=["MORNING", "EVENING"], default=None,
-                    help="Rebuild wf_bins for this tier's metrics.")
+                    help="Rebuild wf_bins and is_bins for this tier's metrics.")
+    ap.add_argument("--build-tt-bins", action="store_true",
+                    help="(Re)build tt_bins for the standard cutoff "
+                         "(in-sample bin table the dashboard reads).")
     ap.add_argument("--build-tt", action="store_true",
-                    help="(Re)build tt_thresholds for the standard cutoff.")
+                    help="(Re)build legacy tt_thresholds for the standard "
+                         "cutoff.  Dashboard reads tt_bins instead; this is "
+                         "kept for the underlying threshold artifact if needed.")
     args = ap.parse_args()
 
-    if not args.tier and not args.build_tt:
+    if not args.tier and not args.build_tt and not args.build_tt_bins:
         ap.print_help()
         return 1
 
@@ -432,6 +560,9 @@ def main() -> int:
             log.info("wf_bins (%s): %d rows upserted.", args.tier, n)
             n = _build_is_bins_for_tier(conn, args.tier)
             log.info("is_bins (%s): %d rows upserted.", args.tier, n)
+        if args.build_tt_bins:
+            n = _build_tt_bins(conn)
+            log.info("tt_bins: %d rows upserted.", n)
         if args.build_tt:
             n = _build_tt_thresholds(conn)
             log.info("tt_thresholds: %d rows upserted.", n)

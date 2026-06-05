@@ -93,6 +93,16 @@ def existing_is_bins_columns(conn) -> set:
         return {r[0] for r in cur.fetchall()}
 
 
+def existing_tt_bins_columns(conn) -> set:
+    """Set of column names currently in tt_bins."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'tt_bins' AND table_schema = 'public'"
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
 def existing_daily_features_columns(conn) -> set:
     """Set of column names in daily_features.  Used to defensively filter the
     eligible-metric list to only those that exist as columns in the source
@@ -201,5 +211,49 @@ def sync_is_bins_schema(conn) -> tuple:
         )
     if added:
         log.info("Added is_bins column pairs for %d metric(s): %s",
+                 len(added), added[:10])
+    return len(added), added
+
+
+def sync_tt_bins_schema(conn) -> tuple:
+    """Add missing bin20_<m> columns to tt_bins for every eligible metric.
+
+    UNLIKE sync_wf_bins_schema / sync_is_bins_schema, which add a frac+bin20
+    PAIR per metric, tt_bins stores ONLY bin20 — there is no frac_<metric>
+    column.  Bin5 and bin10 derive at read time from bin20 via integer
+    division (bin10 = (bin20-1)//2+1, bin5 = (bin20-1)//4+1).
+
+    Returns (added_count, added_metric_names).  Idempotent.  Never drops.
+    """
+    existing = existing_tt_bins_columns(conn)
+    df_cols  = existing_daily_features_columns(conn)
+    eligible = get_eligible_metrics(conn)
+
+    added:           list = []
+    skipped_missing: list = []
+
+    with conn.cursor() as cur:
+        for metric, _tier in eligible:
+            if metric not in df_cols:
+                skipped_missing.append(metric)
+                continue
+            _validate_metric_name(metric)
+            bin_col = f"bin20_{metric}"
+            if bin_col not in existing:
+                cur.execute(
+                    f'ALTER TABLE tt_bins ADD COLUMN IF NOT EXISTS {bin_col} '
+                    f'SMALLINT NOT NULL DEFAULT 0'
+                )
+                added.append(metric)
+    conn.commit()
+
+    if skipped_missing:
+        log.warning(
+            "Skipped %d metric(s) listed in metric_classification but absent "
+            "from daily_features (drift between catalog and schema): %s",
+            len(skipped_missing), skipped_missing[:10],
+        )
+    if added:
+        log.info("Added tt_bins bin20 columns for %d metric(s): %s",
                  len(added), added[:10])
     return len(added), added

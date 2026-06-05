@@ -41,3 +41,27 @@ CREATE TABLE IF NOT EXISTS is_bins (
     trade_date DATE NOT NULL,
     PRIMARY KEY (ticker, trade_date)
 );
+
+-- tt_bins: train-test bin table.  One row per (ticker, trade_date) with
+-- bin20_<metric> per eligible metric (added dynamically by
+-- lib/bin_schema.sync_tt_bins_schema).  Populated by
+-- build_bin_tables.py --build-tt-bins.
+--
+-- Differences from wf_bins / is_bins:
+--   * NO frac_<metric> columns — bin20 is the only stored output.
+--     (Bin5/10 derive at read time from bin20 via integer division.)
+--   * cutoff_date column, defaulted to 2024-01-01.  Single value across
+--     the whole table; present per-row for self-documentation (dashboard
+--     reads cutoff from any row, not from a hardcoded constant).
+--   * No warmup.  Bin 0 means NULL source value OR (ticker, metric)
+--     had fewer than 500 valid pre-cutoff training rows.  Single sentinel.
+--
+-- Method: per (ticker, metric), the frozen ruler = sorted pre-cutoff
+-- valid values; applied to BOTH train (pre-cutoff) and test (post-cutoff)
+-- rows.  See lib/bin_compute.py:train_test_series.
+CREATE TABLE IF NOT EXISTS tt_bins (
+    ticker      TEXT NOT NULL,
+    trade_date  DATE NOT NULL,
+    cutoff_date DATE NOT NULL DEFAULT '2024-01-01',
+    PRIMARY KEY (ticker, trade_date)
+);
