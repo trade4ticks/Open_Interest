@@ -345,20 +345,23 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
              len(metrics), cutoff, min_train)
 
     cols_sql = ", ".join(metrics)
-    log.info("Reading daily_features (ticker, trade_date, %d metric cols) ...",
-             len(metrics))
-    t0 = time.time()
-    df = read_sql_df(
-        conn,
-        f"SELECT ticker, trade_date, {cols_sql} FROM daily_features "
-        f"ORDER BY ticker, trade_date"
-    )
-    log.info("  loaded %d rows in %.1fs.", len(df), time.time() - t0)
-    if df.empty:
-        log.warning("daily_features returned no rows — nothing to bin.")
-        return 0
 
-    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    # Load the ticker list separately (cheap), then STREAM daily_features
+    # per-ticker inside the loop below.  Loading the whole table at once
+    # (~221k rows × 144 metric cols) OOM-killed this build on the
+    # 7.8GB-with-no-swap VPS — see commit history.  The per-ticker
+    # algorithm doesn't need cross-ticker state (binning is per-ticker
+    # against the ticker's own pre-cutoff history), so streaming costs
+    # nothing semantically; only one ticker × all metrics sits in memory
+    # at any moment, freed before the next iteration.
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT ticker FROM daily_features ORDER BY ticker")
+        all_tickers = [r[0] for r in cur.fetchall()]
+    total_tickers = len(all_tickers)
+    log.info("Tickers to process: %d", total_tickers)
+    if total_tickers == 0:
+        log.warning("daily_features has no tickers — nothing to bin.")
+        return 0
 
     # Build the upsert SQL once.  tt_bins is single-tier (no MORNING/EVENING
     # split); the SET clause names cutoff_date + every metric's bin20 column.
@@ -375,9 +378,8 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
         f"    {set_sql}"
     )
 
-    total_tickers = df["ticker"].nunique()
     log.info("Computing + upserting tt_bins — %d metrics × %d tickers, "
-             "commit per %d-ticker batch ...",
+             "streaming reads, commit per %d-ticker batch ...",
              len(metrics), total_tickers, UPSERT_TICKER_BATCH)
     t0 = time.time()
 
@@ -386,8 +388,21 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
     n_tickers_done = 0
     n_thin_tickers = 0   # tickers where EVERY metric returned all-zero (insufficient train)
 
-    for ticker, sub in df.groupby("ticker", sort=False):
-        sub = sub.sort_values("trade_date").reset_index(drop=True)
+    for ticker in all_tickers:
+        # Stream ONE ticker's full series.  WHERE ticker = %s lets Postgres
+        # use the (ticker, trade_date) PK index so only this ticker's rows
+        # cross the wire — not all 124 tickers' worth.  This is THE memory
+        # bound: peak ≈ one ticker's row count × len(metrics).
+        sub = read_sql_df(
+            conn,
+            f"SELECT trade_date, {cols_sql} FROM daily_features "
+            f"WHERE ticker = %(t)s ORDER BY trade_date",
+            {"t": ticker},
+        )
+        if sub.empty:
+            continue
+        sub["trade_date"] = pd.to_datetime(sub["trade_date"]).dt.date
+
         dates = sub["trade_date"].tolist()
         cols: dict = {
             "ticker":      [ticker] * len(dates),
@@ -405,6 +420,12 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
             n_thin_tickers += 1
             log.info("  thin ticker (no binnable metric, all bin20=0): %s", ticker)
         pending.append(pd.DataFrame(cols))
+
+        # Explicitly drop the raw read so peak memory stays at one ticker's
+        # worth before the next SELECT lands.  (Python rebinding `sub` on
+        # the next iteration would do the same, but `del` makes the intent
+        # visible and the GC fire sooner.)
+        del sub
 
         if len(pending) >= UPSERT_TICKER_BATCH:
             total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
