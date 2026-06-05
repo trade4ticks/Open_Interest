@@ -222,35 +222,48 @@ TT_MIN_TRAIN_DEFAULT = 500
 
 
 def train_test_series(values: list, dates: list, cutoff,
-                      min_train: int = TT_MIN_TRAIN_DEFAULT) -> list:
-    """Compute tt_bins bin20 for one (ticker, metric) chronological series.
+                      min_train: int = TT_MIN_TRAIN_DEFAULT) -> tuple[list, list]:
+    """Compute tt_bins (frac, bin20) for one (ticker, metric) chronological series.
 
     Algorithm
     ---------
     1. train_sorted = sorted valid values where trade_date < cutoff.
-    2. If len(train_sorted) < min_train: return all zeros (no usable ruler).
+    2. If len(train_sorted) < min_train: return all-(None, 0) (no usable ruler).
     3. Otherwise, for each row in `values` (train AND test):
-         - if value invalid → bin20 = 0
+         - if value invalid → frac = None, bin20 = 0
          - else:
              rank   = bisect_left(train_sorted, value)
-             bin20  = min(int(rank / n_train * 20) + 1, 20)
+             frac   = rank / n_train
+             bin20  = min(int(frac * 20) + 1, 20)
 
-    Sentinel 0 has a SINGLE meaning here: NULL/invalid source value OR
-    (ticker, metric) had fewer than min_train pre-cutoff rows.  No warmup
-    — wf_bins' warmup is a walk-forward artifact and doesn't apply.
+    Sentinel: frac = None, bin20 = 0 (SQL NULL / 0) has a SINGLE meaning —
+    NULL / invalid source value OR (ticker, metric) had fewer than
+    min_train pre-cutoff rows.  Match is_bins / wf_bins exactly:
+    fracs initialised to [None]*n; only set when row passes validation.
+
+    No warmup — wf_bins' warmup is a walk-forward artifact and doesn't
+    apply to a frozen ruler.
 
     Returns
     -------
+    fracs  : list[Optional[float]]
+        rank / n_train for each row.  None for invalid values OR when
+        n_train < min_train (whole-series NULL in that case).
     bin20s : list[int]
-        Length-`len(values)` list of bin assignments, 0 or 1..20.
-        No frac output — tt_bins stores bin20 only.
+        min(int(frac * 20) + 1, 20) for each row.  0 for invalid / insufficient
+        training sample.
+
+    By construction the relationship bin20 == min(int(frac * 20) + 1, 20)
+    holds for every non-sentinel row, identical to is_bins / wf_bins.
+    Storing frac alongside bin20 lets downstream consumers re-bucket at
+    non-divisor-of-20 resolutions (e.g. 30-bin or 50-bin views).
 
     Edge cases handled
     ------------------
     - Ticker with zero pre-cutoff rows (post-cutoff listing, e.g. QBTS):
-      train_sorted is empty, n_train = 0 < min_train, returns all-zeros
-      WITHOUT entering the bisect loop (no divide-by-zero, no empty-list
-      access).
+      train_sorted is empty, n_train = 0 < min_train, returns all
+      (None, 0) WITHOUT entering the bisect loop (no divide-by-zero,
+      no empty-list access).
     - Ticker with some valid metrics and some invalid: per-metric check
       is independent; each metric's series is evaluated on its own.
     """
@@ -258,6 +271,7 @@ def train_test_series(values: list, dates: list, cutoff,
         raise ValueError("values and dates must have equal length")
 
     n = len(values)
+    fracs:  list = [None] * n
     bin20s: list = [0] * n
 
     train_sorted = sorted(
@@ -266,15 +280,18 @@ def train_test_series(values: list, dates: list, cutoff,
     )
     n_train = len(train_sorted)
     if n_train < min_train:
-        return bin20s
+        return fracs, bin20s
 
     for i, v in enumerate(values):
         if not is_valid_value(v):
             continue
         rank = bisect_left(train_sorted, v)
-        bin20s[i] = min(int(rank / n_train * BIN20_BUCKETS) + 1, BIN20_BUCKETS)
+        frac = rank / n_train
+        bin20 = min(int(frac * BIN20_BUCKETS) + 1, BIN20_BUCKETS)
+        fracs[i] = frac
+        bin20s[i] = bin20
 
-    return bin20s
+    return fracs, bin20s
 
 
 def train_test_history(values) -> tuple[list, int]:

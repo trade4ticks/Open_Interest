@@ -364,12 +364,15 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
         return 0
 
     # Build the upsert SQL once.  tt_bins is single-tier (no MORNING/EVENING
-    # split); the SET clause names cutoff_date + every metric's bin20 column.
+    # split); the SET clause names cutoff_date + frac_<m> + bin20_<m> for
+    # every eligible metric.  Same frac+bin20 pair shape as wf_bins / is_bins.
     write_cols = ["ticker", "trade_date", "cutoff_date"]
     for m in metrics:
+        write_cols.append(f"frac_{m}")
         write_cols.append(f"bin20_{m}")
     set_clauses = ["cutoff_date = EXCLUDED.cutoff_date"]
     for m in metrics:
+        set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
         set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
     set_sql = ",\n        ".join(set_clauses)
     insert_sql = (
@@ -412,7 +415,8 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
         n_metrics_with_any_bin = 0
         for m in metrics:
             vals = sub[m].tolist()
-            bin20s = train_test_series(vals, dates, cutoff, min_train)
+            fracs, bin20s = train_test_series(vals, dates, cutoff, min_train)
+            cols[f"frac_{m}"]  = fracs
             cols[f"bin20_{m}"] = bin20s
             if any(b > 0 for b in bin20s):
                 n_metrics_with_any_bin += 1

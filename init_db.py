@@ -52,7 +52,7 @@ def main() -> None:
             print(f"OK ({n_added} new column pair(s))")
             print("Syncing tt_bins per-metric columns  ...", end=" ", flush=True)
             n_added, _ = sync_tt_bins_schema(conn)
-            print(f"OK ({n_added} new bin20 column(s))")
+            print(f"OK ({n_added} new column pair(s))")
         except Exception as e:
             print(f"SKIPPED ({type(e).__name__}: {e})")
             print("  (Run `python build_bin_tables.py --tier EVENING` later "

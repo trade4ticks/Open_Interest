@@ -216,14 +216,16 @@ def sync_is_bins_schema(conn) -> tuple:
 
 
 def sync_tt_bins_schema(conn) -> tuple:
-    """Add missing bin20_<m> columns to tt_bins for every eligible metric.
+    """Add missing (frac_<m>, bin20_<m>) column pairs to tt_bins for every
+    eligible metric.
 
-    UNLIKE sync_wf_bins_schema / sync_is_bins_schema, which add a frac+bin20
-    PAIR per metric, tt_bins stores ONLY bin20 — there is no frac_<metric>
-    column.  Bin5 and bin10 derive at read time from bin20 via integer
-    division (bin10 = (bin20-1)//2+1, bin5 = (bin20-1)//4+1).
+    Matches sync_wf_bins_schema / sync_is_bins_schema exactly — frac is
+    DOUBLE PRECISION (nullable; NULL sentinel for bin-0 rows), bin20 is
+    SMALLINT NOT NULL DEFAULT 0.  Storing frac alongside bin20 lets
+    downstream consumers re-bucket at non-divisor-of-20 resolutions
+    (e.g. 30- or 50-bin views) where bin20 alone is insufficient.
 
-    Returns (added_count, added_metric_names).  Idempotent.  Never drops.
+    Returns (added_pair_count, added_metric_names).  Idempotent.  Never drops.
     """
     existing = existing_tt_bins_columns(conn)
     df_cols  = existing_daily_features_columns(conn)
@@ -238,12 +240,21 @@ def sync_tt_bins_schema(conn) -> tuple:
                 skipped_missing.append(metric)
                 continue
             _validate_metric_name(metric)
-            bin_col = f"bin20_{metric}"
-            if bin_col not in existing:
+            frac_col = f"frac_{metric}"
+            bin_col  = f"bin20_{metric}"
+            need_frac = frac_col not in existing
+            need_bin  = bin_col  not in existing
+            if need_frac:
+                cur.execute(
+                    f'ALTER TABLE tt_bins ADD COLUMN IF NOT EXISTS {frac_col} '
+                    f'DOUBLE PRECISION'
+                )
+            if need_bin:
                 cur.execute(
                     f'ALTER TABLE tt_bins ADD COLUMN IF NOT EXISTS {bin_col} '
                     f'SMALLINT NOT NULL DEFAULT 0'
                 )
+            if need_frac or need_bin:
                 added.append(metric)
     conn.commit()
 
@@ -254,6 +265,6 @@ def sync_tt_bins_schema(conn) -> tuple:
             len(skipped_missing), skipped_missing[:10],
         )
     if added:
-        log.info("Added tt_bins bin20 columns for %d metric(s): %s",
+        log.info("Added tt_bins column pairs for %d metric(s): %s",
                  len(added), added[:10])
     return len(added), added
