@@ -1267,19 +1267,54 @@ def build_for_ticker(pg_conn, ticker: str,
     log.info("  computing OHLC features ...")
     ohlc_feats = con.execute(OHLC_FEATURES_SQL).df()
 
-    if oi_feats.empty:
-        log.warning("  no OI rows in range for %s — skipping", ticker)
+    # Per docs/daily_features_data_dictionary.md ("As-of semantics — the universal
+    # row invariant" and "Cron / write architecture"): a daily_features row for
+    # date T is a composite — its existence must NOT be gated on any single
+    # contributing family.  Build the trade_date spine as the UNION across all
+    # families, then LEFT-join each family onto it.  This is what allows the
+    # EVENING cron to create the T row from T-1's close before OI for T is
+    # published, and the MORNING cron to later fill OI into that same row.
+    def _dates_of(df: pd.DataFrame) -> set:
+        if df.empty:
+            return set()
+        return set(pd.to_datetime(df["trade_date"]).dt.date.tolist())
+
+    spine_set = _dates_of(oi_feats) | _dates_of(ohlc_feats)
+
+    # chain_adj.feature_date is the EVENING-tier row driver: a chain row from
+    # session T-1 has feature_date = T and lands EVENING vol/IV in row T.
+    # Without including these, an EVENING run with no OI for T yet would have
+    # nothing to attach vol/IV to.
+    if chain_present:
+        chain_dates_rows = con.execute(
+            "SELECT DISTINCT feature_date FROM chain_adj ORDER BY feature_date"
+        ).fetchall()
+        spine_set |= {r[0] for r in chain_dates_rows}
+
+    if not spine_set:
+        log.warning("  no trade_dates from any family for %s — skipping", ticker)
         con.close()
         return 0
 
-    feats = oi_feats.merge(ohlc_feats, on="trade_date", how="left")
+    spine = pd.DataFrame({"trade_date": sorted(spine_set)})
+
+    # LEFT-join each family onto the spine.  A date present only in OHLC and
+    # chain (e.g. tonight's EVENING build of row T+1 before OI lands) gets OI
+    # cols NULL; the next MORNING run's MORNING_UPSERT_SQL fills them.  A date
+    # present only in OI (rare backfill case) gets OHLC/vol/IV NULL until those
+    # land.
+    feats = spine.merge(oi_feats,   on="trade_date", how="left")
+    feats = feats.merge(ohlc_feats, on="trade_date", how="left")
     # DuckDB returns DATE columns as datetime64[us]; normalise to Python date
     # so `>= start` (Python date) comparisons work and psycopg2 sees a clean
     # DATE value at INSERT time.
     feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
     feats.insert(0, "ticker", ticker)
 
-    # Register the merged base for vol/IV queries.
+    # Register AFTER the spine is built so VOL/IV SQL joins to base_feats see
+    # every spine date.  Where OI cols are NULL, the vol/OI cross-metrics
+    # (vol_oi_ratio_*, net_new_oi_div_vol — all MORNING-tier) evaluate to NULL
+    # via the division — correct: the next MORNING run fills them.
     con.register("base_feats", feats)
 
     if chain_present:
