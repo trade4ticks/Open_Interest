@@ -383,3 +383,17 @@ ALTER TABLE daily_features ADD COLUMN IF NOT EXISTS ret_20d_fwd_cc  DOUBLE PRECI
 -- ---------------------------------------------------------------------------
 ALTER TABLE option_volume_daily ADD COLUMN IF NOT EXISTS source_session DATE;
 ALTER TABLE option_iv_daily     ADD COLUMN IF NOT EXISTS source_session DATE;
+
+-- ---------------------------------------------------------------------------
+-- 11. Open-price provenance on underlying_ohlc (2026-06-07)
+--     The 7am premarket run writes open = premarket proxy and stamps the
+--     source so downstream consumers know the price isn't the official open.
+--     The 9:35 MORNING and EVENING runs overwrite both columns with
+--     open_source = 'daily_1d' when they correct open to the official bar.
+--
+--     open_source  values: 'premarket_1m' | 'daily_1d' | NULL (legacy rows)
+--     open_asof_ts: wall-clock timestamp of the bar used (ET, tz-aware).
+--                   NULL for daily_1d rows (bar time is just the trade date).
+-- ---------------------------------------------------------------------------
+ALTER TABLE underlying_ohlc ADD COLUMN IF NOT EXISTS open_source   TEXT;
+ALTER TABLE underlying_ohlc ADD COLUMN IF NOT EXISTS open_asof_ts  TIMESTAMPTZ;

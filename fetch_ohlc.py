@@ -30,14 +30,16 @@ INSERT INTO underlying_ohlc
     (ticker, trade_date, open, high, low, close, adj_close, volume, dividends, splits)
 VALUES %s
 ON CONFLICT (ticker, trade_date) DO UPDATE SET
-    open      = EXCLUDED.open,
-    high      = EXCLUDED.high,
-    low       = EXCLUDED.low,
-    close     = EXCLUDED.close,
-    adj_close = EXCLUDED.adj_close,
-    volume    = EXCLUDED.volume,
-    dividends = EXCLUDED.dividends,
-    splits    = EXCLUDED.splits
+    open         = EXCLUDED.open,
+    high         = EXCLUDED.high,
+    low          = EXCLUDED.low,
+    close        = EXCLUDED.close,
+    adj_close    = EXCLUDED.adj_close,
+    volume       = EXCLUDED.volume,
+    dividends    = EXCLUDED.dividends,
+    splits       = EXCLUDED.splits,
+    open_source  = 'daily_1d',
+    open_asof_ts = NULL
 """
 
 
