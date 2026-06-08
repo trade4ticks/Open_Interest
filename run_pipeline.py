@@ -60,7 +60,7 @@ from fetch_chain_eod import fetch_ticker as run_chain_fetch
 from fetch_ohlc import run as run_ohlc_fetch
 from fetch_oi import fetch_ticker as run_oi_history_fetch
 from fetch_oi_snapshot import fetch_ticker as run_oi_snapshot_fetch
-from lib.market_hours import get_trading_days, last_trading_day
+from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import test_connection as test_thetadata
 
@@ -136,7 +136,15 @@ def run_evening(conn, today: date) -> None:
         run_chain_fetch(t, chain_days)
 
     # 3. build_features for EVENING tier only — fires EVENING_UPSERT_SQL only.
-    feat_end   = today
+    # Per docs/daily_features_data_dictionary.md (universal row invariant):
+    # EVENING on calendar day X writes for trade_date T = next_trading_day(X).
+    # The chain just fetched in step 2 is stamped feature_date=T, so extending
+    # feat_end to T lets chain_adj's feature_date filter include it.  OHLC for
+    # T does not yet exist on T-1 evening — build_for_ticker injects a NULL-
+    # price placeholder ohlc row at T so the rolling-window OHLC SQL emits
+    # T's backward-looking EVENING metrics from real T-1-and-earlier closes.
+    # The next MORNING run on T fills OI into this same row.
+    feat_end   = next_trading_day(today)
     feat_start = feat_end - timedelta(days=FEATURES_LOOKBACK_DAYS)
     log.info("--- build_features (EVENING): %s → %s ---", feat_start, feat_end)
     for t in sorted(feature_tickers):
