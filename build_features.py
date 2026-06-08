@@ -28,6 +28,7 @@ import psycopg2.extras
 from db import get_connection, read_sql_df
 from lib.chain_store import has_data as chain_has_data, parquet_glob as chain_parquet_glob
 from lib.expirations import build_next_monthly_lookup
+from lib.market_hours import next_trading_day
 from lib.parquet_store import list_tickers, parquet_glob
 from lib.split_factors import load_splits, make_split_factors
 
@@ -1163,6 +1164,56 @@ def build_for_ticker(pg_conn, ticker: str,
         ohlc = ohlc_full_df
         date_filter_sql = ""
 
+    # ------------------------------------------------------------------------
+    # Placeholder-anchor row injection (EVENING-first compliance).
+    #
+    # On the T-1 evening EVENING run, the universal row invariant requires us
+    # to write trade_date T's EVENING_COLS from data through T-1's close.
+    # Chain-derived EVENING cols (vol, IV from chain_adj) land naturally via
+    # the feature_date=T offset stored in the chain parquet — a one-to-one
+    # source→consumer mapping.  OHLC's own EVENING cols (rv_*, pct_from_ma*,
+    # donchian_pos_20d, ret_5/10/20d, z-scores, etc.) do NOT have a stored
+    # feature_date offset because OHLC bars feed many feature_dates via
+    # rolling windows (T-1's close participates in T's, T+1's, ... T+19's
+    # rv_20d/donchian/returns/z-scores).  The mapping is many-to-many,
+    # unlike chain's one-to-one, so a stored relabel is not applicable.
+    #
+    # The gap is structural: OHLC_FEATURES_SQL is `... FROM ohlc` and only
+    # emits an output row at trade_date D if an input row exists at D.  On
+    # T-1 evening, no bar at T exists yet (T is the future) — so the window
+    # functions emit nothing for T, even though every input value they need
+    # (closes/highs/lows through T-1) is fully present.  A relabel cannot
+    # create the missing anchor at T; only injection can.
+    #
+    # Injection rule: add a single placeholder row at trade_date = end_eff
+    # with price columns NULL, ONLY when end_eff is exactly the next trading
+    # day after the last real OHLC row.  This guarantees the placeholder is
+    # the terminal row of the ohlc view, so no other row's rolling-window
+    # aggregate can look back through its NULL close.  All EVENING-tier
+    # window bounds end at "1 PRECEDING", so the placeholder's own NULL is
+    # excluded from its own windows — backward-looking metrics at T compute
+    # from real T-1-and-earlier inputs.
+    #
+    # The placeholder is in-memory only — never persisted.  When T's real
+    # bar later lands, the next EVENING run recomputes T's metrics from
+    # real data; backward-looking values are byte-identical because their
+    # inputs are unchanged.  The diagnostic immediately after OHLC features
+    # are computed verifies this idempotency against the actual data.
+    placeholder_injected = False
+    if (not ohlc.empty
+        and end_eff > ohlc["trade_date"].iloc[-1]
+        and end_eff == next_trading_day(ohlc["trade_date"].iloc[-1])):
+        placeholder = pd.DataFrame([{
+            "trade_date": end_eff,
+            "open": None, "high": None, "low": None,
+            "close": None, "volume": None,
+        }])
+        ohlc = pd.concat([ohlc, placeholder], ignore_index=True)
+        placeholder_injected = True
+        log.info("  injected placeholder OHLC row at %s "
+                 "(evening-first; price cols NULL, backward EVENING "
+                 "metrics from real T-1-and-earlier closes)", end_eff)
+
     con = duckdb.connect(database=":memory:")
 
     listed = listed_expirations_from_parquet(con, ticker)
@@ -1266,6 +1317,44 @@ def build_for_ticker(pg_conn, ticker: str,
     oi_feats = con.execute(OI_FEATURES_SQL).df()
     log.info("  computing OHLC features ...")
     ohlc_feats = con.execute(OHLC_FEATURES_SQL).df()
+
+    # ------------------------------------------------------------------------
+    # DIAGNOSTIC (temporary — remove after one clean production evening run).
+    # Confirms the placeholder-idempotency proof against the actual SQL and
+    # data: reruns OHLC_FEATURES_SQL on an ohlc view without the placeholder
+    # and verifies that the row at the last REAL OHLC date is byte-identical
+    # to the with-placeholder version.  If any metric differs, the placeholder
+    # is contaminating the last real row's window (e.g. a window bound of
+    # CURRENT ROW instead of 1 PRECEDING would silently admit the NULL).
+    # Cost: one extra OHLC_FEATURES_SQL pass per ticker per evening run.
+    if placeholder_injected:
+        last_real_date = ohlc["trade_date"].iloc[-2]
+        log.info("  [diagnostic] verifying placeholder idempotency at %s ...",
+                 last_real_date)
+        scratch = duckdb.connect(database=":memory:")
+        scratch.register("ohlc", ohlc.iloc[:-1].reset_index(drop=True))
+        baseline = scratch.execute(OHLC_FEATURES_SQL).df()
+        scratch.close()
+        row_w = ohlc_feats[ohlc_feats["trade_date"] == last_real_date].squeeze()
+        row_b = baseline[baseline["trade_date"] == last_real_date].squeeze()
+        diffs = []
+        for col in row_w.index:
+            if col == "trade_date":
+                continue
+            a, b = row_w[col], row_b[col]
+            if pd.isna(a) and pd.isna(b):
+                continue
+            if a != b:
+                diffs.append((col, a, b))
+        if diffs:
+            log.error("  [diagnostic] FAIL — placeholder contaminates "
+                      "%d metric(s) at %s:", len(diffs), last_real_date)
+            for col, a, b in diffs:
+                log.error("    %s: with=%r  without=%r", col, a, b)
+        else:
+            log.info("  [diagnostic] OK — placeholder idempotent at %s "
+                     "(all %d backward-window metrics byte-identical)",
+                     last_real_date, len(row_w) - 1)
 
     # Per docs/daily_features_data_dictionary.md ("As-of semantics — the universal
     # row invariant" and "Cron / write architecture"): a daily_features row for
