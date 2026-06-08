@@ -1385,41 +1385,63 @@ def build_for_ticker(pg_conn, ticker: str,
         con.close()
         return 0
 
-    spine = pd.DataFrame({"trade_date": sorted(spine_set)})
+    # Canonical trade_date dtype across all four feature-family merges below:
+    # datetime64[us], matching what DuckDB's .df() returns for DATE columns.
+    # The spine is built from Python dates (via _dates_of, which uses .dt.date
+    # for hashable set-union) and is object dtype — without coercion the
+    # first merge errors with "merge on object and datetime64[us] columns".
+    # Coercing oi_feats / ohlc_feats / vol_feats / iv_feats is defensive: a
+    # no-op today since DuckDB already emits datetime64[us], but pins the
+    # dtype across DuckDB Python-binding version changes so the next merge
+    # can't silently mismatch.  Final downconvert to Python date happens
+    # once, after the iv_feats merge, for the SPY merge (load_ohlc_spy
+    # returns Python date), the `>= start` trailing slice (start is date),
+    # and psycopg2's DATE column at INSERT.
+    _DT = "datetime64[us]"
+    spine = pd.DataFrame(
+        {"trade_date": pd.to_datetime(sorted(spine_set)).astype(_DT)}
+    )
+    oi_feats["trade_date"]   = pd.to_datetime(oi_feats["trade_date"]).astype(_DT)
+    ohlc_feats["trade_date"] = pd.to_datetime(ohlc_feats["trade_date"]).astype(_DT)
 
     # LEFT-join each family onto the spine.  A date present only in OHLC and
     # chain (e.g. tonight's EVENING build of row T+1 before OI lands) gets OI
     # cols NULL; the next MORNING run's MORNING_UPSERT_SQL fills them.  A date
     # present only in OI (rare backfill case) gets OHLC/vol/IV NULL until those
     # land.
+    # Merge 1: spine (us) + oi_feats (us).
     feats = spine.merge(oi_feats,   on="trade_date", how="left")
+    # Merge 2: feats (us) + ohlc_feats (us).
     feats = feats.merge(ohlc_feats, on="trade_date", how="left")
-    # DuckDB returns DATE columns as datetime64[us]; normalise to Python date
-    # so `>= start` (Python date) comparisons work and psycopg2 sees a clean
-    # DATE value at INSERT time.
-    feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
     feats.insert(0, "ticker", ticker)
 
-    # Register AFTER the spine is built so VOL/IV SQL joins to base_feats see
-    # every spine date.  Where OI cols are NULL, the vol/OI cross-metrics
-    # (vol_oi_ratio_*, net_new_oi_div_vol — all MORNING-tier) evaluate to NULL
-    # via the division — correct: the next MORNING run fills them.
+    # Register base_feats with trade_date still as datetime64[us].  DuckDB's
+    # JOIN to chain_adj (DATE column) implicit-casts DATE -> TIMESTAMP_US for
+    # the equality compare, so the registered dtype change vs. the old code's
+    # Python-date registration is transparent to VOL_FEATURES_SQL /
+    # IV_FEATURES_SQL.
     con.register("base_feats", feats)
 
     if chain_present:
         log.info("  computing vol features ...")
         vol_feats = con.execute(VOL_FEATURES_SQL).df()
-        vol_feats["trade_date"] = pd.to_datetime(vol_feats["trade_date"]).dt.date
-        # LEFT MERGE: missing chain data for a date leaves vol columns NULL
-        # rather than dropping the daily_features row.
+        vol_feats["trade_date"] = pd.to_datetime(vol_feats["trade_date"]).astype(_DT)
+        # Merge 3: feats (us) + vol_feats (us).  LEFT MERGE: missing chain
+        # data for a date leaves vol columns NULL rather than dropping the
+        # daily_features row.
         feats = feats.merge(vol_feats, on="trade_date", how="left")
 
         log.info("  computing IV features ...")
         iv_feats = con.execute(IV_FEATURES_SQL).df()
-        iv_feats["trade_date"] = pd.to_datetime(iv_feats["trade_date"]).dt.date
+        iv_feats["trade_date"] = pd.to_datetime(iv_feats["trade_date"]).astype(_DT)
+        # Merge 4: feats (us) + iv_feats (us).
         feats = feats.merge(iv_feats, on="trade_date", how="left")
     else:
         log.warning("  no chain_eod parquet for %s — vol/IV columns will be NULL", ticker)
+
+    # Now downconvert to Python date — required by the SPY merge (next),
+    # the `>= start` trailing slice, and psycopg2's DATE INSERT.
+    feats["trade_date"] = pd.to_datetime(feats["trade_date"]).dt.date
 
     con.close()
 
