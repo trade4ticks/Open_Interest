@@ -49,8 +49,10 @@ from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
     TerminalServerError,
     TerminalTimeoutError,
+    fetch_greeks_eod_current_day,
     fetch_greeks_eod_raw,
     test_connection,
+    today_et,
 )
 
 MAX_WORKERS = 4
@@ -182,9 +184,15 @@ def fetch_ticker(ticker: str, fetch_dates: list[date]) -> int:
                  ticker, len(fetch_dates) - len(todo), len(fetch_dates), len(todo))
 
     frames: list[pd.DataFrame] = []
+    # Compute once — ThetaData rejects expiration=* for today's date in ET.
+    # Historical dates use the efficient wildcard; today uses the per-expiration path.
+    _today = today_et()
     for fd in todo:
         try:
-            raw = fetch_greeks_eod_raw(ticker, fd)
+            if fd == _today:
+                raw = fetch_greeks_eod_current_day(ticker, fd)
+            else:
+                raw = fetch_greeks_eod_raw(ticker, fd)
         except (TerminalTimeoutError, TerminalServerError) as exc:
             log.warning("  TIMEOUT/ERROR %s %s: %s", ticker, fd, exc)
             continue

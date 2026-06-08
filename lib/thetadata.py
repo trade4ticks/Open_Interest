@@ -1,15 +1,22 @@
 """
-ThetaData v3 client — daily Open Interest only.
+ThetaData v3 client.
 
 Endpoints used:
   /v3/option/list/expirations
   /v3/option/history/open_interest
+  /v3/option/history/greeks/eod
+  /v3/option/snapshot/open_interest
+  /v3/option/history/eod
+  /v3/option/history/greeks/first_order
+  /v3/option/history/quote
 """
 from __future__ import annotations
 
 import logging
 import time
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -19,6 +26,11 @@ from config import THETADATA_BASE_URL
 log = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 60
+
+# ThetaData's reference timezone for "current day" — used to decide whether
+# to use the expiration=* wildcard (historical) or the per-expiration path
+# (current day, which rejects the wildcard with a 400 error).
+_ET = ZoneInfo("America/New_York")
 
 
 # --- Exceptions ------------------------------------------------------------
@@ -115,6 +127,19 @@ def _parse_ymd(raw) -> date | None:
 
 
 # --- Public API ------------------------------------------------------------
+
+def today_et() -> date:
+    """Return today's date in US Eastern Time.
+
+    ThetaData defines 'current day' in ET.  Callers use this to decide
+    whether to use the expiration=* wildcard (historical dates) or the
+    per-expiration path (today, which rejects the wildcard with a 400 error).
+
+    Prefer this over date.today() so the VPS running in UTC doesn't get an
+    off-by-one at the ET midnight boundary.
+    """
+    return datetime.now(_ET).date()
+
 
 def list_expirations(symbol: str) -> list[date]:
     """All expirations the terminal knows about for `symbol` (sorted ascending).
@@ -587,6 +612,113 @@ def fetch_greeks_eod_raw(symbol: str, trade_date: date,
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
+
+
+def fetch_greeks_eod_raw_for_expiration(
+    symbol: str,
+    expiration: date,
+    trade_date: date,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> pd.DataFrame:
+    """Fetch raw EOD greeks for ONE specific expiration on one trading day.
+
+    Same endpoint as fetch_greeks_eod_raw but passes expiration=YYYYMMDD
+    instead of expiration=*.  Required for current-day fetches: ThetaData
+    rejects expiration=* for today's date with a 400 error.
+
+    Carries identical retry-and-backoff logic to fetch_greeks_eod_raw so
+    a transient 429 or disconnect retries before propagating.
+
+    Returns a raw DataFrame (all vendor fields, same shape as
+    fetch_greeks_eod_raw).  Empty DataFrame on NoDataError or empty response.
+    """
+    date_str = trade_date.strftime("%Y%m%d")
+    exp_str  = expiration.strftime("%Y%m%d")
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": exp_str,
+        "start_date": date_str,
+        "end_date":   date_str,
+    }
+
+    try:
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except NoDataError:
+        return pd.DataFrame()
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (greeks_eod_exp %s %s)",
+                    symbol, exp_str)
+        time.sleep(60)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (greeks_eod_exp %s %s)",
+                    symbol, exp_str)
+        time.sleep(10)
+        data = _get("/v3/option/history/greeks/eod", params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def fetch_greeks_eod_current_day(
+    symbol: str,
+    trade_date: date,
+    exp_workers: int = 4,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> pd.DataFrame:
+    """Fetch raw EOD greeks for EVERY expiration on the current trading day.
+
+    ThetaData rejects expiration=* for the current calendar date in ET with
+    a 400 error.  This function works around that by:
+      1. Enumerating expirations via /v3/option/list/expirations (fresh each
+         call — new expirations get listed over time; never use stale data).
+      2. Fetching each expiration individually via
+         fetch_greeks_eod_raw_for_expiration, parallelised across exp_workers
+         threads.
+
+    Each per-expiration call carries the same retry-and-backoff logic as
+    fetch_greeks_eod_raw — a transient 429 or disconnect on one expiration
+    retries before failing, so the returned frame is as complete as possible.
+    A failed expiration is logged at WARNING and excluded from the concat;
+    the rest are returned.
+
+    Returns a concatenated raw DataFrame in the same shape as
+    fetch_greeks_eod_raw.  Empty DataFrame if list_expirations returns nothing
+    or all per-expiration calls return empty.
+    """
+    expirations = list_expirations(symbol)
+    if not expirations:
+        log.debug("  %s: list_expirations returned nothing — "
+                  "no current-day chain to fetch", symbol)
+        return pd.DataFrame()
+
+    log.debug("  %s: current-day per-expiration fetch — %d expirations, "
+              "%d workers", symbol, len(expirations), exp_workers)
+
+    frames: list[pd.DataFrame] = []
+
+    def _fetch_one(exp: date) -> pd.DataFrame:
+        return fetch_greeks_eod_raw_for_expiration(
+            symbol, exp, trade_date, timeout=timeout
+        )
+
+    with ThreadPoolExecutor(max_workers=exp_workers) as pool:
+        fut_to_exp = {pool.submit(_fetch_one, exp): exp for exp in expirations}
+        for fut in as_completed(fut_to_exp):
+            exp = fut_to_exp[fut]
+            try:
+                df = fut.result()
+                if not df.empty:
+                    frames.append(df)
+            except Exception as exc:
+                log.warning("  %s exp %s: current-day greeks fetch failed — %s",
+                            symbol, exp, exc)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
