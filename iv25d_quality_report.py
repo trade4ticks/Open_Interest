@@ -215,7 +215,15 @@ call_25d_brackets AS (
            iv_error      AS iv_error_hi
     FROM call_25d_cands WHERE rn = 1
 ),
--- Put 25d bracket: prev_delta <= -0.25 <= delta.
+-- Put 25d bracket: uses ABS(delta) to be robust to ThetaData's sign
+-- convention for puts.  Prior run produced put bracketability of ~0%
+-- everywhere while calls were 0.83-0.94 on the same chains — the
+-- signed predicate prev_delta <= -0.25 <= delta found no matches,
+-- which indicates the chain stores positive-magnitude put delta (i.e.,
+-- |delta|, not the standard signed convention).  Under ABS the put
+-- bracket is symmetric to the call: as strike increases, |delta|
+-- increases (OTM->ITM), so bracket = prev_abs <= 0.25 <= abs.  Works
+-- under either signed or unsigned upstream convention.
 put_25d_cands AS (
     SELECT trade_date, expiration,
            prev_strike, prev_delta, prev_iv_error,
@@ -226,8 +234,8 @@ put_25d_cands AS (
     FROM ranked
     WHERE option_type = 'P'
       AND prev_delta IS NOT NULL
-      AND prev_delta <= -0.25
-      AND delta      >= -0.25
+      AND ABS(prev_delta) <= 0.25
+      AND ABS(delta)      >= 0.25
 ),
 put_25d_brackets AS (
     SELECT trade_date, expiration,
@@ -521,14 +529,23 @@ def _dte_bucket(width: int) -> str:
 
 def _bracket_ok(slice_df: pd.DataFrame, side: str, exp_tag: str,
                 target: float, tol: float) -> pd.Series:
-    """Per-row boolean: bracket exists AND closer-side |delta - target| <= tol."""
+    """Per-row boolean: bracket exists AND closer-side |delta - target| <= tol.
+
+    Distances are measured in |delta| space so the test is sign-convention
+    agnostic for puts (the chain stores positive-magnitude put delta;
+    target is passed as +TARGET_DELTA for calls and -TARGET_DELTA for
+    puts; |stored_delta| vs |target| gives a clean magnitude compare in
+    either case).
+    """
     lo_col = f"{side}_{exp_tag}_delta_lo"
     hi_col = f"{side}_{exp_tag}_delta_hi"
     if lo_col not in slice_df.columns or hi_col not in slice_df.columns:
         return pd.Series(False, index=slice_df.index)
     lo = slice_df[lo_col]
     hi = slice_df[hi_col]
-    closer = pd.concat([(lo - target).abs(), (hi - target).abs()],
+    abs_target = abs(target)
+    closer = pd.concat([(lo.abs() - abs_target).abs(),
+                        (hi.abs() - abs_target).abs()],
                        axis=1).min(axis=1)
     return lo.notna() & hi.notna() & (closer <= tol)
 
