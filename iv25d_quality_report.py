@@ -74,6 +74,13 @@ IV_ERROR_THRESHOLDS     = [0.001, 0.005, 0.010]
 DTE_WIDTH_BUCKETS       = [(0, 7), (7, 15), (15, 30), (30, 9999)]
 LIQUIDITY_LOOKBACK_DAYS = 90
 
+# iv_error values >= this are treated as solver sentinels (the prior run
+# showed 100.0 leaking into a put_25d p99 percentile — clearly not a real
+# converged-IV residual).  Permissive threshold of 1.0: anything above
+# 100% solver error is junk.  Keep NULL iv_error rows so brackets aren't
+# dropped on contracts that simply lack the quality-of-fit field.
+IV_ERROR_SENTINEL_MAX   = 1.0
+
 OUTPUT_DIR  = Path("data/diagnostics")
 SLICE_FILE  = OUTPUT_DIR / "iv25d_quality_report.csv"
 DETAIL_FILE = OUTPUT_DIR / "iv25d_quality_report_detail.csv"
@@ -153,14 +160,19 @@ def bs_inverse_strike(spot: float, iv: float, dte_years: float,
 # released even on per-ticker errors; gc.collect() at the end for
 # belt-and-braces.
 
-_MEASURE_SQL = """
+_MEASURE_SQL = f"""
 WITH chain_clean AS (
-    -- Pre-filter: same gating the metric would apply.
+    -- Pre-filter: same gating the metric would apply, PLUS an iv_error
+    -- sentinel filter (>= IV_ERROR_SENTINEL_MAX = {IV_ERROR_SENTINEL_MAX}) to
+    -- drop solver-sentinel values like 100.0 that the prior run leaked
+    -- into the p99 percentile.  NULL iv_error is kept so brackets aren't
+    -- dropped on contracts that simply lack the quality-of-fit field.
     SELECT trade_date, expiration, strike, option_type, delta, iv_error,
            volume
     FROM chain_adj
     WHERE delta IS NOT NULL
       AND implied_vol IS NOT NULL AND implied_vol > 0
+      AND (iv_error IS NULL OR iv_error < {IV_ERROR_SENTINEL_MAX})
 ),
 ranked AS (
     -- LAG over strike-sorted rows within each (trade_date, expiration,
