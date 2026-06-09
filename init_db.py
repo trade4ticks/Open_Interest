@@ -20,6 +20,7 @@ FILES   = [
     "02_views.sql",
     "04_backtest.sql",
     "05_bin_tables.sql",
+    "06_25d_skew_metrics.sql",
 ]
 
 
