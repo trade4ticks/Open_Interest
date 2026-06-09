@@ -759,8 +759,10 @@ def fetch_greeks_eod_current_day(
     ThetaData rejects expiration=* for the current calendar date in ET with
     a 400 error.  This function works around that by:
       1. Enumerating expirations via /v3/option/list/expirations (fresh each
-         call — new expirations get listed over time; never use stale data).
-      2. Fetching each expiration individually via
+         call — new expirations get listed over time; never use stale data),
+         then filtering to exp >= trade_date so already-expired contracts
+         don't waste a per-expiration round-trip on a guaranteed NoData.
+      2. Fetching each remaining expiration individually via
          fetch_greeks_eod_raw_for_expiration, parallelised across exp_workers
          threads.
 
@@ -780,8 +782,18 @@ def fetch_greeks_eod_current_day(
                   "no current-day chain to fetch", symbol)
         return pd.DataFrame()
 
-    log.debug("  %s: current-day per-expiration fetch — %d expirations, "
-              "%d workers", symbol, len(expirations), exp_workers)
+    # Filter to exp >= trade_date.  /list/expirations returns the FULL
+    # historical set (e.g. AAPL: 793 total, ~768 expired) — without this
+    # filter the per-expiration fan-out spends ~97% of its calls on
+    # guaranteed-NoData round-trips for contracts that expired before
+    # today, dominating runtime.  Safe: anything currently listed has
+    # expiration >= trade_date by definition; a 0DTE contract
+    # (exp == trade_date) is retained by >=.
+    n_total = len(expirations)
+    expirations = [e for e in expirations if e >= trade_date]
+    log.debug("  %s: current-day per-expiration fetch — %d live (of %d "
+              "total), %d workers", symbol, len(expirations), n_total,
+              exp_workers)
 
     frames: list[pd.DataFrame] = []
 
