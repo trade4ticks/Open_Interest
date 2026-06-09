@@ -94,18 +94,43 @@ def bs_inverse_strike(spot: float, iv: float, dte_years: float,
     contain this target, that's a signal the snapshot delta diverges
     from BS theory.  NOT used as the metric's locator unless the
     divergence rate is high.
+
+    Returns None on ANY degenerate input — non-finite, non-positive,
+    or values that would overflow math.exp (e.g. an illiquid contract
+    reporting iv >> 1 making the BS exponent blow past ~709).  The
+    sanity-flag is secondary to the rest of the per-row measurement;
+    a single bad contract must NOT bubble up and lose the ticker's
+    entire iv_error / bracketability data.
     """
-    if spot is None or spot <= 0 or iv is None or iv <= 0 or dte_years <= 0:
+    # Reject None, NaN, Inf, and non-positive values up front — keeps
+    # math.sqrt/math.exp from raising on the easy cases.
+    if spot is None or iv is None or dte_years is None:
         return None
-    sigma_sqrt_t = iv * math.sqrt(dte_years)
-    drift = 0.5 * iv * iv * dte_years
-    if side == "call":
-        # N(d1) = 0.25 -> d1 = Z_25 (~-0.6745); K = S * exp(-Z_25 * sigma*sqrt(t) + drift).
-        return spot * math.exp(-_Z_25 * sigma_sqrt_t + drift)
-    elif side == "put":
-        # N(d1) = 0.75 -> d1 = -Z_25; K = S * exp(Z_25 * sigma*sqrt(t) + drift).
-        return spot * math.exp(_Z_25 * sigma_sqrt_t + drift)
-    raise ValueError(f"side must be 'call' or 'put'; got {side!r}")
+    if not (math.isfinite(spot) and math.isfinite(iv)
+            and math.isfinite(dte_years)):
+        return None
+    if spot <= 0 or iv <= 0 or dte_years <= 0:
+        return None
+    try:
+        sigma_sqrt_t = iv * math.sqrt(dte_years)
+        drift = 0.5 * iv * iv * dte_years
+        if side == "call":
+            # N(d1) = 0.25 -> d1 = Z_25 (~-0.6745); K = S * exp(-Z_25*sigma*sqrt(t) + drift).
+            exponent = -_Z_25 * sigma_sqrt_t + drift
+        elif side == "put":
+            # N(d1) = 0.75 -> d1 = -Z_25; K = S * exp(Z_25*sigma*sqrt(t) + drift).
+            exponent = _Z_25 * sigma_sqrt_t + drift
+        else:
+            raise ValueError(f"side must be 'call' or 'put'; got {side!r}")
+        # Final guard before math.exp: extreme exponents (large iv*sqrt(t)
+        # or huge drift) would overflow.  Cap at ~700 to stay inside
+        # double-precision range; anything beyond is a degenerate input
+        # whose sanity-flag isn't meaningful anyway.
+        if not math.isfinite(exponent) or exponent > 700 or exponent < -700:
+            return None
+        return spot * math.exp(exponent)
+    except (OverflowError, ValueError):
+        return None
 
 
 # ---- Bracket-finding (strike-sorted lists in, bracket pair out) ---------
