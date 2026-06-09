@@ -168,7 +168,7 @@ WITH chain_clean AS (
     -- into the p99 percentile.  NULL iv_error is kept so brackets aren't
     -- dropped on contracts that simply lack the quality-of-fit field.
     SELECT trade_date, expiration, strike, option_type, delta, iv_error,
-           volume
+           implied_vol, volume
     FROM chain_adj
     WHERE delta IS NOT NULL
       AND implied_vol IS NOT NULL AND implied_vol > 0
@@ -177,12 +177,16 @@ WITH chain_clean AS (
 ranked AS (
     -- LAG over strike-sorted rows within each (trade_date, expiration,
     -- option_type) gives us each row's "previous strike" neighbour, which
-    -- is what we need to detect adjacent strike-pair brackets.
+    -- is what we need to detect adjacent strike-pair brackets.  implied_vol
+    -- is carried + lagged so the BS-inverse sanity flag can use the bracket
+    -- strikes' LOCAL IV (smile-aware) rather than atm_iv_30d (flat-vol).
     SELECT
         trade_date, expiration, option_type, strike, delta, iv_error,
-        LAG(strike)   OVER w AS prev_strike,
-        LAG(delta)    OVER w AS prev_delta,
-        LAG(iv_error) OVER w AS prev_iv_error
+        implied_vol,
+        LAG(strike)      OVER w AS prev_strike,
+        LAG(delta)       OVER w AS prev_delta,
+        LAG(iv_error)    OVER w AS prev_iv_error,
+        LAG(implied_vol) OVER w AS prev_iv
     FROM chain_clean
     WINDOW w AS (
         PARTITION BY trade_date, expiration, option_type ORDER BY strike
@@ -194,8 +198,8 @@ ranked AS (
 -- for cases where stored delta is non-monotonic from snapshot noise.
 call_25d_cands AS (
     SELECT trade_date, expiration,
-           prev_strike, prev_delta, prev_iv_error,
-           strike, delta, iv_error,
+           prev_strike, prev_delta, prev_iv_error, prev_iv,
+           strike, delta, iv_error, implied_vol,
            ROW_NUMBER() OVER (
                PARTITION BY trade_date, expiration ORDER BY strike
            ) AS rn
@@ -210,9 +214,11 @@ call_25d_brackets AS (
            prev_strike   AS strike_lo,
            prev_delta    AS delta_lo,
            prev_iv_error AS iv_error_lo,
+           prev_iv       AS iv_lo,
            strike        AS strike_hi,
            delta         AS delta_hi,
-           iv_error      AS iv_error_hi
+           iv_error      AS iv_error_hi,
+           implied_vol   AS iv_hi
     FROM call_25d_cands WHERE rn = 1
 ),
 -- Put 25d bracket: uses ABS(delta) to be robust to ThetaData's sign
@@ -226,8 +232,8 @@ call_25d_brackets AS (
 -- under either signed or unsigned upstream convention.
 put_25d_cands AS (
     SELECT trade_date, expiration,
-           prev_strike, prev_delta, prev_iv_error,
-           strike, delta, iv_error,
+           prev_strike, prev_delta, prev_iv_error, prev_iv,
+           strike, delta, iv_error, implied_vol,
            ROW_NUMBER() OVER (
                PARTITION BY trade_date, expiration ORDER BY strike
            ) AS rn
@@ -242,9 +248,11 @@ put_25d_brackets AS (
            prev_strike   AS strike_lo,
            prev_delta    AS delta_lo,
            prev_iv_error AS iv_error_lo,
+           prev_iv       AS iv_lo,
            strike        AS strike_hi,
            delta         AS delta_hi,
-           iv_error      AS iv_error_hi
+           iv_error      AS iv_error_hi,
+           implied_vol   AS iv_hi
     FROM put_25d_cands WHERE rn = 1
 ),
 -- ATM bracket: calls only, prev_strike <= spot <= strike.  Needs the
@@ -307,34 +315,43 @@ SELECT
     (db.dte_upper - db.dte_lower)::INTEGER AS bracket_width_dte,
     s.spot_pc, s.atm_iv_30d,
     tv.total_vol,
-    -- Call 25d at exp_lower
+    -- Call 25d at exp_lower (iv_lo / iv_hi added for the smile-aware
+    -- BS sanity flag — local IVs at the bracket strikes, not atm_iv_30d)
     cbl.strike_lo   AS call_25d_lower_strike_lo,
     cbl.delta_lo    AS call_25d_lower_delta_lo,
     cbl.iv_error_lo AS call_25d_lower_iv_error_lo,
+    cbl.iv_lo       AS call_25d_lower_iv_lo,
     cbl.strike_hi   AS call_25d_lower_strike_hi,
     cbl.delta_hi    AS call_25d_lower_delta_hi,
     cbl.iv_error_hi AS call_25d_lower_iv_error_hi,
+    cbl.iv_hi       AS call_25d_lower_iv_hi,
     -- Call 25d at exp_upper
     cbu.strike_lo   AS call_25d_upper_strike_lo,
     cbu.delta_lo    AS call_25d_upper_delta_lo,
     cbu.iv_error_lo AS call_25d_upper_iv_error_lo,
+    cbu.iv_lo       AS call_25d_upper_iv_lo,
     cbu.strike_hi   AS call_25d_upper_strike_hi,
     cbu.delta_hi    AS call_25d_upper_delta_hi,
     cbu.iv_error_hi AS call_25d_upper_iv_error_hi,
+    cbu.iv_hi       AS call_25d_upper_iv_hi,
     -- Put 25d at exp_lower
     pbl.strike_lo   AS put_25d_lower_strike_lo,
     pbl.delta_lo    AS put_25d_lower_delta_lo,
     pbl.iv_error_lo AS put_25d_lower_iv_error_lo,
+    pbl.iv_lo       AS put_25d_lower_iv_lo,
     pbl.strike_hi   AS put_25d_lower_strike_hi,
     pbl.delta_hi    AS put_25d_lower_delta_hi,
     pbl.iv_error_hi AS put_25d_lower_iv_error_hi,
+    pbl.iv_hi       AS put_25d_lower_iv_hi,
     -- Put 25d at exp_upper
     pbu.strike_lo   AS put_25d_upper_strike_lo,
     pbu.delta_lo    AS put_25d_upper_delta_lo,
     pbu.iv_error_lo AS put_25d_upper_iv_error_lo,
+    pbu.iv_lo       AS put_25d_upper_iv_lo,
     pbu.strike_hi   AS put_25d_upper_strike_hi,
     pbu.delta_hi    AS put_25d_upper_delta_hi,
     pbu.iv_error_hi AS put_25d_upper_iv_error_hi,
+    pbu.iv_hi       AS put_25d_upper_iv_hi,
     -- ATM at exp_lower / exp_upper (iv_error only — strike/delta not needed
     -- for the report; only iv_error is consumed for the ATM-vs-25d compare)
     abl.iv_error_lo AS atm_lower_iv_error_lo,
@@ -431,26 +448,50 @@ def measure_ticker(pg_conn, ticker: str) -> pd.DataFrame:
     result.insert(0, "ticker", ticker)
     result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.date
 
-    # BS-inverse sanity flag — compute in Python (the formula needs scipy
-    # and the call is now per-row scalars, no list iteration).  Per-row
-    # cost is ~10us so this is negligible vs the SQL pass.
+    # BS-inverse sanity flag — uses LOCAL IV at the bracket strikes
+    # (average of iv_lo and iv_hi) as sigma, NOT atm_iv_30d.
+    #
+    # Prior version used atm_iv_30d (a flat-vol assumption), which
+    # produced 12-33% agreement on call-side brackets — far below the
+    # >90% expected for "stored delta is reliable."  Hand-checked the
+    # formula; it was correct.  The disagreement was the flat-vol BS
+    # locator versus the smile-aware stored delta: at, say, SPY $500 /
+    # 30 DTE / 20% ATM vol, BS gives K=520.57 for 25-delta call, but
+    # the actual market 25-delta call sits at K=518.40 if the local
+    # 25-delta-call IV is 18% (typical SPX skew).  Off by ~$2, often
+    # outside the 1-strike bracket.  Disagreement reflected the smile,
+    # not bad delta.
+    #
+    # Using local IV from the bracket strikes makes the test
+    # apples-to-apples: a correctly-located bracket should have
+    # K_bs(local_iv) inside [strike_lo, strike_hi].  Genuine
+    # disagreement now signals stored-delta-vs-stored-IV inconsistency
+    # within the contract (solver returned mismatched values), which is
+    # the real flag we want.
     for side_tag in ("call_25d", "put_25d"):
         side = "call" if side_tag.startswith("call") else "put"
         for exp_tag in ("lower", "upper"):
             agree_col = f"{side_tag}_{exp_tag}_bs_agree"
             slo_col   = f"{side_tag}_{exp_tag}_strike_lo"
             shi_col   = f"{side_tag}_{exp_tag}_strike_hi"
+            iv_lo_col = f"{side_tag}_{exp_tag}_iv_lo"
+            iv_hi_col = f"{side_tag}_{exp_tag}_iv_hi"
             dte_col   = f"dte_{exp_tag}"
             agree_vals: list = []
             for _, r in result.iterrows():
-                spot, atm, dte = r["spot_pc"], r["atm_iv_30d"], r[dte_col]
-                slo, shi       = r[slo_col],   r[shi_col]
-                if (pd.isna(spot) or pd.isna(atm) or pd.isna(dte)
-                        or pd.isna(slo) or pd.isna(shi)):
+                spot, dte = r["spot_pc"], r[dte_col]
+                slo, shi  = r[slo_col],  r[shi_col]
+                iv_lo, iv_hi = r[iv_lo_col], r[iv_hi_col]
+                if (pd.isna(spot) or pd.isna(dte) or pd.isna(slo)
+                        or pd.isna(shi) or pd.isna(iv_lo) or pd.isna(iv_hi)):
                     agree_vals.append(None)
                     continue
+                # Local IV at the bracket = average of the two strikes'
+                # implied vols.  Linear in delta is a first-order
+                # approximation; sufficient for a sanity flag.
+                local_iv = (float(iv_lo) + float(iv_hi)) / 2.0
                 bs_k = bs_inverse_strike(
-                    float(spot), float(atm), float(dte) / 365.0, side,
+                    float(spot), local_iv, float(dte) / 365.0, side,
                 )
                 agree_vals.append(
                     None if bs_k is None else bool(slo <= bs_k <= shi)
