@@ -722,9 +722,17 @@ JOIN zscores z USING (trade_date)
 # This is a deliberate change from the legacy Python (_atm_iv_for_expiration)
 # which returned the nearest-strike IV — that fallback masked the split bug.
 #
-# iv_25d_* / rr / bf / skew columns remain NULL pending a future 15:45
-# endpoint migration (see test_iv_endpoint.py); EOD greeks are not trusted
-# in the wings.
+# iv_25d_* / rr / bf / skew columns are populated from the EOD greeks
+# chain (chain_adj) using stored chain delta as the strike locator:
+# adjacent strikes bracket +/-0.25 delta; linear-in-delta interpolation at
+# 0.25 gives the per-expiration 25d IV; linear-in-DTE interpolation across
+# exp_lower (max DTE <= target) and exp_upper (min DTE > target) gives the
+# tenored value.  Tenors: 7d (uses atm_iv_7d as the ATM body for bf / skew)
+# and 30d (uses atm_iv_30d).  No nearest-neighbour fallback — NULL when
+# bracketing strikes or expirations are absent (consistent with atm_iv).
+# Puts use ABS(delta) so the locator is robust to whether the chain stores
+# signed [-1,0] or unsigned [0,1] put delta (vendor stores positive
+# magnitude, confirmed via iv25d_quality_report diagnostic).
 # ---------------------------------------------------------------------------
 IV_FEATURES_SQL = """
 WITH calls AS (
@@ -826,18 +834,177 @@ atm_pivoted AS (
     FROM atm_by_dte
     GROUP BY feature_date
 ),
+
+-- ============================================================
+-- 25-delta CALL path: bracket-by-delta in strike, then
+-- bracket-by-DTE across expirations.  Targets 7 and 30 days.
+-- Calls only — call delta is non-increasing in strike.
+-- ============================================================
+calls_for_delta AS (
+    SELECT trade_date, feature_date, expiration, strike, implied_vol, delta
+    FROM chain_adj
+    WHERE option_type = 'C'
+      AND implied_vol > 0
+      AND delta IS NOT NULL
+      AND ABS(delta) <= 1.0
+),
+call_25d_strike_brackets AS (
+    -- s_lo (lower strike, higher delta) = highest strike where delta >= 0.25
+    -- s_hi (higher strike, lower delta) = lowest strike where delta <= 0.25
+    SELECT feature_date, expiration,
+           ANY_VALUE((expiration - trade_date)::INTEGER) AS exp_dte,
+           MAX(strike) FILTER (WHERE delta >= 0.25) AS s_lo,
+           MIN(strike) FILTER (WHERE delta <= 0.25) AS s_hi
+    FROM calls_for_delta
+    GROUP BY feature_date, expiration
+),
+call_25d_strike_brackets_iv AS (
+    SELECT sb.feature_date, sb.expiration, sb.exp_dte, sb.s_lo, sb.s_hi,
+           cl.implied_vol AS iv_lo, cl.delta AS delta_lo,
+           ch.implied_vol AS iv_hi, ch.delta AS delta_hi
+    FROM call_25d_strike_brackets sb
+    LEFT JOIN calls_for_delta cl
+      ON cl.feature_date = sb.feature_date AND cl.expiration = sb.expiration AND cl.strike = sb.s_lo
+    LEFT JOIN calls_for_delta ch
+      ON ch.feature_date = sb.feature_date AND ch.expiration = sb.expiration AND ch.strike = sb.s_hi
+),
+call_25d_per_exp AS (
+    -- Linear-in-delta at target delta = 0.25.  NULL when bracketing strikes
+    -- missing (no nearest-neighbour fallback — same convention as atm_iv).
+    SELECT feature_date, expiration, exp_dte,
+           CASE WHEN s_lo IS NULL OR s_hi IS NULL                THEN NULL
+                WHEN delta_lo IS NULL OR delta_hi IS NULL        THEN NULL
+                WHEN delta_lo = delta_hi                          THEN iv_lo
+                ELSE iv_lo + (iv_hi - iv_lo) * (0.25 - delta_lo) / (delta_hi - delta_lo)
+           END AS iv_25d_call
+    FROM call_25d_strike_brackets_iv
+),
+delta_targets AS (
+    SELECT * FROM (VALUES (7), (30)) AS t(target_dte)
+),
+call_25d_exp_brackets AS (
+    SELECT cpe.feature_date, t.target_dte,
+           MAX(cpe.exp_dte) FILTER (WHERE cpe.exp_dte <= t.target_dte) AS d_lo,
+           MIN(cpe.exp_dte) FILTER (WHERE cpe.exp_dte >  t.target_dte) AS d_hi
+    FROM call_25d_per_exp cpe CROSS JOIN delta_targets t
+    WHERE cpe.iv_25d_call IS NOT NULL
+    GROUP BY cpe.feature_date, t.target_dte
+),
+call_25d_exp_brackets_iv AS (
+    SELECT eb.feature_date, eb.target_dte, eb.d_lo, eb.d_hi,
+           cl.iv_25d_call AS iv_lo, ch.iv_25d_call AS iv_hi
+    FROM call_25d_exp_brackets eb
+    LEFT JOIN call_25d_per_exp cl ON cl.feature_date = eb.feature_date AND cl.exp_dte = eb.d_lo
+    LEFT JOIN call_25d_per_exp ch ON ch.feature_date = eb.feature_date AND ch.exp_dte = eb.d_hi
+),
+call_25d_by_dte AS (
+    SELECT feature_date, target_dte,
+           CASE WHEN d_lo IS NULL OR d_hi IS NULL THEN NULL
+                WHEN d_lo = d_hi                  THEN iv_lo
+                ELSE iv_lo + (iv_hi - iv_lo) * (target_dte - d_lo) / (d_hi - d_lo) END
+             AS iv_25d_call_value
+    FROM call_25d_exp_brackets_iv
+),
+call_25d_pivoted AS (
+    SELECT feature_date AS trade_date,
+           MAX(iv_25d_call_value) FILTER (WHERE target_dte =  7) AS iv_25d_call_7d,
+           MAX(iv_25d_call_value) FILTER (WHERE target_dte = 30) AS iv_25d_call_30d
+    FROM call_25d_by_dte
+    GROUP BY feature_date
+),
+
+-- ============================================================
+-- 25-delta PUT path: same shape, on |delta|.
+-- Puts only — |put_delta| is non-decreasing in strike (OTM low
+-- strike = small |delta|; ITM high strike = large |delta|).
+-- ============================================================
+puts_for_delta AS (
+    SELECT trade_date, feature_date, expiration, strike, implied_vol,
+           ABS(delta) AS abs_delta
+    FROM chain_adj
+    WHERE option_type = 'P'
+      AND implied_vol > 0
+      AND delta IS NOT NULL
+      AND ABS(delta) <= 1.0
+),
+put_25d_strike_brackets AS (
+    -- s_lo (lower strike, smaller |delta|) = highest strike where |delta| <= 0.25
+    -- s_hi (higher strike, larger |delta|) = lowest strike where |delta| >= 0.25
+    SELECT feature_date, expiration,
+           ANY_VALUE((expiration - trade_date)::INTEGER) AS exp_dte,
+           MAX(strike) FILTER (WHERE abs_delta <= 0.25) AS s_lo,
+           MIN(strike) FILTER (WHERE abs_delta >= 0.25) AS s_hi
+    FROM puts_for_delta
+    GROUP BY feature_date, expiration
+),
+put_25d_strike_brackets_iv AS (
+    SELECT sb.feature_date, sb.expiration, sb.exp_dte, sb.s_lo, sb.s_hi,
+           pl.implied_vol AS iv_lo, pl.abs_delta AS abs_delta_lo,
+           ph.implied_vol AS iv_hi, ph.abs_delta AS abs_delta_hi
+    FROM put_25d_strike_brackets sb
+    LEFT JOIN puts_for_delta pl
+      ON pl.feature_date = sb.feature_date AND pl.expiration = sb.expiration AND pl.strike = sb.s_lo
+    LEFT JOIN puts_for_delta ph
+      ON ph.feature_date = sb.feature_date AND ph.expiration = sb.expiration AND ph.strike = sb.s_hi
+),
+put_25d_per_exp AS (
+    SELECT feature_date, expiration, exp_dte,
+           CASE WHEN s_lo IS NULL OR s_hi IS NULL                       THEN NULL
+                WHEN abs_delta_lo IS NULL OR abs_delta_hi IS NULL       THEN NULL
+                WHEN abs_delta_lo = abs_delta_hi                         THEN iv_lo
+                ELSE iv_lo + (iv_hi - iv_lo) * (0.25 - abs_delta_lo)
+                                                / (abs_delta_hi - abs_delta_lo)
+           END AS iv_25d_put
+    FROM put_25d_strike_brackets_iv
+),
+put_25d_exp_brackets AS (
+    SELECT ppe.feature_date, t.target_dte,
+           MAX(ppe.exp_dte) FILTER (WHERE ppe.exp_dte <= t.target_dte) AS d_lo,
+           MIN(ppe.exp_dte) FILTER (WHERE ppe.exp_dte >  t.target_dte) AS d_hi
+    FROM put_25d_per_exp ppe CROSS JOIN delta_targets t
+    WHERE ppe.iv_25d_put IS NOT NULL
+    GROUP BY ppe.feature_date, t.target_dte
+),
+put_25d_exp_brackets_iv AS (
+    SELECT eb.feature_date, eb.target_dte, eb.d_lo, eb.d_hi,
+           pl.iv_25d_put AS iv_lo, ph.iv_25d_put AS iv_hi
+    FROM put_25d_exp_brackets eb
+    LEFT JOIN put_25d_per_exp pl ON pl.feature_date = eb.feature_date AND pl.exp_dte = eb.d_lo
+    LEFT JOIN put_25d_per_exp ph ON ph.feature_date = eb.feature_date AND ph.exp_dte = eb.d_hi
+),
+put_25d_by_dte AS (
+    SELECT feature_date, target_dte,
+           CASE WHEN d_lo IS NULL OR d_hi IS NULL THEN NULL
+                WHEN d_lo = d_hi                  THEN iv_lo
+                ELSE iv_lo + (iv_hi - iv_lo) * (target_dte - d_lo) / (d_hi - d_lo) END
+             AS iv_25d_put_value
+    FROM put_25d_exp_brackets_iv
+),
+put_25d_pivoted AS (
+    SELECT feature_date AS trade_date,
+           MAX(iv_25d_put_value) FILTER (WHERE target_dte =  7) AS iv_25d_put_7d,
+           MAX(iv_25d_put_value) FILTER (WHERE target_dte = 30) AS iv_25d_put_30d
+    FROM put_25d_by_dte
+    GROUP BY feature_date
+),
 iv_joined AS (
-    -- Match the column shape the downstream `derived` CTE expects.
+    -- 25d call/put columns now consume call_25d_pivoted / put_25d_pivoted
+    -- (was CAST(NULL AS DOUBLE) placeholders before the 25d skew enable).
+    -- Both 7d (new) and 30d (formerly dormant) tenors land here.
     SELECT
         a.trade_date,
         a.atm_iv_7d,
         a.atm_iv_30d,
         a.atm_iv_90d,
-        CAST(NULL AS DOUBLE) AS iv_25d_call_30d,
-        CAST(NULL AS DOUBLE) AS iv_25d_put_30d,
+        c.iv_25d_call_7d,
+        c.iv_25d_call_30d,
+        p.iv_25d_put_7d,
+        p.iv_25d_put_30d,
         f.rv_20d
     FROM atm_pivoted a
-    LEFT JOIN base_feats f ON a.trade_date = f.trade_date
+    LEFT JOIN call_25d_pivoted c ON a.trade_date = c.trade_date
+    LEFT JOIN put_25d_pivoted  p ON a.trade_date = p.trade_date
+    LEFT JOIN base_feats       f ON a.trade_date = f.trade_date
 ),
 derived AS (
     SELECT
@@ -845,11 +1012,21 @@ derived AS (
         atm_iv_7d,
         atm_iv_30d,
         atm_iv_90d,
+        iv_25d_call_7d,
         iv_25d_call_30d,
+        iv_25d_put_7d,
         iv_25d_put_30d,
         rv_20d,
+        -- 7d skew derivatives (NEW — bf and skew_* use atm_iv_7d as the
+        -- tenor-matched ATM body; rr is body-independent).
+        iv_25d_call_7d - iv_25d_put_7d                                  AS rr_25d_7d,
+        0.5 * (iv_25d_call_7d + iv_25d_put_7d) - atm_iv_7d              AS bf_25d_7d,
+        iv_25d_put_7d  - atm_iv_7d                                      AS skew_25p_atm_7d,
+        atm_iv_7d      - iv_25d_call_7d                                 AS skew_atm_25c_7d,
+        -- 30d skew derivatives (formerly NULL inputs -> NULL outputs; now
+        -- real values land since iv_25d_call/put_30d are populated).
         iv_25d_call_30d - iv_25d_put_30d                                AS rr_25d_30d,
-        0.5 * (iv_25d_call_30d + iv_25d_put_30d) - atm_iv_30d          AS bf_25d_30d,
+        0.5 * (iv_25d_call_30d + iv_25d_put_30d) - atm_iv_30d           AS bf_25d_30d,
         iv_25d_put_30d - atm_iv_30d                                     AS skew_25p_atm_30d,
         atm_iv_30d - iv_25d_call_30d                                    AS skew_atm_25c_30d,
         atm_iv_7d  - atm_iv_30d                                         AS term_7d_30d,
@@ -877,6 +1054,10 @@ zscores AS (
              THEN (atm_iv_90d - AVG(atm_iv_90d) OVER w60)
                   / NULLIF(STDDEV_SAMP(atm_iv_90d) OVER w60, 0)
              ELSE NULL END                                              AS zscore_iv_90d,
+        CASE WHEN COUNT(rr_25d_7d) OVER w60 >= 60
+             THEN (rr_25d_7d - AVG(rr_25d_7d) OVER w60)
+                  / NULLIF(STDDEV_SAMP(rr_25d_7d) OVER w60, 0)
+             ELSE NULL END                                              AS zscore_rr_25d_7d,
         CASE WHEN COUNT(rr_25d_30d) OVER w60 >= 60
              THEN (rr_25d_30d - AVG(rr_25d_30d) OVER w60)
                   / NULLIF(STDDEV_SAMP(rr_25d_30d) OVER w60, 0)
@@ -903,7 +1084,10 @@ zscores AS (
 SELECT
     d.trade_date,
     d.atm_iv_7d, d.atm_iv_30d, d.atm_iv_90d,
+    d.iv_25d_call_7d,  d.iv_25d_put_7d,
     d.iv_25d_call_30d, d.iv_25d_put_30d,
+    d.rr_25d_7d,  d.bf_25d_7d,
+    d.skew_25p_atm_7d,  d.skew_atm_25c_7d,
     d.rr_25d_30d, d.bf_25d_30d,
     d.skew_25p_atm_30d, d.skew_atm_25c_30d,
     d.term_7d_30d, d.term_30d_90d,
@@ -911,7 +1095,7 @@ SELECT
     d.d1_atm_iv_7d_change, d.d5_atm_iv_7d_change,
     d.d1_atm_iv_30d_change, d.d5_atm_iv_30d_change,
     z.zscore_iv_7d, z.zscore_iv_30d, z.zscore_iv_90d,
-    z.zscore_rr_25d_30d,
+    z.zscore_rr_25d_7d, z.zscore_rr_25d_30d,
     z.zscore_term_7d_30d, z.zscore_term_30d_90d,
     z.zscore_vrp_30d, z.zscore_iv_rv_ratio_30d
 FROM derived d
@@ -1057,7 +1241,11 @@ EVENING_COLS = [
     "zscore_vol_above_below_ratio_pc",
     # Bucket 3: IV chain (15:45 snapshot)
     "atm_iv_7d", "atm_iv_30d", "atm_iv_90d",
+    # 25-delta skew — 7d (new) and 30d (formerly NULL, now populated).
+    "iv_25d_call_7d",  "iv_25d_put_7d",
     "iv_25d_call_30d", "iv_25d_put_30d",
+    "rr_25d_7d",  "bf_25d_7d",
+    "skew_25p_atm_7d",  "skew_atm_25c_7d",
     "rr_25d_30d", "bf_25d_30d",
     "skew_25p_atm_30d", "skew_atm_25c_30d",
     "term_7d_30d", "term_30d_90d",
@@ -1065,7 +1253,7 @@ EVENING_COLS = [
     "d1_atm_iv_7d_change", "d5_atm_iv_7d_change",
     "d1_atm_iv_30d_change", "d5_atm_iv_30d_change",
     "zscore_iv_7d", "zscore_iv_30d", "zscore_iv_90d",
-    "zscore_rr_25d_30d",
+    "zscore_rr_25d_7d", "zscore_rr_25d_30d",
     "zscore_term_7d_30d", "zscore_term_30d_90d",
     "zscore_vrp_30d", "zscore_iv_rv_ratio_30d",
 ]
