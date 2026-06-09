@@ -41,6 +41,7 @@ no feature tables, no metric_classification flags, no parquet stores.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import time
@@ -133,74 +134,220 @@ def bs_inverse_strike(spot: float, iv: float, dte_years: float,
         return None
 
 
-# ---- Bracket-finding (strike-sorted lists in, bracket pair out) ---------
-
-def find_delta_bracket(strikes: list[float], deltas: list[float],
-                       iv_errors: list[float], target: float
-                       ) -> dict | None:
-    """Adjacent strike pair where delta crosses `target`.
-
-    target > 0 (call side): delta is non-increasing in strike (ITM=high
-    delta, OTM=low delta), so look for delta_lo >= target >= delta_hi.
-    target < 0 (put side): delta is non-decreasing in strike (ITM=-1,
-    OTM=0), so look for delta_lo <= target <= delta_hi.
-    Strikes/deltas/iv_errors must be sorted ascending by strike.
-    """
-    n = len(strikes)
-    if n < 2:
-        return None
-    if target > 0:
-        for i in range(n - 1):
-            if deltas[i] is None or deltas[i + 1] is None:
-                continue
-            if deltas[i] >= target >= deltas[i + 1]:
-                return _pack_bracket(strikes, deltas, iv_errors, i)
-    else:
-        for i in range(n - 1):
-            if deltas[i] is None or deltas[i + 1] is None:
-                continue
-            if deltas[i] <= target <= deltas[i + 1]:
-                return _pack_bracket(strikes, deltas, iv_errors, i)
-    return None
-
-
-def find_atm_bracket(strikes: list[float], deltas: list[float],
-                     iv_errors: list[float], spot: float) -> dict | None:
-    """Adjacent strike pair bracketing `spot` (used for ATM iv_error
-    comparison; matches build_features.py's atm_iv_* convention: calls
-    only, two strikes around spot, linear interp).
-    """
-    if spot is None or spot <= 0 or len(strikes) < 2:
-        return None
-    for i in range(len(strikes) - 1):
-        if strikes[i] <= spot <= strikes[i + 1]:
-            return _pack_bracket(strikes, deltas, iv_errors, i)
-    return None
-
-
-def _pack_bracket(strikes, deltas, iv_errors, i) -> dict:
-    return {
-        "strike_lo":   strikes[i],
-        "delta_lo":    deltas[i],
-        "iv_error_lo": iv_errors[i],
-        "strike_hi":   strikes[i + 1],
-        "delta_hi":    deltas[i + 1],
-        "iv_error_hi": iv_errors[i + 1],
-    }
-
-
 # ---- Per-ticker measurement --------------------------------------------
+#
+# Memory-discipline note (why the loop body looks like this):
+#
+# The prior implementation used DuckDB LIST(... ORDER BY strike) aggregates
+# to build per-(date, expiration, option_type) strike arrays in pandas, then
+# Python-looped to find brackets.  For a long-history ticker with many
+# expirations, that materialised hundreds of millions of Python float
+# objects in object-dtype columns — gigabytes per ticker, and CPython's
+# allocator doesn't return freed memory to the OS, so RSS climbed
+# monotonically until the 7.8GB VPS ceiling crashed the run at IONQ.
+#
+# The fix is structural: do the bracket-finding INSIDE DuckDB via window
+# functions and return ONLY the scalar bracket result (one row per
+# trade_date with ~50 scalar columns, ~2 MB per ticker).  No LIST columns
+# ever leave SQL.  Connection closed in try/finally so memory pool is
+# released even on per-ticker errors; gc.collect() at the end for
+# belt-and-braces.
+
+_MEASURE_SQL = """
+WITH chain_clean AS (
+    -- Pre-filter: same gating the metric would apply.
+    SELECT trade_date, expiration, strike, option_type, delta, iv_error,
+           volume
+    FROM chain_adj
+    WHERE delta IS NOT NULL
+      AND implied_vol IS NOT NULL AND implied_vol > 0
+),
+ranked AS (
+    -- LAG over strike-sorted rows within each (trade_date, expiration,
+    -- option_type) gives us each row's "previous strike" neighbour, which
+    -- is what we need to detect adjacent strike-pair brackets.
+    SELECT
+        trade_date, expiration, option_type, strike, delta, iv_error,
+        LAG(strike)   OVER w AS prev_strike,
+        LAG(delta)    OVER w AS prev_delta,
+        LAG(iv_error) OVER w AS prev_iv_error
+    FROM chain_clean
+    WINDOW w AS (
+        PARTITION BY trade_date, expiration, option_type ORDER BY strike
+    )
+),
+-- Call 25d bracket: adjacent strike pair with prev_delta >= 0.25 >= delta.
+-- ROW_NUMBER + WHERE rn=1 keeps the FIRST such pair (lowest strike) per
+-- (trade_date, expiration), matching the prior Python find_first behaviour
+-- for cases where stored delta is non-monotonic from snapshot noise.
+call_25d_cands AS (
+    SELECT trade_date, expiration,
+           prev_strike, prev_delta, prev_iv_error,
+           strike, delta, iv_error,
+           ROW_NUMBER() OVER (
+               PARTITION BY trade_date, expiration ORDER BY strike
+           ) AS rn
+    FROM ranked
+    WHERE option_type = 'C'
+      AND prev_delta IS NOT NULL
+      AND prev_delta >= 0.25
+      AND delta      <= 0.25
+),
+call_25d_brackets AS (
+    SELECT trade_date, expiration,
+           prev_strike   AS strike_lo,
+           prev_delta    AS delta_lo,
+           prev_iv_error AS iv_error_lo,
+           strike        AS strike_hi,
+           delta         AS delta_hi,
+           iv_error      AS iv_error_hi
+    FROM call_25d_cands WHERE rn = 1
+),
+-- Put 25d bracket: prev_delta <= -0.25 <= delta.
+put_25d_cands AS (
+    SELECT trade_date, expiration,
+           prev_strike, prev_delta, prev_iv_error,
+           strike, delta, iv_error,
+           ROW_NUMBER() OVER (
+               PARTITION BY trade_date, expiration ORDER BY strike
+           ) AS rn
+    FROM ranked
+    WHERE option_type = 'P'
+      AND prev_delta IS NOT NULL
+      AND prev_delta <= -0.25
+      AND delta      >= -0.25
+),
+put_25d_brackets AS (
+    SELECT trade_date, expiration,
+           prev_strike   AS strike_lo,
+           prev_delta    AS delta_lo,
+           prev_iv_error AS iv_error_lo,
+           strike        AS strike_hi,
+           delta         AS delta_hi,
+           iv_error      AS iv_error_hi
+    FROM put_25d_cands WHERE rn = 1
+),
+-- ATM bracket: calls only, prev_strike <= spot <= strike.  Needs the
+-- spots view registered by the caller.
+atm_cands AS (
+    SELECT r.trade_date, r.expiration,
+           r.prev_strike, r.prev_iv_error,
+           r.strike, r.iv_error,
+           ROW_NUMBER() OVER (
+               PARTITION BY r.trade_date, r.expiration ORDER BY r.strike
+           ) AS rn
+    FROM ranked r
+    JOIN spots s ON r.trade_date = s.trade_date
+    WHERE r.option_type = 'C'
+      AND r.prev_strike IS NOT NULL
+      AND r.prev_strike <= s.spot_pc
+      AND r.strike      >= s.spot_pc
+),
+atm_brackets AS (
+    SELECT trade_date, expiration,
+           prev_iv_error AS iv_error_lo,
+           iv_error      AS iv_error_hi
+    FROM atm_cands WHERE rn = 1
+),
+-- DTE per (trade_date, expiration) — DISTINCT so each expiration counted once.
+exp_dte AS (
+    SELECT DISTINCT trade_date, expiration,
+           (expiration - trade_date)::INTEGER AS dte
+    FROM chain_clean
+),
+-- exp_lower = max DTE <= 30 per trade_date; exp_upper = min DTE > 30.
+-- Both must exist for the row to be emitted (mirrors the metric's
+-- no-nearest-neighbour-fallback convention).
+exp_lower_ranked AS (
+    SELECT trade_date, expiration AS exp_lower, dte AS dte_lower,
+           ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY dte DESC) AS rn
+    FROM exp_dte WHERE dte <= 30
+),
+exp_upper_ranked AS (
+    SELECT trade_date, expiration AS exp_upper, dte AS dte_upper,
+           ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY dte ASC) AS rn
+    FROM exp_dte WHERE dte > 30
+),
+dte_brackets AS (
+    SELECT l.trade_date, l.exp_lower, l.dte_lower,
+           u.exp_upper, u.dte_upper
+    FROM exp_lower_ranked l
+    JOIN exp_upper_ranked u ON l.trade_date = u.trade_date
+    WHERE l.rn = 1 AND u.rn = 1
+),
+total_vol AS (
+    SELECT trade_date, SUM(volume)::DOUBLE AS total_vol
+    FROM chain_adj
+    GROUP BY trade_date
+)
+SELECT
+    db.trade_date,
+    db.exp_lower, db.dte_lower,
+    db.exp_upper, db.dte_upper,
+    (db.dte_upper - db.dte_lower)::INTEGER AS bracket_width_dte,
+    s.spot_pc, s.atm_iv_30d,
+    tv.total_vol,
+    -- Call 25d at exp_lower
+    cbl.strike_lo   AS call_25d_lower_strike_lo,
+    cbl.delta_lo    AS call_25d_lower_delta_lo,
+    cbl.iv_error_lo AS call_25d_lower_iv_error_lo,
+    cbl.strike_hi   AS call_25d_lower_strike_hi,
+    cbl.delta_hi    AS call_25d_lower_delta_hi,
+    cbl.iv_error_hi AS call_25d_lower_iv_error_hi,
+    -- Call 25d at exp_upper
+    cbu.strike_lo   AS call_25d_upper_strike_lo,
+    cbu.delta_lo    AS call_25d_upper_delta_lo,
+    cbu.iv_error_lo AS call_25d_upper_iv_error_lo,
+    cbu.strike_hi   AS call_25d_upper_strike_hi,
+    cbu.delta_hi    AS call_25d_upper_delta_hi,
+    cbu.iv_error_hi AS call_25d_upper_iv_error_hi,
+    -- Put 25d at exp_lower
+    pbl.strike_lo   AS put_25d_lower_strike_lo,
+    pbl.delta_lo    AS put_25d_lower_delta_lo,
+    pbl.iv_error_lo AS put_25d_lower_iv_error_lo,
+    pbl.strike_hi   AS put_25d_lower_strike_hi,
+    pbl.delta_hi    AS put_25d_lower_delta_hi,
+    pbl.iv_error_hi AS put_25d_lower_iv_error_hi,
+    -- Put 25d at exp_upper
+    pbu.strike_lo   AS put_25d_upper_strike_lo,
+    pbu.delta_lo    AS put_25d_upper_delta_lo,
+    pbu.iv_error_lo AS put_25d_upper_iv_error_lo,
+    pbu.strike_hi   AS put_25d_upper_strike_hi,
+    pbu.delta_hi    AS put_25d_upper_delta_hi,
+    pbu.iv_error_hi AS put_25d_upper_iv_error_hi,
+    -- ATM at exp_lower / exp_upper (iv_error only — strike/delta not needed
+    -- for the report; only iv_error is consumed for the ATM-vs-25d compare)
+    abl.iv_error_lo AS atm_lower_iv_error_lo,
+    abl.iv_error_hi AS atm_lower_iv_error_hi,
+    abu.iv_error_lo AS atm_upper_iv_error_lo,
+    abu.iv_error_hi AS atm_upper_iv_error_hi
+FROM dte_brackets db
+LEFT JOIN spots             s   ON db.trade_date = s.trade_date
+LEFT JOIN total_vol         tv  ON db.trade_date = tv.trade_date
+LEFT JOIN call_25d_brackets cbl ON db.trade_date = cbl.trade_date AND db.exp_lower = cbl.expiration
+LEFT JOIN call_25d_brackets cbu ON db.trade_date = cbu.trade_date AND db.exp_upper = cbu.expiration
+LEFT JOIN put_25d_brackets  pbl ON db.trade_date = pbl.trade_date AND db.exp_lower = pbl.expiration
+LEFT JOIN put_25d_brackets  pbu ON db.trade_date = pbu.trade_date AND db.exp_upper = pbu.expiration
+LEFT JOIN atm_brackets      abl ON db.trade_date = abl.trade_date AND db.exp_lower = abl.expiration
+LEFT JOIN atm_brackets      abu ON db.trade_date = abu.trade_date AND db.exp_upper = abu.expiration
+ORDER BY db.trade_date
+"""
+
 
 def measure_ticker(pg_conn, ticker: str) -> pd.DataFrame:
     """Return one row per (trade_date) carrying all bracket measurements
     + iv_errors + BS sanity flags + total_vol for tier assignment.
     Empty DataFrame if no chain_eod data, no daily_features data, or no
     measurable (date, expiration) combinations.
+
+    Memory: the result set is one row per trade_date with ~50 scalar
+    columns (~2 MB per long-history ticker).  The connection's memory
+    pool is released in the finally block; LIST columns are never
+    materialised in Python.
     """
     if not chain_has_data(ticker):
         return pd.DataFrame()
 
-    # spot_pc + atm_iv_30d (BS-inverse needs both).
     df_spots = read_sql_df(
         pg_conn,
         "SELECT trade_date, spot_pc, atm_iv_30d FROM daily_features "
@@ -210,157 +357,91 @@ def measure_ticker(pg_conn, ticker: str) -> pd.DataFrame:
     if df_spots.empty:
         return pd.DataFrame()
     df_spots["trade_date"] = pd.to_datetime(df_spots["trade_date"]).dt.date
-    spots = df_spots.set_index("trade_date")
 
     splits_df = load_splits(pg_conn, ticker)
 
     con = duckdb.connect(database=":memory:")
+    try:
+        chain_dates = con.execute(
+            f"SELECT DISTINCT trade_date FROM "
+            f"read_parquet('{chain_parquet_glob(ticker)}') ORDER BY trade_date"
+        ).fetchall()
+        if not chain_dates:
+            return pd.DataFrame()
+        chain_dates_list = [r[0] for r in chain_dates]
+        sf_df = make_split_factors(splits_df, chain_dates_list)
+        con.register("split_factors", sf_df)
+        con.register("spots", df_spots)
 
-    chain_dates = con.execute(
-        f"SELECT DISTINCT trade_date FROM "
-        f"read_parquet('{chain_parquet_glob(ticker)}') ORDER BY trade_date"
-    ).fetchall()
-    if not chain_dates:
+        # Mirror build_features.py:1253-1263 — same chain_adj view + same
+        # split-adjustment (strike * adj_factor; volume / adj_factor;
+        # delta, implied_vol, iv_error untouched).
+        con.execute(
+            f"CREATE OR REPLACE VIEW chain_adj AS "
+            f"SELECT raw.trade_date, raw.expiration, "
+            f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
+            f"       raw.option_type, "
+            f"       raw.volume / COALESCE(sf.adj_factor, 1.0) AS volume, "
+            f"       raw.implied_vol, raw.delta, raw.iv_error "
+            f"FROM (SELECT * FROM read_parquet('{chain_parquet_glob(ticker)}')) raw "
+            f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
+        )
+
+        result = con.execute(_MEASURE_SQL).df()
+    finally:
+        # Explicit cleanup: drop the view + unregister the registered
+        # DataFrames so the connection's memory pool can release them
+        # before close(), then close() the connection.  Wrap in try/except
+        # so a partial-setup failure (e.g. parquet read error) still
+        # reaches close() rather than leaking the connection.
+        try:
+            con.execute("DROP VIEW IF EXISTS chain_adj")
+        except Exception:
+            pass
+        for name in ("split_factors", "spots"):
+            try:
+                con.unregister(name)
+            except Exception:
+                pass
         con.close()
-        return pd.DataFrame()
-    chain_dates_list = [r[0] for r in chain_dates]
-    sf_df = make_split_factors(splits_df, chain_dates_list)
-    con.register("split_factors", sf_df)
 
-    # Mirror build_features.py:1253-1263 — same chain_adj view, same
-    # split-adjustment (strike * adj_factor; volume / adj_factor; delta,
-    # implied_vol, iv_error untouched).
-    con.execute(
-        f"CREATE OR REPLACE VIEW chain_adj AS "
-        f"SELECT raw.trade_date, raw.expiration, "
-        f"       raw.strike * COALESCE(sf.adj_factor, 1.0) AS strike, "
-        f"       raw.option_type, "
-        f"       raw.volume / COALESCE(sf.adj_factor, 1.0) AS volume, "
-        f"       raw.implied_vol, raw.delta, raw.iv_error "
-        f"FROM (SELECT * FROM read_parquet('{chain_parquet_glob(ticker)}')) raw "
-        f"LEFT JOIN split_factors sf ON raw.trade_date = sf.trade_date"
-    )
-
-    # total_vol per trade_date — for the median-based liquidity tier.
-    df_vol = con.execute(
-        "SELECT trade_date, SUM(volume)::DOUBLE AS total_vol "
-        "FROM chain_adj GROUP BY trade_date"
-    ).df()
-    df_vol["trade_date"] = pd.to_datetime(df_vol["trade_date"]).dt.date
-    vols = df_vol.set_index("trade_date")["total_vol"]
-
-    # Per (trade_date, expiration, option_type) — strike-sorted arrays of
-    # (strike, delta, iv_error).  DuckDB LIST(... ORDER BY ...) keeps them
-    # aligned.  Drop rows with NULL delta or non-positive IV upstream so
-    # the bracket-finder doesn't have to.
-    df_pe = con.execute(
-        """
-        SELECT
-            trade_date, expiration, option_type,
-            LIST(strike   ORDER BY strike) AS strikes,
-            LIST(delta    ORDER BY strike) AS deltas,
-            LIST(iv_error ORDER BY strike) AS iv_errors
-        FROM chain_adj
-        WHERE delta IS NOT NULL
-          AND implied_vol IS NOT NULL AND implied_vol > 0
-        GROUP BY trade_date, expiration, option_type
-        """
-    ).df()
-    con.close()
-
-    if df_pe.empty:
+    if result.empty:
         return pd.DataFrame()
 
-    df_pe["trade_date"] = pd.to_datetime(df_pe["trade_date"]).dt.date
-    df_pe["expiration"] = pd.to_datetime(df_pe["expiration"]).dt.date
-    df_pe["dte"] = df_pe.apply(lambda r: (r["expiration"] - r["trade_date"]).days,
-                               axis=1)
+    result.insert(0, "ticker", ticker)
+    result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.date
 
-    rows = []
-    for tdate, g in df_pe.groupby("trade_date", sort=True):
-        # Build the DTE-bracket pair around TARGET_DTE.  exp_lower = max
-        # expiration with DTE <= 30; exp_upper = min expiration with DTE > 30.
-        # Both must exist (matches the metric's "no nearest-neighbor fallback"
-        # convention) or the row is dropped.
-        exp_dte = g[["expiration", "dte"]].drop_duplicates().sort_values("dte")
-        lower = exp_dte[exp_dte["dte"] <= TARGET_DTE]
-        upper = exp_dte[exp_dte["dte"] >  TARGET_DTE]
-        if lower.empty or upper.empty:
-            continue
-        exp_lower = lower.iloc[-1]["expiration"]
-        dte_lower = int(lower.iloc[-1]["dte"])
-        exp_upper = upper.iloc[ 0]["expiration"]
-        dte_upper = int(upper.iloc[ 0]["dte"])
-
-        spot   = spots.loc[tdate, "spot_pc"]   if tdate in spots.index else None
-        atm_iv = spots.loc[tdate, "atm_iv_30d"] if tdate in spots.index else None
-        total_vol = vols.loc[tdate] if tdate in vols.index else None
-
-        row = {
-            "ticker":            ticker,
-            "trade_date":        tdate,
-            "exp_lower":         exp_lower,
-            "exp_upper":         exp_upper,
-            "dte_lower":         dte_lower,
-            "dte_upper":         dte_upper,
-            "bracket_width_dte": dte_upper - dte_lower,
-            "spot_pc":           spot,
-            "atm_iv_30d":        atm_iv,
-            "total_vol":         total_vol,
-        }
-
-        for exp_tag, exp_date, exp_dte_val in (
-            ("lower", exp_lower, dte_lower),
-            ("upper", exp_upper, dte_upper),
-        ):
-            for side_tag, target, opt_type in (
-                ("call_25d", +TARGET_DELTA, "C"),
-                ("put_25d",  -TARGET_DELTA, "P"),
-            ):
-                sub = g[(g["expiration"] == exp_date)
-                        & (g["option_type"] == opt_type)]
-                if sub.empty:
+    # BS-inverse sanity flag — compute in Python (the formula needs scipy
+    # and the call is now per-row scalars, no list iteration).  Per-row
+    # cost is ~10us so this is negligible vs the SQL pass.
+    for side_tag in ("call_25d", "put_25d"):
+        side = "call" if side_tag.startswith("call") else "put"
+        for exp_tag in ("lower", "upper"):
+            agree_col = f"{side_tag}_{exp_tag}_bs_agree"
+            slo_col   = f"{side_tag}_{exp_tag}_strike_lo"
+            shi_col   = f"{side_tag}_{exp_tag}_strike_hi"
+            dte_col   = f"dte_{exp_tag}"
+            agree_vals: list = []
+            for _, r in result.iterrows():
+                spot, atm, dte = r["spot_pc"], r["atm_iv_30d"], r[dte_col]
+                slo, shi       = r[slo_col],   r[shi_col]
+                if (pd.isna(spot) or pd.isna(atm) or pd.isna(dte)
+                        or pd.isna(slo) or pd.isna(shi)):
+                    agree_vals.append(None)
                     continue
-                strikes = list(sub["strikes"].iloc[0])
-                deltas  = list(sub["deltas"].iloc[0])
-                iv_errs = list(sub["iv_errors"].iloc[0])
-                br = find_delta_bracket(strikes, deltas, iv_errs, target)
-                if br is None:
-                    continue
-                pfx = f"{side_tag}_{exp_tag}_"
-                row[pfx + "strike_lo"]   = br["strike_lo"]
-                row[pfx + "delta_lo"]    = br["delta_lo"]
-                row[pfx + "iv_error_lo"] = br["iv_error_lo"]
-                row[pfx + "strike_hi"]   = br["strike_hi"]
-                row[pfx + "delta_hi"]    = br["delta_hi"]
-                row[pfx + "iv_error_hi"] = br["iv_error_hi"]
-                # BS-inverse sanity flag (only if atm_iv is usable).
-                if (atm_iv is not None and atm_iv > 0
-                        and spot is not None and spot > 0):
-                    bs_k = bs_inverse_strike(
-                        spot, atm_iv, exp_dte_val / 365.0,
-                        "call" if target > 0 else "put",
-                    )
-                    if bs_k is not None:
-                        row[pfx + "bs_agree"] = (
-                            br["strike_lo"] <= bs_k <= br["strike_hi"]
-                        )
+                bs_k = bs_inverse_strike(
+                    float(spot), float(atm), float(dte) / 365.0, side,
+                )
+                agree_vals.append(
+                    None if bs_k is None else bool(slo <= bs_k <= shi)
+                )
+            result[agree_col] = agree_vals
 
-            # ATM bracket (calls only, around spot — matches atm_iv_* logic).
-            csub = g[(g["expiration"] == exp_date) & (g["option_type"] == "C")]
-            if not csub.empty and spot is not None and spot > 0:
-                strikes = list(csub["strikes"].iloc[0])
-                deltas  = list(csub["deltas"].iloc[0])
-                iv_errs = list(csub["iv_errors"].iloc[0])
-                ab = find_atm_bracket(strikes, deltas, iv_errs, spot)
-                if ab is not None:
-                    pfx = f"atm_{exp_tag}_"
-                    row[pfx + "iv_error_lo"] = ab["iv_error_lo"]
-                    row[pfx + "iv_error_hi"] = ab["iv_error_hi"]
-
-        rows.append(row)
-
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    # Force GC at the end of each ticker — DuckDB's memory pool is freed
+    # by con.close() above; this nudges Python to reclaim the result
+    # DataFrame's predecessor objects before the next ticker allocates.
+    gc.collect()
+    return result
 
 
 # ---- Tier assignment ----------------------------------------------------
