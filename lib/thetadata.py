@@ -6,6 +6,7 @@ Endpoints used:
   /v3/option/history/open_interest
   /v3/option/history/greeks/eod
   /v3/option/snapshot/open_interest
+  /v3/option/snapshot/greeks/implied_volatility
   /v3/option/history/eod
   /v3/option/history/greeks/first_order
   /v3/option/history/quote
@@ -13,6 +14,7 @@ Endpoints used:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -312,6 +314,90 @@ def fetch_oi_snapshot(symbol: str, trade_date: date,
     df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce").astype("Int64")
     df = df.dropna(subset=["strike", "open_interest"])
     return df
+
+
+def fetch_underlying_snapshot(symbol: str,
+                              timeout: int = _DEFAULT_TIMEOUT,
+                              ) -> tuple[float | None, datetime | None]:
+    """Read the live underlying mid + its timestamp from the IV snapshot.
+
+    Endpoint: /v3/option/snapshot/greeks/implied_volatility
+    Every row in the response carries the same `underlying_price` and
+    `underlying_timestamp` (a single per-call snapshot, not per-contract);
+    we read both fields off the first row.  Used by fetch_ohlc_premarket
+    as a live premarket-open proxy: yfinance won't serve current-day
+    premarket bars before the open, and our ThetaData subscription doesn't
+    include regular-stock endpoints — but this options endpoint exposes the
+    live underlying price as a side-effect and the values have been
+    confirmed current during premarket.
+
+    Returns
+    -------
+    (price, ts)   — underlying mid + tz-aware ET datetime, when both are
+                    parseable from the first row.
+    (None, None)  — empty response, missing fields, non-finite / non-positive
+                    price, or unparseable timestamp.  Caller writes nothing
+                    (safe-failure mode — no stale or null price written).
+
+    Per ThetaData v3 docs `underlying_timestamp` is an ISO-8601 naive string
+    `YYYY-MM-DDTHH:mm:ss.SSS` (no offset).  ThetaData's broader timestamp
+    convention is ET (the open-interest snapshot page references "06:30 ET"
+    for the OCC publish, and the IV article defines `ms_of_day` as ms-since-
+    midnight-ET).  We localise to America/New_York here so the downstream
+    open_asof_ts TIMESTAMPTZ column is correct.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+    }
+    endpoint = "/v3/option/snapshot/greeks/implied_volatility"
+
+    try:
+        data = _get(endpoint, params, timeout=timeout)
+    except NoDataError:
+        return None, None
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (iv_snapshot %s)", symbol)
+        time.sleep(60)
+        data = _get(endpoint, params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (iv_snapshot %s)", symbol)
+        time.sleep(10)
+        data = _get(endpoint, params, timeout=timeout)
+
+    rows = _parse_rows(data)
+    if not rows:
+        return None, None
+
+    first = rows[0]
+    raw_price = first.get("underlying_price")
+    raw_ts    = first.get("underlying_timestamp")
+    if raw_price is None or raw_ts is None:
+        return None, None
+
+    # Price must be finite + positive — catches NaN, Inf, 0, negatives.
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        return None, None
+    if not math.isfinite(price) or price <= 0:
+        return None, None
+
+    # Naive ISO string per docs; localise to ET (ThetaData convention).
+    # pd.Timestamp parses the YYYY-MM-DDTHH:mm:ss.SSS format directly and
+    # returns NaT on garbage (caught below).
+    try:
+        ts_naive = pd.Timestamp(raw_ts)
+    except (TypeError, ValueError):
+        return None, None
+    if pd.isna(ts_naive):
+        return None, None
+    if ts_naive.tzinfo is None:
+        ts_aware = ts_naive.tz_localize(_ET)
+    else:
+        ts_aware = ts_naive.tz_convert(_ET)
+
+    return price, ts_aware.to_pydatetime()
 
 
 def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
