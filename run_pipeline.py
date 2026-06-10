@@ -172,10 +172,27 @@ def run_morning(conn, today: date) -> None:
     for t in sorted(ohlc_tickers):
         run_ohlc_fetch(conn, t, ohlc_start, ohlc_end)
 
-    # 2. OI history — fills/refreshes the prior week from the ThetaData history
-    #    endpoint. Today's row typically isn't in history yet (~1-day lag);
-    #    that's expected — the snapshot in step 3 covers today.
-    oi_end   = today
+    # 2. OI history — fills/refreshes the rolling window from the ThetaData
+    #    history endpoint up THROUGH YESTERDAY'S TRADING SESSION (not today).
+    #
+    #    ThetaData rejects expiration=* for today's date in ET with a 400
+    #    Bad Request (same current-day restriction the chain_eod endpoint
+    #    has).  Previously the window ended at `today`, which produced a
+    #    WARNING + "FAIL" log line per ticker on every weekday cron run —
+    #    pure noise that masked any genuine failure.
+    #
+    #    Today's OI is covered by step 3 (snapshot) and lands in the same
+    #    parquet via the same write_rows call with the same composite dedup
+    #    key (trade_date, expiration, strike, option_type), so excluding
+    #    today from the history fetch loses nothing.  Yesterday's session
+    #    IS still fetched here — that's the history fetch's actual job:
+    #    overwrite whatever the prior day's snapshot wrote with the
+    #    authoritative history-endpoint value.
+    #
+    #    `last_trading_day(today - 1 day)` returns the prior trading day,
+    #    correctly skipping weekends and holidays (e.g. on Tue after a Mon
+    #    holiday it returns the previous Fri).
+    oi_end   = last_trading_day(today - timedelta(days=1))
     oi_start = oi_end - timedelta(days=OI_LOOKBACK_DAYS)
     oi_trading_days = get_trading_days(oi_start, oi_end)
     log.info("--- OI history: %s → %s (%d trading days) ---",
