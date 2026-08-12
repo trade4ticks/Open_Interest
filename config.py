@@ -29,6 +29,12 @@ _default_chain_dir = PROJECT_ROOT / "data" / "chain_eod"
 CHAIN_EOD_DIR      = Path(os.environ.get("CHAIN_EOD_DIR", str(_default_chain_dir))).resolve()
 
 # --- Parquet store for twice-daily intraday chain snapshots (09:45 / 15:45) --
-_default_chain_snap_dir = PROJECT_ROOT / "data" / "chain_snapshots"
+# Defaults to a TRUE sibling of the resolved CHAIN_EOD_DIR, not to
+# PROJECT_ROOT/data.  The other stores only land in the top-level /data
+# because .env overrides them (OI_RAW_DIR, CHAIN_EOD_DIR); their PROJECT_ROOT
+# defaults above are never what production actually uses.  Deriving from
+# CHAIN_EOD_DIR.parent means this store follows chain_eod wherever .env puts
+# it and cannot drift into the project tree if the .env entry is missing.
+_default_chain_snap_dir = CHAIN_EOD_DIR.parent / "chain_snapshots"
 CHAIN_SNAPSHOTS_DIR     = Path(os.environ.get("CHAIN_SNAPSHOTS_DIR",
                                               str(_default_chain_snap_dir))).resolve()

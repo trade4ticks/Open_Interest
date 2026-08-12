@@ -90,7 +90,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -242,8 +243,38 @@ def _to_date_series(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s.astype("string"), errors="coerce")
 
 
-def _project(raw: pd.DataFrame, ticker: str, snapshot: str) -> pd.DataFrame:
+def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
+             session: date) -> pd.DataFrame:
     """Project the vendor's raw first_order frame into the stored schema.
+
+    Field mapping, confirmed against a real response rather than inferred:
+
+        vendor                  stored
+        ------                  ------
+        timestamp            -> timestamp   (verbatim, naive ET)
+                             -> trade_date  (date part; see below)
+        expiration           -> expiration
+        strike               -> strike
+        right                -> option_type ('C'/'P')
+        bid, ask             -> bid, ask
+        delta, theta, vega,
+        rho, epsilon, lambda -> same names
+        implied_vol          -> implied_vol
+        iv_error             -> iv_error
+        underlying_price     -> underlying_price
+        underlying_timestamp -> underlying_timestamp
+        symbol               -> (unused; `ticker` comes from the fetch loop,
+                                 which is authoritative for the request)
+
+    Plus three derived columns: ticker, snapshot ('0945'/'1545'), and
+    feature_date = next_trading_day(trade_date).  16 vendor fields + 4 derived
+    = the 20-column store schema.
+
+    The response carries NO `date` field, so trade_date is derived from
+    `timestamp`.  That makes one field load-bearing for the store's primary
+    key, so `session` — the date we requested, which is known and correct —
+    is used as a fallback wherever the timestamp will not parse.  Without it
+    a timestamp format change would silently drop every row.
 
     No row filtering beyond dropping rows that lack an identifier the store is
     keyed on (trade_date, expiration, strike, option_type).  Zero-IV and
@@ -262,12 +293,19 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str) -> pd.DataFrame:
     ts = pd.to_datetime(raw["timestamp"], errors="coerce") \
         if "timestamp" in raw.columns else pd.Series(pd.NaT, index=raw.index)
 
-    # trade_date: prefer the vendor's own date field; fall back to the date
-    # component of the row timestamp.
+    # trade_date: prefer an explicit vendor date field, then the date part of
+    # the row timestamp, then the session we asked for. The last fallback is
+    # what stops a timestamp-format change from silently emptying the store.
     if "date" in raw.columns:
         td = _to_date_series(raw["date"]).dt.date
     else:
         td = ts.dt.date
+    n_fallback = int(td.isna().sum())
+    if n_fallback:
+        td = td.fillna(session)
+        log.warning("  %s %s @%s: %d/%d rows had no parseable timestamp — "
+                    "trade_date fell back to the requested session",
+                    ticker, session, snapshot, n_fallback, len(raw))
 
     # option_type: vendor uses 'right' (C/P or CALL/PUT); project convention
     # is option_type with 'C'/'P'.
@@ -389,28 +427,122 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                      ticker, w_start, w_end, len(sessions))
             continue
 
-        # --- phase 1: enumerate, one session at a time ----------------------
+        # --- enumerate + fetch, pipelined in ONE pool -----------------------
         # Enumerating per session (option (b)) rather than per window makes the
         # completeness invariant exact rather than merely safe: the enumeration
         # window IS the fetch window, one session wide, so the fetched set is
         # precisely what existed that day. No dead (expiration, session) pairs.
+        #
+        # Enumeration and fetching share a single 4-slot pool with NO barrier
+        # between them: the moment one session's expirations come back, its
+        # point queries are submitted, while other sessions are still
+        # enumerating. A barrier here would idle up to 3 connections for the
+        # whole enumeration phase (and all 4 but one when a batch holds a
+        # single session). The cap still holds — one pool, 4 workers, both
+        # kinds of request drawing from the same slots.
         exp_by_session: dict[date, list[date]] = {}
         enum_failures: list[tuple[date, str]] = []
+        frames: list[pd.DataFrame] = []
+        failures: list[tuple[date, date, str, str]] = []
+        # Every path a row can take is counted, so "nothing was stored" always
+        # resolves to a specific stage rather than an absence of log lines.
+        n_ok = n_empty = n_projected_away = 0
+        raw_rows = proj_rows = 0
+        n_queries = 0
+        first_raw_cols: list[str] | None = None
+        # Sum of per-request wall time. Divided by batch wall time this gives
+        # measured average concurrency — the direct check on whether the 4
+        # allowed connections are actually being kept busy.
+        busy_seconds = 0.0
 
+        def _enum_one(sess: date) -> tuple[float, set[date]]:
+            t0 = time.monotonic()
+            out = enumerate_expirations_eod(ticker, sess, sess)
+            return time.monotonic() - t0, out
+
+        def _fetch_one(sess: date, exp: date, snap: str) -> tuple[float, pd.DataFrame]:
+            t0 = time.monotonic()
+            out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
+            return time.monotonic() - t0, out
+
+        batch_t0 = time.monotonic()
         with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
-            futs = {pool.submit(enumerate_expirations_eod, ticker, d, d): d
-                    for d in todo}
-            for fut in as_completed(futs):
-                d = futs[fut]
-                try:
-                    # exp >= d is a no-op safety net: a contract listed on d
-                    # necessarily expires on or after d.
-                    exps = sorted(e for e in fut.result() if e >= d)
-                except Exception as exc:
-                    enum_failures.append((d, f"{type(exc).__name__}: {exc}"))
-                    continue
-                if exps:
-                    exp_by_session[d] = exps
+            # kind, session, expiration, snapshot
+            pending: dict = {
+                pool.submit(_enum_one, d): ("enum", d, None, None) for d in todo
+            }
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    kind, sess, exp, snap = pending.pop(fut)
+
+                    if kind == "enum":
+                        try:
+                            elapsed, raw_exps = fut.result()
+                        except Exception as exc:
+                            enum_failures.append(
+                                (sess, f"{type(exc).__name__}: {exc}"))
+                            continue
+                        busy_seconds += elapsed
+                        # exp >= sess is a no-op safety net: a contract listed
+                        # on sess necessarily expires on or after sess.
+                        exps = sorted(e for e in raw_exps if e >= sess)
+                        if not exps:
+                            continue
+                        exp_by_session[sess] = exps
+                        # Submit this session's queries immediately — no wait
+                        # for the other sessions to finish enumerating.
+                        for e in exps:
+                            for s in SNAPSHOT_LABELS:
+                                if (sess, s) in already:
+                                    continue
+                                n_queries += 1
+                                nf = pool.submit(_fetch_one, sess, e, s)
+                                pending[nf] = ("fetch", sess, e, s)
+                        continue
+
+                    try:
+                        elapsed, raw = fut.result()
+                        busy_seconds += elapsed
+                        if raw.empty:
+                            n_empty += 1
+                            continue
+                        raw_rows += len(raw)
+                        if first_raw_cols is None:
+                            first_raw_cols = list(raw.columns)
+                            if debug_response:
+                                log.info("  DEBUG first non-empty response "
+                                         "(%s exp=%s %s @%s): columns=%s",
+                                         ticker, exp, sess, snap, first_raw_cols)
+                                log.info("  DEBUG first row: %s",
+                                         raw.iloc[0].to_dict())
+                        # Projection is inside the try so one malformed
+                        # response is recorded as a unit failure instead of
+                        # aborting the whole ticker.
+                        projected = _project(raw, ticker, snap, sess)
+                    except (TerminalTimeoutError, TerminalServerError) as exc:
+                        failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
+                        continue
+                    except Exception as exc:
+                        failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
+                        continue
+                    proj_rows += len(projected)
+                    if projected.empty:
+                        n_projected_away += 1
+                    else:
+                        n_ok += 1
+                        frames.append(projected)
+
+        batch_wall = time.monotonic() - batch_t0
+        n_requests = n_queries + len(todo)
+        log.info("  %s %s..%s: %d sessions, %d point queries, %d requests in "
+                 "%.1fs | measured concurrency %.2f of %d "
+                 "(%.2fs avg per request)",
+                 ticker, w_start, w_end, len(exp_by_session), n_queries,
+                 n_requests, batch_wall,
+                 (busy_seconds / batch_wall) if batch_wall > 0 else 0.0,
+                 SNAPSHOT_MAX_CONNECTIONS,
+                 (busy_seconds / n_requests) if n_requests else 0.0)
 
         if enum_failures:
             # These sessions are simply not written, so they stay unloaded and
@@ -420,80 +552,17 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         ticker, w_start, w_end, len(enum_failures),
                         "; ".join(f"{d}: {m[:60]}" for d, m in enum_failures[:3]))
 
-        if not exp_by_session:
-            log.info("  %s %s..%s: no expirations listed", ticker, w_start, w_end)
-            continue
-
-        # --- phase 2: point-query fetch, <= 4 in flight ---------------------
-        units = [(d, e, s)
-                 for d, exps in sorted(exp_by_session.items())
-                 for e in exps
-                 for s in SNAPSHOT_LABELS
-                 if (d, s) not in already]
-
-        log.info("  %s %s..%s: %d sessions enumerated, %d point queries queued",
-                 ticker, w_start, w_end, len(exp_by_session), len(units))
-
-        frames: list[pd.DataFrame] = []
-        failures: list[tuple[date, date, str, str]] = []
-        # Every path a row can take is counted, so "nothing was stored" always
-        # resolves to a specific stage rather than an absence of log lines.
-        n_ok = n_empty = n_projected_away = 0
-        raw_rows = proj_rows = 0
-        first_raw_cols: list[str] | None = None
-
-        def _fetch_one(sess: date, exp: date, snap: str) -> pd.DataFrame:
-            return fetch_first_order_raw(
-                ticker, exp, sess, SNAPSHOT_TIMES[snap],
-            )
-
-        with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
-            futs = {pool.submit(_fetch_one, d, e, s): (d, e, s)
-                    for d, e, s in units}
-            for fut in as_completed(futs):
-                sess, exp, snap = futs[fut]
-                try:
-                    raw = fut.result()
-                    if raw.empty:
-                        n_empty += 1
-                        continue
-                    raw_rows += len(raw)
-                    if first_raw_cols is None:
-                        first_raw_cols = list(raw.columns)
-                        if debug_response:
-                            log.info("  DEBUG first non-empty response (%s exp=%s "
-                                     "%s @%s): columns=%s", ticker, exp, sess,
-                                     snap, first_raw_cols)
-                            log.info("  DEBUG first row: %s",
-                                     raw.iloc[0].to_dict())
-                    # Projection is inside the try so one malformed response
-                    # is recorded as a unit failure instead of aborting the
-                    # whole ticker.
-                    projected = _project(raw, ticker, snap)
-                except (TerminalTimeoutError, TerminalServerError) as exc:
-                    failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
-                    continue
-                except Exception as exc:
-                    failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
-                    continue
-                proj_rows += len(projected)
-                if projected.empty:
-                    n_projected_away += 1
-                else:
-                    n_ok += 1
-                    frames.append(projected)
-
         if failures:
             log.warning("  %s %s..%s: %d/%d point queries FAILED — those "
                         "(session, expiration, snapshot) cells are missing. "
                         "Rerun with --force to retry. First few: %s",
-                        ticker, w_start, w_end, len(failures), len(units),
+                        ticker, w_start, w_end, len(failures), n_queries,
                         "; ".join(f"{d}/{e}/{s}: {m[:60]}"
                                   for d, e, s, m in failures[:3]))
 
         log.info("  %s %s..%s: %d queries -> %d with rows, %d empty, "
                  "%d projected-away, %d failed | %d raw rows -> %d projected",
-                 ticker, w_start, w_end, len(units), n_ok, n_empty,
+                 ticker, w_start, w_end, n_queries, n_ok, n_empty,
                  n_projected_away, len(failures), raw_rows, proj_rows)
 
         # The one case that would otherwise look identical to "no data exists":
