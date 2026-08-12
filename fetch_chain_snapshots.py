@@ -96,7 +96,13 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 from tqdm import tqdm
 
-from lib.chain_snapshot_store import SNAPSHOT_LABELS, loaded_keys, write_rows
+from config import CHAIN_EOD_DIR, CHAIN_SNAPSHOTS_DIR
+from lib.chain_snapshot_store import (
+    SNAPSHOT_LABELS,
+    loaded_keys,
+    write_rows,
+    year_path,
+)
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
@@ -223,8 +229,16 @@ def _warn_unknown_fields(raw: pd.DataFrame) -> None:
 
 def _to_date_series(s: pd.Series) -> pd.Series:
     """Parse a vendor date column that may be 'YYYY-MM-DD', 'YYYYMMDD', or the
-    integer 20241104.  astype(str) first — pd.to_datetime on a raw int would
-    read it as a nanosecond epoch."""
+    integer 20241104.
+
+    Stringify first — pd.to_datetime on a raw int reads it as a nanosecond
+    epoch.  Numeric columns route through Int64 rather than a plain
+    astype("string"): if a single row has a null date the whole column comes
+    back as float64, and str(20241104.0) is "20241104.0", which parses to NaT
+    and would silently drop EVERY row in the response.
+    """
+    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+        s = s.astype("Int64")
     return pd.to_datetime(s.astype("string"), errors="coerce")
 
 
@@ -305,8 +319,46 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str) -> pd.DataFrame:
 
 # --- Per-ticker fetch ------------------------------------------------------
 
+def _preflight_store() -> None:
+    """Resolve the store path, prove it is writable, and report .tmp orphans.
+
+    Runs before any fetching so a misconfigured or unwritable store fails in
+    seconds rather than after an hour of successful fetching that stores
+    nothing.  Creating the directory here also means its absence after a run
+    is no longer ambiguous: the folder always exists, so an empty one means
+    "no rows survived", not "the path was wrong".
+    """
+    print(f"Store:    {CHAIN_SNAPSHOTS_DIR}")
+    print(f"Sibling:  {CHAIN_EOD_DIR}  (exists={CHAIN_EOD_DIR.exists()})")
+    log.info("CHAIN_SNAPSHOTS_DIR resolves to %s", CHAIN_SNAPSHOTS_DIR)
+
+    try:
+        CHAIN_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise SystemExit(f"FATAL: cannot create {CHAIN_SNAPSHOTS_DIR}: {exc}")
+
+    probe = CHAIN_SNAPSHOTS_DIR / ".write_probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        raise SystemExit(
+            f"FATAL: {CHAIN_SNAPSHOTS_DIR} is not writable by this process: {exc}"
+        )
+    log.info("  write permission OK")
+
+    orphans = sorted(CHAIN_SNAPSHOTS_DIR.glob("*/*.parquet.tmp"))
+    if orphans:
+        log.error("  %d orphaned .parquet.tmp file(s) — a previous write died "
+                  "between write and rename. Inspect before trusting the "
+                  "store: %s", len(orphans),
+                  ", ".join(str(p) for p in orphans[:5]))
+    else:
+        log.info("  no orphaned .tmp files")
+
+
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
-                 force: bool = False) -> int:
+                 force: bool = False, debug_response: bool = False) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
 
     Every ThetaData request issued here is a point query — one expiration,
@@ -379,11 +431,16 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  for s in SNAPSHOT_LABELS
                  if (d, s) not in already]
 
-        log.info("  %s %s..%s: %d sessions, %d point queries",
+        log.info("  %s %s..%s: %d sessions enumerated, %d point queries queued",
                  ticker, w_start, w_end, len(exp_by_session), len(units))
 
         frames: list[pd.DataFrame] = []
         failures: list[tuple[date, date, str, str]] = []
+        # Every path a row can take is counted, so "nothing was stored" always
+        # resolves to a specific stage rather than an absence of log lines.
+        n_ok = n_empty = n_projected_away = 0
+        raw_rows = proj_rows = 0
+        first_raw_cols: list[str] | None = None
 
         def _fetch_one(sess: date, exp: date, snap: str) -> pd.DataFrame:
             return fetch_first_order_raw(
@@ -398,7 +455,17 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                 try:
                     raw = fut.result()
                     if raw.empty:
+                        n_empty += 1
                         continue
+                    raw_rows += len(raw)
+                    if first_raw_cols is None:
+                        first_raw_cols = list(raw.columns)
+                        if debug_response:
+                            log.info("  DEBUG first non-empty response (%s exp=%s "
+                                     "%s @%s): columns=%s", ticker, exp, sess,
+                                     snap, first_raw_cols)
+                            log.info("  DEBUG first row: %s",
+                                     raw.iloc[0].to_dict())
                     # Projection is inside the try so one malformed response
                     # is recorded as a unit failure instead of aborting the
                     # whole ticker.
@@ -409,7 +476,11 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                 except Exception as exc:
                     failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
                     continue
-                if not projected.empty:
+                proj_rows += len(projected)
+                if projected.empty:
+                    n_projected_away += 1
+                else:
+                    n_ok += 1
                     frames.append(projected)
 
         if failures:
@@ -420,15 +491,53 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         "; ".join(f"{d}/{e}/{s}: {m[:60]}"
                                   for d, e, s, m in failures[:3]))
 
+        log.info("  %s %s..%s: %d queries -> %d with rows, %d empty, "
+                 "%d projected-away, %d failed | %d raw rows -> %d projected",
+                 ticker, w_start, w_end, len(units), n_ok, n_empty,
+                 n_projected_away, len(failures), raw_rows, proj_rows)
+
+        # The one case that would otherwise look identical to "no data exists":
+        # the vendor DID return rows and the projection discarded all of them.
+        if raw_rows > 0 and proj_rows == 0:
+            log.error("  %s %s..%s: %d raw rows returned but ALL were dropped "
+                      "in projection — rows are dropped only when trade_date, "
+                      "expiration, strike or option_type cannot be parsed. "
+                      "Vendor columns were: %s",
+                      ticker, w_start, w_end, raw_rows, first_raw_cols)
+
         if not frames:
-            log.info("  %s %s..%s: no rows produced", ticker, w_start, w_end)
+            log.warning("  %s %s..%s: NOTHING WRITTEN — no rows survived "
+                        "(see the counts above for which stage lost them)",
+                        ticker, w_start, w_end)
             continue
 
         combined = pd.concat(frames, ignore_index=True)
-        by_year = write_rows(ticker, combined)
+        try:
+            by_year = write_rows(ticker, combined)
+        except Exception as exc:
+            # A write failure is systemic (permissions, schema, disk), not
+            # ticker-specific: continuing would fetch for hours and store
+            # nothing. Fail loudly and immediately instead.
+            log.error("  %s %s..%s: PARQUET WRITE FAILED — %s",
+                      ticker, w_start, w_end, exc, exc_info=True)
+            raise SystemExit(
+                f"FATAL: parquet write failed for {ticker} "
+                f"({w_start}..{w_end}): {exc}\n"
+                f"Store dir: {CHAIN_SNAPSHOTS_DIR}\n"
+                "Aborting rather than continuing to fetch with nothing stored."
+            )
+
+        if not by_year:
+            log.error("  %s %s..%s: write_rows accepted %d rows but wrote no "
+                      "year file — every row had an unusable trade_date",
+                      ticker, w_start, w_end, len(combined))
+            continue
+
         fetched += len(combined)
         for y, n in sorted(by_year.items()):
-            log.info("    %s/%d.parquet -> %d rows total", ticker, y, n)
+            p = year_path(ticker, y)
+            size_mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
+            log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, size_mb)
 
     return fetched
 
@@ -445,6 +554,9 @@ def main() -> None:
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
                           "request size — every request is a point query."))
+    ap.add_argument("--debug-response", action="store_true",
+                    help="dump columns + first row of the first non-empty "
+                         "response per batch (diagnosing empty stores)")
     ap.add_argument("--tickers", help="comma-separated; skips the prompt")
     ap.add_argument("--start", help="YYYYMMDD; skips the prompt")
     ap.add_argument("--end", help="YYYYMMDD; skips the prompt")
@@ -484,6 +596,8 @@ def main() -> None:
     print("Note: the last session is included even if today's 15:45 snapshot "
           "has not happened yet — it simply returns no data.\n")
 
+    _preflight_store()
+
     print("Checking ThetaData ...", end=" ", flush=True)
     if not test_connection():
         raise SystemExit("FAILED — terminal not reachable.")
@@ -493,18 +607,40 @@ def main() -> None:
     # inside each chunk's fan-out, so ticker-level parallelism would buy
     # nothing and could only risk exceeding the cap.
     total = 0
+    failed_tickers: list[str] = []
     with tqdm(total=len(tickers), unit="tk", ncols=90, desc="snapshots") as bar:
         for t in tickers:
             try:
-                total += fetch_ticker(t, batches, force=args.force)
-            except KeyboardInterrupt:
+                total += fetch_ticker(t, batches, force=args.force,
+                                      debug_response=args.debug_response)
+            except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
-                log.warning("  FAIL %s: %s", t, exc)
+                log.error("  FAIL %s: %s", t, exc, exc_info=True)
+                failed_tickers.append(t)
             bar.update(1)
 
-    print(f"\nDone. {total:,} rows fetched and merged into data/chain_snapshots/.")
+    print(f"\n{total:,} rows fetched and merged into {CHAIN_SNAPSHOTS_DIR}")
     print("Fetch-and-store only — no metrics repointed, no cron wired.")
+
+    if failed_tickers:
+        print(f"\n{len(failed_tickers)} ticker(s) FAILED: "
+              f"{', '.join(failed_tickers[:10])}"
+              f"{' ...' if len(failed_tickers) > 10 else ''}")
+
+    # A run that stores nothing must not look like a success.
+    if total == 0:
+        raise SystemExit(
+            "\nFAILED: no rows were stored.\n"
+            f"Store dir: {CHAIN_SNAPSHOTS_DIR}\n"
+            "Check the per-batch counter lines above — they say whether the "
+            "vendor returned no rows (all queries empty), whether rows were "
+            "dropped in projection, or whether the queries failed.\n"
+            "Re-run one ticker with --debug-response to dump the first "
+            "non-empty response."
+        )
+    if failed_tickers:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
