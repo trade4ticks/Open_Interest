@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -893,6 +894,176 @@ def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
     df = df.dropna(subset=["strike", "bid", "ask"])
     df = df.drop_duplicates(subset=["strike", "option_type"])
     return df
+
+
+# --- Intraday chain snapshots (fetch_chain_snapshots.py) --------------------
+#
+# These functions are used ONLY by fetch_chain_snapshots.py.  They carry their
+# own connection cap because the ThetaData subscription allows 4 concurrent
+# connections, and the snapshot fetcher must never exceed it regardless of how
+# its loops are structured.
+#
+# The cap is deliberately NOT applied to the shared `_get()` above: doing so
+# would silently throttle the existing pipeline fetchers (fetch_chain_eod.py
+# can put up to 4 tickers x 4 expirations = 16 requests in flight), which is
+# out of scope for this module's callers.
+
+SNAPSHOT_MAX_CONNECTIONS = 4
+_SNAPSHOT_SEM = threading.BoundedSemaphore(SNAPSHOT_MAX_CONNECTIONS)
+
+
+def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
+    """`_get` behind the 4-connection snapshot semaphore.
+
+    The semaphore is released as soon as the request returns OR raises, so the
+    retry sleeps in `_get_with_retry` never hold a connection slot.
+    """
+    with _SNAPSHOT_SEM:
+        return _get(endpoint, params, timeout=timeout)
+
+
+def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
+    """Shared retry ladder for the snapshot endpoints.
+
+    429 (rate limit)        -> sleep 60s, retry once
+    474 (server disconnect) -> sleep 10s, retry once
+    472 (no data)           -> propagates as NoDataError; caller treats as empty
+    570 (large request)     -> propagates as LargeRequestError; caller halves
+                               the date window and retries both halves
+    read timeout / 500      -> propagate; caller logs and excludes this unit
+    """
+    try:
+        return _get_capped(endpoint, params, timeout=timeout)
+    except RateLimitError:
+        log.warning("Rate limited — sleeping 60s, retrying once (%s)", label)
+        time.sleep(60)
+        return _get_capped(endpoint, params, timeout=timeout)
+    except ServerDisconnectedError:
+        log.warning("Server disconnected — sleeping 10s, retrying once (%s)", label)
+        time.sleep(10)
+        return _get_capped(endpoint, params, timeout=timeout)
+
+
+def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
+                              timeout: int = _DEFAULT_TIMEOUT) -> set[date]:
+    """Distinct expirations that EXISTED at any point in [start_date, end_date].
+
+    Endpoint: /v3/option/history/eod with expiration=* over a date range.
+
+    This is the expiration source for the intraday snapshot fetcher, chosen
+    over /v3/option/list/expirations and over the OI parquet store because:
+
+      * It is keyed per-date — fetching a 2019 window returns 2019's
+        expirations, not the full historical set, so there is no
+        historical over-fetch waste.
+      * It reports what the exchange actually listed, including a brand-new
+        weekly on its listing day.  An enumeration source keyed off traded
+        activity (the OI store drops zero-OI rows) would systematically miss
+        a new weekly on day one — a guaranteed weekly hole on every ticker
+        that lists weeklies.
+      * It is one consistent source for backfill and live alike, so there is
+        no source-switching between code paths.
+
+    The returned set is the UNION across every date in the window, with no
+    filtering whatsoever — no DTE cap, no `exp >= trade_date` prune, no
+    intersection against any other source.  Callers must fetch all of it.
+    Combinations that did not exist on a given date simply return no data and
+    are excluded downstream, which is what makes the union safe.
+
+    HTTP 570 (response too large) halves the date window and unions both
+    halves, so a wide chain (SPY, SPX) self-adjusts without losing coverage.
+
+    Returns an empty set iff the terminal returned no data.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": "*",
+        "start_date": start_date.strftime("%Y%m%d"),
+        "end_date":   end_date.strftime("%Y%m%d"),
+    }
+    label = f"enum {symbol} {start_date}..{end_date}"
+
+    try:
+        data = _get_with_retry("/v3/option/history/eod", params, timeout, label)
+    except NoDataError:
+        return set()
+    except LargeRequestError:
+        if start_date >= end_date:
+            raise   # cannot split a single day — let the caller see it
+        mid = start_date + (end_date - start_date) // 2
+        log.info("  570 on %s — halving window", label)
+        return (
+            enumerate_expirations_eod(symbol, start_date, mid, timeout)
+            | enumerate_expirations_eod(symbol, mid + timedelta(days=1), end_date, timeout)
+        )
+
+    out: set[date] = set()
+    for r in _parse_rows(data):
+        d = _parse_ymd(r.get("expiration"))
+        if d is not None:
+            out.add(d)
+    return out
+
+
+def fetch_first_order_raw(symbol: str, expiration: date,
+                          start_date: date, end_date: date,
+                          snapshot_time: str,
+                          interval: str = "5m",
+                          timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """Raw first-order greeks/quotes for ONE expiration at ONE time-of-day.
+
+    Endpoint: /v3/option/history/greeks/first_order
+
+    `snapshot_time` is a point in time, not a bar: start_time == end_time
+    returns the chain state at exactly that instant, and `interval` controls
+    only the granularity of the underlying series, not a span.  Pass
+    "09:45:00" / "15:45:00".
+
+    With start_date != end_date the endpoint returns one row per
+    (session, contract) at `snapshot_time`, which is what makes the caller's
+    date-chunking possible.
+
+    All strikes and both rights are returned — no `strike_range` is sent.
+
+    Returns ALL vendor fields with no field- or row-filtering; projection to
+    the stored schema happens in fetch_chain_snapshots.py.  Empty DataFrame on
+    NoDataError or an empty response.  HTTP 570 halves the date window and
+    concatenates both halves.
+    """
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": expiration.strftime("%Y%m%d"),
+        "start_date": start_date.strftime("%Y%m%d"),
+        "end_date":   end_date.strftime("%Y%m%d"),
+        "interval":   interval,
+        "start_time": snapshot_time,
+        "end_time":   snapshot_time,
+    }
+    label = (f"first_order {symbol} exp={expiration} "
+             f"{start_date}..{end_date} @{snapshot_time}")
+
+    try:
+        data = _get_with_retry(
+            "/v3/option/history/greeks/first_order", params, timeout, label
+        )
+    except NoDataError:
+        return pd.DataFrame()
+    except LargeRequestError:
+        if start_date >= end_date:
+            raise
+        mid = start_date + (end_date - start_date) // 2
+        log.info("  570 on %s — halving window", label)
+        left = fetch_first_order_raw(symbol, expiration, start_date, mid,
+                                     snapshot_time, interval, timeout)
+        right = fetch_first_order_raw(symbol, expiration, mid + timedelta(days=1),
+                                      end_date, snapshot_time, interval, timeout)
+        frames = [f for f in (left, right) if not f.empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    rows = _parse_rows(data)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 def test_connection() -> bool:

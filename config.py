@@ -27,3 +27,8 @@ OI_RAW_DIR      = Path(os.environ.get("OI_RAW_DIR", str(_default_oi_dir))).resol
 # --- Parquet store for raw EOD greeks chain (vol + IV refactor) -------------
 _default_chain_dir = PROJECT_ROOT / "data" / "chain_eod"
 CHAIN_EOD_DIR      = Path(os.environ.get("CHAIN_EOD_DIR", str(_default_chain_dir))).resolve()
+
+# --- Parquet store for twice-daily intraday chain snapshots (09:45 / 15:45) --
+_default_chain_snap_dir = PROJECT_ROOT / "data" / "chain_snapshots"
+CHAIN_SNAPSHOTS_DIR     = Path(os.environ.get("CHAIN_SNAPSHOTS_DIR",
+                                              str(_default_chain_snap_dir))).resolve()
