@@ -1005,42 +1005,49 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
     return out
 
 
-def fetch_first_order_raw(symbol: str, expiration: date,
-                          start_date: date, end_date: date,
+def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
                           snapshot_time: str,
                           interval: str = "5m",
                           timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
-    """Raw first-order greeks/quotes for ONE expiration at ONE time-of-day.
+    """Raw first-order greeks/quotes: ONE expiration, ONE session, ONE instant.
 
     Endpoint: /v3/option/history/greeks/first_order
 
-    `snapshot_time` is a point in time, not a bar: start_time == end_time
-    returns the chain state at exactly that instant, and `interval` controls
-    only the granularity of the underlying series, not a span.  Pass
-    "09:45:00" / "15:45:00".
+    This is a point query in BOTH dimensions, matching the shape of a
+    hand-issued browser call exactly:
 
-    With start_date != end_date the endpoint returns one row per
-    (session, contract) at `snapshot_time`, which is what makes the caller's
-    date-chunking possible.
+        start_time == end_time == snapshot_time   (one instant, not a bar)
+        start_date == end_date == trade_date      (one session, not a range)
+
+    The time dimension was always a point query.  The DATE dimension was not:
+    an earlier version passed a window of up to 30 calendar days in a single
+    call, which multiplied the response by ~21 sessions and made the terminal
+    compute greeks for the entire month of a full-width chain in one request.
+    That was the source of the 570s, the 60s timeouts, and the halving-plus-
+    retry cascade they triggered.  Callers now iterate sessions themselves.
 
     All strikes and both rights are returned — no `strike_range` is sent.
 
     Returns ALL vendor fields with no field- or row-filtering; projection to
     the stored schema happens in fetch_chain_snapshots.py.  Empty DataFrame on
-    NoDataError or an empty response.  HTTP 570 halves the date window and
-    concatenates both halves.
+    NoDataError or an empty response.
+
+    A 570 on a single-session point query cannot be relieved by splitting the
+    date range any further, so it propagates to the caller, which records the
+    unit as failed rather than retrying a request that would fail identically.
     """
+    date_str = trade_date.strftime("%Y%m%d")
     params = {
         "symbol":     symbol.upper(),
         "expiration": expiration.strftime("%Y%m%d"),
-        "start_date": start_date.strftime("%Y%m%d"),
-        "end_date":   end_date.strftime("%Y%m%d"),
+        "start_date": date_str,
+        "end_date":   date_str,
         "interval":   interval,
         "start_time": snapshot_time,
         "end_time":   snapshot_time,
     }
     label = (f"first_order {symbol} exp={expiration} "
-             f"{start_date}..{end_date} @{snapshot_time}")
+             f"{trade_date} @{snapshot_time}")
 
     try:
         data = _get_with_retry(
@@ -1049,16 +1056,9 @@ def fetch_first_order_raw(symbol: str, expiration: date,
     except NoDataError:
         return pd.DataFrame()
     except LargeRequestError:
-        if start_date >= end_date:
-            raise
-        mid = start_date + (end_date - start_date) // 2
-        log.info("  570 on %s — halving window", label)
-        left = fetch_first_order_raw(symbol, expiration, start_date, mid,
-                                     snapshot_time, interval, timeout)
-        right = fetch_first_order_raw(symbol, expiration, mid + timedelta(days=1),
-                                      end_date, snapshot_time, interval, timeout)
-        frames = [f for f in (left, right) if not f.empty]
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        log.warning("  570 on %s — already a single-session point query, "
+                    "cannot split further", label)
+        raise
 
     rows = _parse_rows(data)
     if not rows:

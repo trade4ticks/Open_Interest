@@ -27,9 +27,9 @@ By design:
 --- Expiration enumeration (the completeness guarantee) --------------------
 
 The first_order endpoint requires a specific expiration — it rejects
-expiration=*.  So the fetcher must know which expirations existed for each
-window.  It enumerates them from /v3/option/history/eod with expiration=* over
-the SAME window it is about to fetch.
+expiration=*.  So the fetcher must know which expirations existed on each
+session.  It enumerates them from /v3/option/history/eod with expiration=* for
+the SAME single session it is about to fetch.
 
 That source is chosen over /v3/option/list/expirations and over the OI parquet
 store because it is keyed per-date (no historical over-fetch waste), it
@@ -40,24 +40,33 @@ rows, and this script would run before the OI fetch anyway — would
 systematically miss a brand-new weekly on its listing day.  That would be a
 guaranteed weekly hole on every ticker.
 
-Three properties make the coverage airtight:
+Enumeration is per session (option (b)), which makes coverage exact rather
+than merely safe:
 
-  1. The enumeration window is ALWAYS identical to the fetch window.  Both are
-     the same (w_start, w_end) chunk, so an expiration first listed mid-window
-     is in the set by construction.  There is no path where one date's list
-     gets applied across a wider range.
-  2. The enumerated set is fetched in full.  No DTE cap, no `exp >= trade_date`
-     prune, no intersection against another source.
-  3. Combinations that did not exist on a given date return no data and are
-     simply absent.  That is what makes the union-across-the-window safe.
+  1. The enumeration window IS the fetch window — one session — so the set
+     fetched for a date is precisely what was listed on that date.  A weekly
+     first listed on day N is enumerated on day N.  There is no path where one
+     date's list gets applied to another date, and no dead (expiration,
+     session) pairs to absorb.
+  2. The enumerated set is fetched in full.  No DTE cap, no intersection
+     against another source, no row filtering.
+  3. The single narrowing — discarding expirations before the session date —
+     is provably a no-op, since a contract listed on D expires on or after D.
+     It only guards against a stale enumeration row costing a round trip.
 
-Two narrowings are applied, neither of which can drop coverage:
-  * the per-expiration END date is clamped to min(w_end, expiration), since no
-    data exists after expiry;
-  * enumerated expirations before w_start are discarded — provably a no-op,
-    because an expiration listed on a date D in the window satisfies
-    exp >= D >= w_start. It only guards against a stale enumeration row
-    costing a round trip.
+--- Request shape -----------------------------------------------------------
+
+Every request is a point query in BOTH dimensions:
+    start_time == end_time == 09:45:00 / 15:45:00   (one instant, not a bar)
+    start_date == end_date == the session            (one session, not a range)
+
+The date dimension matters as much as the time dimension.  An earlier version
+issued one call per (expiration, snapshot) spanning up to 30 calendar days,
+which made the terminal compute greeks across ~21 sessions of a full-width
+chain per request.  That produced 570s and 60s timeouts, whose halving-and-
+retry cascade then dominated the runtime.  Total rows retrieved are identical
+either way; only the per-request size differs, and the terminal is markedly
+superlinear in it.
 
 --- Connections -----------------------------------------------------------
 
@@ -74,8 +83,8 @@ Usage:
     python fetch_chain_snapshots.py --force
         (refetch dates already present in the store)
 
-    python fetch_chain_snapshots.py --chunk-days 10
-        (smaller windows — lower peak memory on wide chains like SPY)
+    python fetch_chain_snapshots.py --batch-days 5
+        (write more often — lower peak memory, less lost to an interrupt)
 """
 from __future__ import annotations
 
@@ -111,11 +120,12 @@ SNAPSHOT_TIMES = {
 assert set(SNAPSHOT_TIMES) == set(SNAPSHOT_LABELS), \
     "SNAPSHOT_TIMES must cover exactly lib.chain_snapshot_store.SNAPSHOT_LABELS"
 
-# The endpoint tops out around 30 days per call.  Wide chains will trip HTTP
-# 570 before that; fetch_first_order_raw halves the window transparently when
-# they do, so this is an upper bound rather than a tuned value.  Lower it via
-# --chunk-days to reduce peak memory on very wide tickers.
-DEFAULT_CHUNK_DAYS = 30
+# Sessions per WRITE batch. Requests are always single-session point queries,
+# so this no longer affects request size or response time — only how many
+# sessions are accumulated in memory before a parquet write, and therefore how
+# much work an interrupted run discards. Lower it to reduce peak memory on
+# wide chains; raise it to write less often.
+DEFAULT_BATCH_DAYS = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,9 +182,9 @@ def _prompt_date(label: str) -> date:
 def chunk_range(start: date, end: date, max_days: int) -> list[tuple[date, date]]:
     """Split [start, end] into inclusive calendar-day windows of <= max_days.
 
-    Chunking is on calendar days, not sessions, because the endpoint's range
-    limit is a calendar-date span.  A window with no trading days is harmless:
-    it enumerates to nothing and is skipped.
+    These are WRITE batches, not request windows — every request the fetcher
+    issues covers a single session.  A batch with no trading days is harmless:
+    it yields no sessions and is skipped.
     """
     if max_days < 1:
         raise ValueError("max_days must be >= 1")
@@ -295,73 +305,96 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str) -> pd.DataFrame:
 
 # --- Per-ticker fetch ------------------------------------------------------
 
-def fetch_ticker(ticker: str, chunks: list[tuple[date, date]],
+def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  force: bool = False) -> int:
-    """Enumerate + fetch every chunk for one ticker.
+    """Enumerate + fetch every session in every batch for one ticker.
+
+    Every ThetaData request issued here is a point query — one expiration,
+    one session, one instant. `batches` group sessions for WRITE batching
+    only; they no longer affect request size.
 
     Returns rows fetched and merged (before dedupe against what was already
     on disk), so a refetch reports the rows it re-sent, not net new rows.
 
-    Writes once per chunk, AFTER that chunk's fan-out has completed, so the
+    Writes once per batch, AFTER that batch's fan-out has completed, so the
     (trade_date, snapshot) "loaded" flag stays honest: a run interrupted
-    mid-chunk leaves nothing for that chunk, and a rerun redoes it in full
+    mid-batch leaves nothing for that batch, and a rerun redoes it in full
     rather than skipping a partial gap.
     """
-    years = {y for (a, b) in chunks for y in range(a.year, b.year + 1)}
+    years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
     already = set() if force else loaded_keys(ticker, years)
 
     fetched = 0
-    for w_start, w_end in chunks:
+    for w_start, w_end in batches:
         sessions = get_trading_days(w_start, w_end)
         if not sessions:
             continue
 
-        todo = [(d, s) for d in sessions for s in SNAPSHOT_LABELS
-                if (d, s) not in already]
+        todo = [d for d in sessions
+                if any((d, s) not in already for s in SNAPSHOT_LABELS)]
         if not todo:
-            log.info("  %s %s..%s: all %d (date, snapshot) cells loaded — skip",
-                     ticker, w_start, w_end, len(sessions) * len(SNAPSHOT_LABELS))
+            log.info("  %s %s..%s: all %d sessions loaded — skip",
+                     ticker, w_start, w_end, len(sessions))
             continue
 
-        # --- enumerate: one call, same window we are about to fetch ---------
-        try:
-            exps = enumerate_expirations_eod(ticker, w_start, w_end)
-        except Exception as exc:
-            log.warning("  ENUM FAIL %s %s..%s: %s — chunk skipped, nothing "
-                        "written (rerun to retry)", ticker, w_start, w_end, exc)
+        # --- phase 1: enumerate, one session at a time ----------------------
+        # Enumerating per session (option (b)) rather than per window makes the
+        # completeness invariant exact rather than merely safe: the enumeration
+        # window IS the fetch window, one session wide, so the fetched set is
+        # precisely what existed that day. No dead (expiration, session) pairs.
+        exp_by_session: dict[date, list[date]] = {}
+        enum_failures: list[tuple[date, str]] = []
+
+        with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
+            futs = {pool.submit(enumerate_expirations_eod, ticker, d, d): d
+                    for d in todo}
+            for fut in as_completed(futs):
+                d = futs[fut]
+                try:
+                    # exp >= d is a no-op safety net: a contract listed on d
+                    # necessarily expires on or after d.
+                    exps = sorted(e for e in fut.result() if e >= d)
+                except Exception as exc:
+                    enum_failures.append((d, f"{type(exc).__name__}: {exc}"))
+                    continue
+                if exps:
+                    exp_by_session[d] = exps
+
+        if enum_failures:
+            # These sessions are simply not written, so they stay unloaded and
+            # a plain rerun retries them — no --force needed.
+            log.warning("  %s %s..%s: enumeration FAILED for %d session(s) — "
+                        "not written, rerun to retry. First few: %s",
+                        ticker, w_start, w_end, len(enum_failures),
+                        "; ".join(f"{d}: {m[:60]}" for d, m in enum_failures[:3]))
+
+        if not exp_by_session:
+            log.info("  %s %s..%s: no expirations listed", ticker, w_start, w_end)
             continue
 
-        if not exps:
-            log.info("  %s %s..%s: no expirations listed in window",
-                     ticker, w_start, w_end)
-            continue
+        # --- phase 2: point-query fetch, <= 4 in flight ---------------------
+        units = [(d, e, s)
+                 for d, exps in sorted(exp_by_session.items())
+                 for e in exps
+                 for s in SNAPSHOT_LABELS
+                 if (d, s) not in already]
 
-        # Safety net only, and provably not a coverage filter: any expiration
-        # listed on a date D in this window satisfies exp >= D >= w_start, so
-        # this cannot drop a legitimate expiration. It exists to catch a stale
-        # row from the enumeration endpoint before it costs a round trip.
-        exps = sorted(e for e in exps if e >= w_start)
-        log.info("  %s %s..%s: %d expirations x %d snapshots = %d calls",
-                 ticker, w_start, w_end, len(exps), len(SNAPSHOT_LABELS),
-                 len(exps) * len(SNAPSHOT_LABELS))
+        log.info("  %s %s..%s: %d sessions, %d point queries",
+                 ticker, w_start, w_end, len(exp_by_session), len(units))
 
-        # --- fan out: <= 4 in flight ----------------------------------------
-        units = [(e, s) for e in exps for s in SNAPSHOT_LABELS]
         frames: list[pd.DataFrame] = []
-        failures: list[tuple[date, str, str]] = []
+        failures: list[tuple[date, date, str, str]] = []
 
-        def _fetch_one(exp: date, snap: str) -> pd.DataFrame:
-            w_stop = min(w_end, exp)        # no data exists after expiry
-            if w_stop < w_start:            # cannot happen given the filter above
-                return pd.DataFrame()
+        def _fetch_one(sess: date, exp: date, snap: str) -> pd.DataFrame:
             return fetch_first_order_raw(
-                ticker, exp, w_start, w_stop, SNAPSHOT_TIMES[snap],
+                ticker, exp, sess, SNAPSHOT_TIMES[snap],
             )
 
         with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
-            futs = {pool.submit(_fetch_one, e, s): (e, s) for e, s in units}
+            futs = {pool.submit(_fetch_one, d, e, s): (d, e, s)
+                    for d, e, s in units}
             for fut in as_completed(futs):
-                exp, snap = futs[fut]
+                sess, exp, snap = futs[fut]
                 try:
                     raw = fut.result()
                     if raw.empty:
@@ -371,20 +404,21 @@ def fetch_ticker(ticker: str, chunks: list[tuple[date, date]],
                     # whole ticker.
                     projected = _project(raw, ticker, snap)
                 except (TerminalTimeoutError, TerminalServerError) as exc:
-                    failures.append((exp, snap, f"{type(exc).__name__}: {exc}"))
+                    failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
                     continue
                 except Exception as exc:
-                    failures.append((exp, snap, f"{type(exc).__name__}: {exc}"))
+                    failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
                     continue
                 if not projected.empty:
                     frames.append(projected)
 
         if failures:
-            log.warning("  %s %s..%s: %d/%d units FAILED — those "
-                        "(expiration, snapshot) cells are missing from this "
-                        "chunk. Rerun with --force to retry. First few: %s",
+            log.warning("  %s %s..%s: %d/%d point queries FAILED — those "
+                        "(session, expiration, snapshot) cells are missing. "
+                        "Rerun with --force to retry. First few: %s",
                         ticker, w_start, w_end, len(failures), len(units),
-                        "; ".join(f"{e}/{s}: {m[:80]}" for e, s, m in failures[:3]))
+                        "; ".join(f"{d}/{e}/{s}: {m[:60]}"
+                                  for d, e, s, m in failures[:3]))
 
         if not frames:
             log.info("  %s %s..%s: no rows produced", ticker, w_start, w_end)
@@ -407,8 +441,10 @@ def main() -> None:
     )
     ap.add_argument("--force", action="store_true",
                     help="refetch (date, snapshot) cells already in the store")
-    ap.add_argument("--chunk-days", type=int, default=DEFAULT_CHUNK_DAYS,
-                    help=f"max calendar days per call (default {DEFAULT_CHUNK_DAYS})")
+    ap.add_argument("--batch-days", type=int, default=DEFAULT_BATCH_DAYS,
+                    help=("calendar days accumulated per parquet write "
+                          f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
+                          "request size — every request is a point query."))
     ap.add_argument("--tickers", help="comma-separated; skips the prompt")
     ap.add_argument("--start", help="YYYYMMDD; skips the prompt")
     ap.add_argument("--end", help="YYYYMMDD; skips the prompt")
@@ -436,13 +472,15 @@ def main() -> None:
     if not sessions:
         raise SystemExit("No NYSE trading days in the requested range.")
 
-    chunks = chunk_range(start, end, args.chunk_days)
+    batches = chunk_range(start, end, args.batch_days)
 
     print(f"\n{len(tickers)} tickers x {len(sessions)} sessions "
           f"({start} -> {end})")
-    print(f"{len(chunks)} chunk(s) of <= {args.chunk_days} calendar days, "
+    print(f"{len(batches)} write batch(es) of <= {args.batch_days} calendar days, "
           f"{SNAPSHOT_MAX_CONNECTIONS} concurrent connections"
-          f"{' , --force (ignoring loaded cells)' if args.force else ''}")
+          f"{', --force (ignoring loaded cells)' if args.force else ''}")
+    print("Every request is a point query: one expiration, one session, "
+          "one instant.")
     print("Note: the last session is included even if today's 15:45 snapshot "
           "has not happened yet — it simply returns no data.\n")
 
@@ -458,7 +496,7 @@ def main() -> None:
     with tqdm(total=len(tickers), unit="tk", ncols=90, desc="snapshots") as bar:
         for t in tickers:
             try:
-                total += fetch_ticker(t, chunks, force=args.force)
+                total += fetch_ticker(t, batches, force=args.force)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
