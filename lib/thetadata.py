@@ -13,6 +13,7 @@ Endpoints used:
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -911,15 +912,94 @@ def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
 SNAPSHOT_MAX_CONNECTIONS = 4
 _SNAPSHOT_SEM = threading.BoundedSemaphore(SNAPSHOT_MAX_CONNECTIONS)
 
+# requests' scalar `timeout=` is a CONNECT and INTER-BYTE READ timeout, not a
+# cap on total request duration: every chunk received resets the read clock, so
+# a server that trickles bytes — or streams a very large body slowly — never
+# trips it and can hold a worker indefinitely. With only 4 connections, a
+# handful of such requests freezes the run. The snapshot path therefore
+# enforces its own hard wall-clock deadline on top of the socket timeouts.
+SNAPSHOT_CONNECT_TIMEOUT = 10     # seconds to establish the TCP connection
+SNAPSHOT_READ_TIMEOUT    = 45     # seconds of socket silence before giving up
+SNAPSHOT_TOTAL_TIMEOUT   = 180    # hard cap on total time for one request
+
+
+def _get_snapshot(endpoint: str, params: dict,
+                  total_timeout: int = SNAPSHOT_TOTAL_TIMEOUT):
+    """GET with a hard total-duration deadline, for the snapshot endpoints.
+
+    Streams the body and checks elapsed wall time between chunks, so a
+    slow-trickle response is aborted at `total_timeout` instead of running
+    forever.  Raises TerminalTimeoutError on either the socket timeout or the
+    total deadline; callers record the unit as failed and move on.
+    """
+    base   = f"{THETADATA_BASE_URL}{endpoint}"
+    params = {**params, "format": "json"}
+    # Query string built manually so * is not percent-encoded, as in _get.
+    qs  = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{base}?{qs}"
+
+    t0 = time.monotonic()
+    try:
+        resp = requests.get(
+            url,
+            timeout=(SNAPSHOT_CONNECT_TIMEOUT, SNAPSHOT_READ_TIMEOUT),
+            stream=True,
+        )
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout):
+        raise TerminalTimeoutError(
+            f"socket timeout (connect={SNAPSHOT_CONNECT_TIMEOUT}s, "
+            f"read={SNAPSHOT_READ_TIMEOUT}s)"
+        )
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            f"Cannot reach ThetaData at {THETADATA_BASE_URL}. "
+            "Is Tailscale up and the terminal running?"
+        )
+
+    with resp:
+        if resp.status_code == 500:
+            raise TerminalServerError(f"HTTP 500: {resp.text[:200]}")
+        exc = _STATUS_EXC.get(resp.status_code)
+        if exc:
+            raise exc(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+
+        chunks: list[bytes] = []
+        nbytes = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    chunks.append(chunk)
+                    nbytes += len(chunk)
+                elapsed = time.monotonic() - t0
+                if elapsed > total_timeout:
+                    raise TerminalTimeoutError(
+                        f"exceeded total timeout {total_timeout}s "
+                        f"({nbytes:,} bytes read in {elapsed:.0f}s) — response "
+                        "was still streaming; aborted so the worker is freed"
+                    )
+        except requests.exceptions.ReadTimeout:
+            raise TerminalTimeoutError(
+                f"read timeout after {SNAPSHOT_READ_TIMEOUT}s of socket "
+                f"silence ({nbytes:,} bytes read)"
+            )
+
+    body = b"".join(chunks)
+    if not body:
+        return {}
+    return json.loads(body)
+
 
 def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
-    """`_get` behind the 4-connection snapshot semaphore.
+    """`_get_snapshot` behind the 4-connection snapshot semaphore.
 
-    The semaphore is released as soon as the request returns OR raises, so the
-    retry sleeps in `_get_with_retry` never hold a connection slot.
+    The semaphore is released as soon as the request returns OR raises —
+    including on timeout — so a hung request frees its slot for the other
+    workers rather than starving them, and the retry sleeps in
+    `_get_with_retry` never hold a connection slot.
     """
     with _SNAPSHOT_SEM:
-        return _get(endpoint, params, timeout=timeout)
+        return _get_snapshot(endpoint, params)
 
 
 def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):

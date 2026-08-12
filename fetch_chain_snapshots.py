@@ -89,9 +89,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -108,6 +111,7 @@ from lib.market_hours import get_trading_days, last_trading_day, next_trading_da
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
     SNAPSHOT_MAX_CONNECTIONS,
+    SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
     enumerate_expirations_eod,
@@ -357,6 +361,53 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
 
 # --- Per-ticker fetch ------------------------------------------------------
 
+# --- In-flight tracking + watchdog -----------------------------------------
+#
+# A stalled run must never be ambiguous. The watchdog reports what is in
+# flight and for how long; critically, "0 in flight" while the run appears
+# stopped proves the stall is LOCAL (parquet merge, sort, loaded_keys) rather
+# than a hung vendor request, which are fixed in completely different places.
+
+_INFLIGHT: dict[int, tuple[str, float]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_SEQ = itertools.count()
+_WATCHDOG_STOP = threading.Event()
+
+
+@contextmanager
+def _track(label: str):
+    key = next(_INFLIGHT_SEQ)
+    with _INFLIGHT_LOCK:
+        _INFLIGHT[key] = (label, time.monotonic())
+    try:
+        yield
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.pop(key, None)
+
+
+def _start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
+    """Log in-flight requests whenever one has been running unusually long."""
+    def _run() -> None:
+        while not _WATCHDOG_STOP.wait(interval):
+            now = time.monotonic()
+            with _INFLIGHT_LOCK:
+                ages = sorted((now - t0, label) for label, t0 in _INFLIGHT.values())
+            if not ages:
+                log.warning("WATCHDOG: 0 requests in flight — if the run looks "
+                            "stopped, it is NOT waiting on the vendor (check "
+                            "the parquet merge/sort or loaded_keys)")
+                continue
+            if ages[-1][0] >= stall_after:
+                log.warning("WATCHDOG: %d in flight, oldest %.0fs (hard cap "
+                            "%ds): %s", len(ages), ages[-1][0],
+                            SNAPSHOT_TOTAL_TIMEOUT,
+                            "; ".join(f"{lab} {age:.0f}s"
+                                      for age, lab in ages[-4:]))
+
+    threading.Thread(target=_run, daemon=True, name="watchdog").start()
+
+
 def _preflight_store() -> None:
     """Resolve the store path, prove it is writable, and report .tmp orphans.
 
@@ -457,12 +508,14 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         def _enum_one(sess: date) -> tuple[float, set[date]]:
             t0 = time.monotonic()
-            out = enumerate_expirations_eod(ticker, sess, sess)
+            with _track(f"enum {ticker} {sess}"):
+                out = enumerate_expirations_eod(ticker, sess, sess)
             return time.monotonic() - t0, out
 
         def _fetch_one(sess: date, exp: date, snap: str) -> tuple[float, pd.DataFrame]:
             t0 = time.monotonic()
-            out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
+            with _track(f"{ticker} exp={exp} {sess}@{snap}"):
+                out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
             return time.monotonic() - t0, out
 
         batch_t0 = time.monotonic()
@@ -581,6 +634,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
             continue
 
         combined = pd.concat(frames, ignore_index=True)
+        write_t0 = time.monotonic()
         try:
             by_year = write_rows(ticker, combined)
         except Exception as exc:
@@ -602,11 +656,17 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                       ticker, w_start, w_end, len(combined))
             continue
 
+        write_secs = time.monotonic() - write_t0
         fetched += len(combined)
         for y, n in sorted(by_year.items()):
             p = year_path(ticker, y)
             size_mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
             log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, size_mb)
+        # The year-file merge is read-modify-rewrite and grows through the
+        # year, so it is a real candidate for a stall with 0 requests in
+        # flight. Timing it makes that visible instead of inferred.
+        log.info("    write took %.1fs for %d new rows (no requests in flight "
+                 "during this)", write_secs, len(combined))
 
     return fetched
 
@@ -670,7 +730,11 @@ def main() -> None:
     print("Checking ThetaData ...", end=" ", flush=True)
     if not test_connection():
         raise SystemExit("FAILED — terminal not reachable.")
-    print("OK\n")
+    print("OK")
+    print(f"Per-request caps: connect 10s, read 45s, hard total "
+          f"{SNAPSHOT_TOTAL_TIMEOUT}s. Watchdog reports stalls every 30s.\n")
+
+    _start_watchdog()
 
     # Tickers are sequential on purpose: the 4-connection budget is spent
     # inside each chunk's fan-out, so ticker-level parallelism would buy
