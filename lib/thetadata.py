@@ -922,6 +922,30 @@ SNAPSHOT_CONNECT_TIMEOUT = 10     # seconds to establish the TCP connection
 SNAPSHOT_READ_TIMEOUT    = 45     # seconds of socket silence before giving up
 SNAPSHOT_TOTAL_TIMEOUT   = 180    # hard cap on total time for one request
 
+# --- Worker-side timing accumulators ---------------------------------------
+# Splits time spent inside a request into HTTP transfer vs local decoding, so
+# "the vendor is slow" can be separated from "we are slow decoding what the
+# vendor sent". Mutated from worker threads, hence the lock.
+_TIMING_LOCK = threading.Lock()
+SNAPSHOT_TIMING: dict[str, float] = {
+    "http_seconds":  0.0,   # connect + stream the body
+    "parse_seconds": 0.0,   # json.loads + row normalisation + DataFrame build
+    "http_count":    0.0,
+    "http_bytes":    0.0,
+}
+
+
+def reset_snapshot_timing() -> None:
+    with _TIMING_LOCK:
+        for k in SNAPSHOT_TIMING:
+            SNAPSHOT_TIMING[k] = 0.0
+
+
+def _add_timing(**kw: float) -> None:
+    with _TIMING_LOCK:
+        for k, v in kw.items():
+            SNAPSHOT_TIMING[k] += v
+
 
 def _get_snapshot(endpoint: str, params: dict,
                   total_timeout: int = SNAPSHOT_TOTAL_TIMEOUT):
@@ -984,10 +1008,14 @@ def _get_snapshot(endpoint: str, params: dict,
                 f"silence ({nbytes:,} bytes read)"
             )
 
+    http_secs = time.monotonic() - t0
     body = b"".join(chunks)
-    if not body:
-        return {}
-    return json.loads(body)
+
+    t1 = time.monotonic()
+    out = json.loads(body) if body else {}
+    _add_timing(http_seconds=http_secs, parse_seconds=time.monotonic() - t1,
+                http_count=1, http_bytes=float(nbytes))
+    return out
 
 
 def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
@@ -1077,11 +1105,13 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
             | enumerate_expirations_eod(symbol, mid + timedelta(days=1), end_date, timeout)
         )
 
+    t_parse = time.monotonic()
     out: set[date] = set()
     for r in _parse_rows(data):
         d = _parse_ymd(r.get("expiration"))
         if d is not None:
             out.add(d)
+    _add_timing(parse_seconds=time.monotonic() - t_parse)
     return out
 
 
@@ -1140,10 +1170,11 @@ def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
                     "cannot split further", label)
         raise
 
+    t_parse = time.monotonic()
     rows = _parse_rows(data)
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows) if rows else pd.DataFrame()
+    _add_timing(parse_seconds=time.monotonic() - t_parse)
+    return out
 
 
 def test_connection() -> bool:

@@ -361,6 +361,65 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
 
 # --- Per-ticker fetch ------------------------------------------------------
 
+# --- Run timing accounting --------------------------------------------------
+#
+# Two decompositions, because with 4 concurrent workers they cannot be one:
+#
+#   (A) A MECE wall-clock timeline of the MAIN thread. At any instant the run
+#       is in exactly one of these, so they sum to total wall clock and the
+#       remainder is surfaced as "unaccounted".
+#   (B) Worker-side aggregates, which OVERLAP each other and (A) by design —
+#       4 workers can accumulate 4 seconds of request time per wall second.
+#       These give effective concurrency and per-request latency.
+#
+# Reporting them as one table would be wrong; the summary keeps them apart.
+
+class _RunTiming:
+    def __init__(self) -> None:
+        # (A) main-thread wall clock, mutually exclusive
+        self.startup = 0.0
+        self.loaded_keys = 0.0
+        self.fanout_blocked = 0.0      # main thread waiting on futures
+        self.local_compute = 0.0       # projection / result handling
+        self.parquet_write = 0.0
+        # (B) worker-side, concurrent
+        self.enum_secs = 0.0
+        self.enum_count = 0
+        self.query_secs = 0.0
+        self.query_count = 0
+        self.fanout_wall = 0.0         # blocked + local_compute
+        # write growth through the run
+        self.writes: list[tuple[float, int]] = []   # (seconds, new rows)
+
+
+TIMING = _RunTiming()
+
+# Sampled occupancy, for idle / under-saturation attribution.
+_SAMPLES: list[tuple[int, bool]] = []      # (in-flight count, local work busy)
+_LOCAL_BUSY = False
+_SAMPLER_STOP = threading.Event()
+
+
+def _set_local_busy(v: bool) -> None:
+    """Mark whether the main thread is doing local (non-network) work.
+
+    Read by the sampler to distinguish genuine dead time (nothing in flight
+    AND nothing being computed) from local work that legitimately runs with
+    the connections idle.
+    """
+    global _LOCAL_BUSY
+    _LOCAL_BUSY = v
+
+
+def _start_sampler(interval: float = 0.1) -> None:
+    def _run() -> None:
+        while not _SAMPLER_STOP.wait(interval):
+            with _INFLIGHT_LOCK:
+                n = len(_INFLIGHT)
+            _SAMPLES.append((n, _LOCAL_BUSY))
+    threading.Thread(target=_run, daemon=True, name="sampler").start()
+
+
 # --- In-flight tracking + watchdog -----------------------------------------
 #
 # A stalled run must never be ambiguous. The watchdog reports what is in
@@ -406,6 +465,86 @@ def _start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
                                       for age, lab in ages[-4:]))
 
     threading.Thread(target=_run, daemon=True, name="watchdog").start()
+
+
+def _print_timing_summary(wall_total: float) -> None:
+    """Attribute the run's wall clock, then report the concurrent overlay."""
+    t = TIMING
+    accounted = (t.startup + t.loaded_keys + t.fanout_blocked
+                 + t.local_compute + t.parquet_write)
+    unaccounted = wall_total - accounted
+
+    def pct(x: float) -> float:
+        return (100.0 * x / wall_total) if wall_total > 0 else 0.0
+
+    def row(label: str, secs: float) -> None:
+        print(f"  {label:<38}{secs:>9.1f}s {pct(secs):>6.1f}%")
+
+    print("\n" + "=" * 64)
+    print("TIMING SUMMARY")
+    print("=" * 64)
+    print("(A) WALL CLOCK — main-thread timeline, mutually exclusive,")
+    print("    sums to 100%. This is where the run's real time went.")
+    print(f"  {'TOTAL':<38}{wall_total:>9.1f}s {100.0:>6.1f}%")
+    row("startup (preflight + conn test)", t.startup)
+    row("loaded_keys (resumability read)", t.loaded_keys)
+    row("fan-out: blocked on network", t.fanout_blocked)
+    row("fan-out: local compute (projection)", t.local_compute)
+    row("parquet write (merge+sort+rewrite)", t.parquet_write)
+    row("unaccounted", unaccounted)
+
+    worker_total = t.enum_secs + t.query_secs
+    http  = SNAPSHOT_TIMING["http_seconds"]
+    parse = SNAPSHOT_TIMING["parse_seconds"]
+    mb    = SNAPSHOT_TIMING["http_bytes"] / 1e6
+
+    print("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
+    print("    4 workers accrue up to 4s of request time per wall second,")
+    print("    so these deliberately do not sum into (A).")
+    print(f"  {'total request time':<38}{worker_total:>9.1f}s")
+    if worker_total > 0:
+        print(f"  {'  of which HTTP transfer':<38}{http:>9.1f}s "
+              f"{100.0 * http / worker_total:>6.1f}%")
+        print(f"  {'  of which decode (json/rows/frame)':<38}{parse:>9.1f}s "
+              f"{100.0 * parse / worker_total:>6.1f}%")
+    print(f"  {'bytes received':<38}{mb:>9.1f} MB")
+    if t.enum_count:
+        print(f"  enumeration:   {t.enum_count:>6d} calls, {t.enum_secs:>8.1f}s "
+              f"total, {t.enum_secs / t.enum_count:>6.2f}s avg")
+    if t.query_count:
+        print(f"  point queries: {t.query_count:>6d} calls, {t.query_secs:>8.1f}s "
+              f"total, {t.query_secs / t.query_count:>6.2f}s avg")
+    if worker_total > 0 and t.enum_count and t.query_count:
+        print(f"  enumeration share of request time: "
+              f"{100.0 * t.enum_secs / worker_total:.1f}%")
+
+    print("\n(C) CONCURRENCY / SATURATION")
+    eff = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
+    print(f"  {'effective concurrency':<38}{eff:>9.2f} of "
+          f"{SNAPSHOT_MAX_CONNECTIONS}")
+    n = len(_SAMPLES)
+    if n:
+        mean_inflight = sum(c for c, _ in _SAMPLES) / n
+        idle_frac  = sum(1 for c, busy in _SAMPLES if c == 0 and not busy) / n
+        under_frac = sum(1 for c, _ in _SAMPLES
+                         if c < SNAPSHOT_MAX_CONNECTIONS) / n
+        print(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
+        print(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
+              f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
+        print(f"  {'under-saturated (<4 in flight)':<38}"
+              f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
+
+    if t.writes:
+        secs = [s for s, _ in t.writes]
+        print("\n(D) PARQUET WRITE GROWTH")
+        print(f"  {'writes':<38}{len(t.writes):>9d}")
+        print(f"  {'first write':<38}{t.writes[0][0]:>9.1f}s "
+              f"({t.writes[0][1]:,} rows)")
+        print(f"  {'last write':<38}{t.writes[-1][0]:>9.1f}s "
+              f"({t.writes[-1][1]:,} rows)")
+        print(f"  {'mean / max write':<38}"
+              f"{sum(secs) / len(secs):>9.1f}s / {max(secs):.1f}s")
+    print("=" * 64)
 
 
 def _preflight_store() -> None:
@@ -463,7 +602,11 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
     rather than skipping a partial gap.
     """
     years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
+    t_lk = time.monotonic()
+    _set_local_busy(True)
     already = set() if force else loaded_keys(ticker, years)
+    _set_local_busy(False)
+    TIMING.loaded_keys += time.monotonic() - t_lk
 
     fetched = 0
     for w_start, w_end in batches:
@@ -525,7 +668,12 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                 pool.submit(_enum_one, d): ("enum", d, None, None) for d in todo
             }
             while pending:
+                t_wait = time.monotonic()
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                TIMING.fanout_blocked += time.monotonic() - t_wait
+
+                t_local = time.monotonic()
+                _set_local_busy(True)
                 for fut in done:
                     kind, sess, exp, snap = pending.pop(fut)
 
@@ -537,6 +685,8 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                                 (sess, f"{type(exc).__name__}: {exc}"))
                             continue
                         busy_seconds += elapsed
+                        TIMING.enum_secs += elapsed
+                        TIMING.enum_count += 1
                         # exp >= sess is a no-op safety net: a contract listed
                         # on sess necessarily expires on or after sess.
                         exps = sorted(e for e in raw_exps if e >= sess)
@@ -557,6 +707,8 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                     try:
                         elapsed, raw = fut.result()
                         busy_seconds += elapsed
+                        TIMING.query_secs += elapsed
+                        TIMING.query_count += 1
                         if raw.empty:
                             n_empty += 1
                             continue
@@ -586,7 +738,11 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         n_ok += 1
                         frames.append(projected)
 
+                _set_local_busy(False)
+                TIMING.local_compute += time.monotonic() - t_local
+
         batch_wall = time.monotonic() - batch_t0
+        TIMING.fanout_wall += batch_wall
         n_requests = n_queries + len(todo)
         log.info("  %s %s..%s: %d sessions, %d point queries, %d requests in "
                  "%.1fs | measured concurrency %.2f of %d "
@@ -635,6 +791,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         combined = pd.concat(frames, ignore_index=True)
         write_t0 = time.monotonic()
+        _set_local_busy(True)
         try:
             by_year = write_rows(ticker, combined)
         except Exception as exc:
@@ -656,7 +813,10 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                       ticker, w_start, w_end, len(combined))
             continue
 
+        _set_local_busy(False)
         write_secs = time.monotonic() - write_t0
+        TIMING.parquet_write += write_secs
+        TIMING.writes.append((write_secs, len(combined)))
         fetched += len(combined)
         for y, n in sorted(by_year.items()):
             p = year_path(ticker, y)
@@ -725,6 +885,10 @@ def main() -> None:
     print("Note: the last session is included even if today's 15:45 snapshot "
           "has not happened yet — it simply returns no data.\n")
 
+    run_t0 = time.monotonic()
+    reset_snapshot_timing()
+    _start_sampler()
+
     _preflight_store()
 
     print("Checking ThetaData ...", end=" ", flush=True)
@@ -734,6 +898,7 @@ def main() -> None:
     print(f"Per-request caps: connect 10s, read 45s, hard total "
           f"{SNAPSHOT_TOTAL_TIMEOUT}s. Watchdog reports stalls every 30s.\n")
 
+    TIMING.startup = time.monotonic() - run_t0
     _start_watchdog()
 
     # Tickers are sequential on purpose: the 4-connection budget is spent
@@ -753,15 +918,28 @@ def main() -> None:
                 failed_tickers.append(t)
             bar.update(1)
 
+    _SAMPLER_STOP.set()
+    _WATCHDOG_STOP.set()
+
     print(f"\n{total:,} rows fetched and merged into {CHAIN_SNAPSHOTS_DIR}")
     print("Fetch-and-store only — no metrics repointed, no cron wired.")
+
+    _print_timing_summary(time.monotonic() - run_t0)
 
     if failed_tickers:
         print(f"\n{len(failed_tickers)} ticker(s) FAILED: "
               f"{', '.join(failed_tickers[:10])}"
               f"{' ...' if len(failed_tickers) > 10 else ''}")
 
-    # A run that stores nothing must not look like a success.
+    # A run that attempted no requests at all had nothing to do (everything
+    # already loaded) — that is a legitimate no-op, not a failure.
+    attempted = TIMING.enum_count + TIMING.query_count
+    if total == 0 and attempted == 0 and not failed_tickers:
+        print("\nNothing to do — every (date, snapshot) cell was already "
+              "loaded. Use --force to refetch.")
+        return
+
+    # A run that DID work but stored nothing must not look like a success.
     if total == 0:
         raise SystemExit(
             "\nFAILED: no rows were stored.\n"
