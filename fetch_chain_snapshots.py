@@ -111,11 +111,13 @@ from lib.market_hours import get_trading_days, last_trading_day, next_trading_da
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
     SNAPSHOT_MAX_CONNECTIONS,
+    SNAPSHOT_TIMING,
     SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
     enumerate_expirations_eod,
     fetch_first_order_raw,
+    reset_snapshot_timing,
     test_connection,
 )
 
