@@ -89,18 +89,29 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import itertools
 import logging
-import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pandas as pd
 from tqdm import tqdm
 
 from config import CHAIN_EOD_DIR, CHAIN_SNAPSHOTS_DIR
+from lib.chain_fetch_common import (
+    TIMING,
+    chunk_range,
+    preflight_store,
+    print_timing_summary,
+    prompt_date,
+    prompt_tickers,
+    set_local_busy,
+    start_sampler,
+    start_watchdog,
+    stop_background_threads,
+    to_date_series,
+    track,
+)
 from lib.chain_snapshot_store import (
     SNAPSHOT_LABELS,
     loaded_keys,
@@ -111,7 +122,6 @@ from lib.market_hours import get_trading_days, last_trading_day, next_trading_da
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
     SNAPSHOT_MAX_CONNECTIONS,
-    SNAPSHOT_TIMING,
     SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
@@ -165,50 +175,6 @@ _EXPECTED_VENDOR_FIELDS = {
 }
 
 
-# --- Prompts ---------------------------------------------------------------
-
-def _prompt_tickers() -> list[str]:
-    raw = input(
-        "Tickers (comma-separated; blank = all tickers in OI store): "
-    ).strip()
-    if raw:
-        return [t.strip().upper() for t in raw.split(",") if t.strip()]
-    out = list_oi_tickers()
-    if not out:
-        raise SystemExit(
-            "No tickers entered and OI store is empty — please specify."
-        )
-    return out
-
-
-def _prompt_date(label: str) -> date:
-    while True:
-        raw = input(f"{label} (YYYYMMDD): ").strip()
-        try:
-            return datetime.strptime(raw, "%Y%m%d").date()
-        except ValueError:
-            print("  Use YYYYMMDD (e.g. 20240102)")
-
-
-# --- Date chunking ---------------------------------------------------------
-
-def chunk_range(start: date, end: date, max_days: int) -> list[tuple[date, date]]:
-    """Split [start, end] into inclusive calendar-day windows of <= max_days.
-
-    These are WRITE batches, not request windows — every request the fetcher
-    issues covers a single session.  A batch with no trading days is harmless:
-    it yields no sessions and is skipped.
-    """
-    if max_days < 1:
-        raise ValueError("max_days must be >= 1")
-    out: list[tuple[date, date]] = []
-    cur = start
-    while cur <= end:
-        w_end = min(cur + timedelta(days=max_days - 1), end)
-        out.append((cur, w_end))
-        cur = w_end + timedelta(days=1)
-    return out
-
 
 # --- Projection ------------------------------------------------------------
 
@@ -233,20 +199,6 @@ def _warn_unknown_fields(raw: pd.DataFrame) -> None:
             "storing as NULL.", ", ".join(sorted(missing))
         )
 
-
-def _to_date_series(s: pd.Series) -> pd.Series:
-    """Parse a vendor date column that may be 'YYYY-MM-DD', 'YYYYMMDD', or the
-    integer 20241104.
-
-    Stringify first — pd.to_datetime on a raw int reads it as a nanosecond
-    epoch.  Numeric columns route through Int64 rather than a plain
-    astype("string"): if a single row has a null date the whole column comes
-    back as float64, and str(20241104.0) is "20241104.0", which parses to NaT
-    and would silently drop EVERY row in the response.
-    """
-    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
-        s = s.astype("Int64")
-    return pd.to_datetime(s.astype("string"), errors="coerce")
 
 
 def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
@@ -303,7 +255,7 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
     # the row timestamp, then the session we asked for. The last fallback is
     # what stops a timestamp-format change from silently emptying the store.
     if "date" in raw.columns:
-        td = _to_date_series(raw["date"]).dt.date
+        td = to_date_series(raw["date"]).dt.date
     else:
         td = ts.dt.date
     n_fallback = int(td.isna().sum())
@@ -337,7 +289,7 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
         "snapshot":             snapshot,
         "feature_date":         td.map(fd_map),
         "timestamp":            ts,
-        "expiration":           _to_date_series(raw["expiration"]).dt.date,
+        "expiration":           to_date_series(raw["expiration"]).dt.date,
         "strike":               pd.to_numeric(raw.get("strike"), errors="coerce"),
         "option_type":          otype,
         "bid":                  pd.to_numeric(raw.get("bid"), errors="coerce"),
@@ -363,230 +315,6 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
 
 # --- Per-ticker fetch ------------------------------------------------------
 
-# --- Run timing accounting --------------------------------------------------
-#
-# Two decompositions, because with 4 concurrent workers they cannot be one:
-#
-#   (A) A MECE wall-clock timeline of the MAIN thread. At any instant the run
-#       is in exactly one of these, so they sum to total wall clock and the
-#       remainder is surfaced as "unaccounted".
-#   (B) Worker-side aggregates, which OVERLAP each other and (A) by design —
-#       4 workers can accumulate 4 seconds of request time per wall second.
-#       These give effective concurrency and per-request latency.
-#
-# Reporting them as one table would be wrong; the summary keeps them apart.
-
-class _RunTiming:
-    def __init__(self) -> None:
-        # (A) main-thread wall clock, mutually exclusive
-        self.startup = 0.0
-        self.loaded_keys = 0.0
-        self.fanout_blocked = 0.0      # main thread waiting on futures
-        self.local_compute = 0.0       # projection / result handling
-        self.parquet_write = 0.0
-        # (B) worker-side, concurrent
-        self.enum_secs = 0.0
-        self.enum_count = 0
-        self.query_secs = 0.0
-        self.query_count = 0
-        self.fanout_wall = 0.0         # blocked + local_compute
-        # write growth through the run
-        self.writes: list[tuple[float, int]] = []   # (seconds, new rows)
-
-
-TIMING = _RunTiming()
-
-# Sampled occupancy, for idle / under-saturation attribution.
-_SAMPLES: list[tuple[int, bool]] = []      # (in-flight count, local work busy)
-_LOCAL_BUSY = False
-_SAMPLER_STOP = threading.Event()
-
-
-def _set_local_busy(v: bool) -> None:
-    """Mark whether the main thread is doing local (non-network) work.
-
-    Read by the sampler to distinguish genuine dead time (nothing in flight
-    AND nothing being computed) from local work that legitimately runs with
-    the connections idle.
-    """
-    global _LOCAL_BUSY
-    _LOCAL_BUSY = v
-
-
-def _start_sampler(interval: float = 0.1) -> None:
-    def _run() -> None:
-        while not _SAMPLER_STOP.wait(interval):
-            with _INFLIGHT_LOCK:
-                n = len(_INFLIGHT)
-            _SAMPLES.append((n, _LOCAL_BUSY))
-    threading.Thread(target=_run, daemon=True, name="sampler").start()
-
-
-# --- In-flight tracking + watchdog -----------------------------------------
-#
-# A stalled run must never be ambiguous. The watchdog reports what is in
-# flight and for how long; critically, "0 in flight" while the run appears
-# stopped proves the stall is LOCAL (parquet merge, sort, loaded_keys) rather
-# than a hung vendor request, which are fixed in completely different places.
-
-_INFLIGHT: dict[int, tuple[str, float]] = {}
-_INFLIGHT_LOCK = threading.Lock()
-_INFLIGHT_SEQ = itertools.count()
-_WATCHDOG_STOP = threading.Event()
-
-
-@contextmanager
-def _track(label: str):
-    key = next(_INFLIGHT_SEQ)
-    with _INFLIGHT_LOCK:
-        _INFLIGHT[key] = (label, time.monotonic())
-    try:
-        yield
-    finally:
-        with _INFLIGHT_LOCK:
-            _INFLIGHT.pop(key, None)
-
-
-def _start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
-    """Log in-flight requests whenever one has been running unusually long."""
-    def _run() -> None:
-        while not _WATCHDOG_STOP.wait(interval):
-            now = time.monotonic()
-            with _INFLIGHT_LOCK:
-                ages = sorted((now - t0, label) for label, t0 in _INFLIGHT.values())
-            if not ages:
-                log.warning("WATCHDOG: 0 requests in flight — if the run looks "
-                            "stopped, it is NOT waiting on the vendor (check "
-                            "the parquet merge/sort or loaded_keys)")
-                continue
-            if ages[-1][0] >= stall_after:
-                log.warning("WATCHDOG: %d in flight, oldest %.0fs (hard cap "
-                            "%ds): %s", len(ages), ages[-1][0],
-                            SNAPSHOT_TOTAL_TIMEOUT,
-                            "; ".join(f"{lab} {age:.0f}s"
-                                      for age, lab in ages[-4:]))
-
-    threading.Thread(target=_run, daemon=True, name="watchdog").start()
-
-
-def _print_timing_summary(wall_total: float) -> None:
-    """Attribute the run's wall clock, then report the concurrent overlay."""
-    t = TIMING
-    accounted = (t.startup + t.loaded_keys + t.fanout_blocked
-                 + t.local_compute + t.parquet_write)
-    unaccounted = wall_total - accounted
-
-    def pct(x: float) -> float:
-        return (100.0 * x / wall_total) if wall_total > 0 else 0.0
-
-    def row(label: str, secs: float) -> None:
-        print(f"  {label:<38}{secs:>9.1f}s {pct(secs):>6.1f}%")
-
-    print("\n" + "=" * 64)
-    print("TIMING SUMMARY")
-    print("=" * 64)
-    print("(A) WALL CLOCK — main-thread timeline, mutually exclusive,")
-    print("    sums to 100%. This is where the run's real time went.")
-    print(f"  {'TOTAL':<38}{wall_total:>9.1f}s {100.0:>6.1f}%")
-    row("startup (preflight + conn test)", t.startup)
-    row("loaded_keys (resumability read)", t.loaded_keys)
-    row("fan-out: blocked on network", t.fanout_blocked)
-    row("fan-out: local compute (projection)", t.local_compute)
-    row("parquet write (merge+sort+rewrite)", t.parquet_write)
-    row("unaccounted", unaccounted)
-
-    worker_total = t.enum_secs + t.query_secs
-    http  = SNAPSHOT_TIMING["http_seconds"]
-    parse = SNAPSHOT_TIMING["parse_seconds"]
-    mb    = SNAPSHOT_TIMING["http_bytes"] / 1e6
-
-    print("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
-    print("    4 workers accrue up to 4s of request time per wall second,")
-    print("    so these deliberately do not sum into (A).")
-    print(f"  {'total request time':<38}{worker_total:>9.1f}s")
-    if worker_total > 0:
-        print(f"  {'  of which HTTP transfer':<38}{http:>9.1f}s "
-              f"{100.0 * http / worker_total:>6.1f}%")
-        print(f"  {'  of which decode (json/rows/frame)':<38}{parse:>9.1f}s "
-              f"{100.0 * parse / worker_total:>6.1f}%")
-    print(f"  {'bytes received':<38}{mb:>9.1f} MB")
-    if t.enum_count:
-        print(f"  enumeration:   {t.enum_count:>6d} calls, {t.enum_secs:>8.1f}s "
-              f"total, {t.enum_secs / t.enum_count:>6.2f}s avg")
-    if t.query_count:
-        print(f"  point queries: {t.query_count:>6d} calls, {t.query_secs:>8.1f}s "
-              f"total, {t.query_secs / t.query_count:>6.2f}s avg")
-    if worker_total > 0 and t.enum_count and t.query_count:
-        print(f"  enumeration share of request time: "
-              f"{100.0 * t.enum_secs / worker_total:.1f}%")
-
-    print("\n(C) CONCURRENCY / SATURATION")
-    eff = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
-    print(f"  {'effective concurrency':<38}{eff:>9.2f} of "
-          f"{SNAPSHOT_MAX_CONNECTIONS}")
-    n = len(_SAMPLES)
-    if n:
-        mean_inflight = sum(c for c, _ in _SAMPLES) / n
-        idle_frac  = sum(1 for c, busy in _SAMPLES if c == 0 and not busy) / n
-        under_frac = sum(1 for c, _ in _SAMPLES
-                         if c < SNAPSHOT_MAX_CONNECTIONS) / n
-        print(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
-        print(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
-              f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
-        print(f"  {'under-saturated (<4 in flight)':<38}"
-              f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
-
-    if t.writes:
-        secs = [s for s, _ in t.writes]
-        print("\n(D) PARQUET WRITE GROWTH")
-        print(f"  {'writes':<38}{len(t.writes):>9d}")
-        print(f"  {'first write':<38}{t.writes[0][0]:>9.1f}s "
-              f"({t.writes[0][1]:,} rows)")
-        print(f"  {'last write':<38}{t.writes[-1][0]:>9.1f}s "
-              f"({t.writes[-1][1]:,} rows)")
-        print(f"  {'mean / max write':<38}"
-              f"{sum(secs) / len(secs):>9.1f}s / {max(secs):.1f}s")
-    print("=" * 64)
-
-
-def _preflight_store() -> None:
-    """Resolve the store path, prove it is writable, and report .tmp orphans.
-
-    Runs before any fetching so a misconfigured or unwritable store fails in
-    seconds rather than after an hour of successful fetching that stores
-    nothing.  Creating the directory here also means its absence after a run
-    is no longer ambiguous: the folder always exists, so an empty one means
-    "no rows survived", not "the path was wrong".
-    """
-    print(f"Store:    {CHAIN_SNAPSHOTS_DIR}")
-    print(f"Sibling:  {CHAIN_EOD_DIR}  (exists={CHAIN_EOD_DIR.exists()})")
-    log.info("CHAIN_SNAPSHOTS_DIR resolves to %s", CHAIN_SNAPSHOTS_DIR)
-
-    try:
-        CHAIN_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        raise SystemExit(f"FATAL: cannot create {CHAIN_SNAPSHOTS_DIR}: {exc}")
-
-    probe = CHAIN_SNAPSHOTS_DIR / ".write_probe"
-    try:
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-    except Exception as exc:
-        raise SystemExit(
-            f"FATAL: {CHAIN_SNAPSHOTS_DIR} is not writable by this process: {exc}"
-        )
-    log.info("  write permission OK")
-
-    orphans = sorted(CHAIN_SNAPSHOTS_DIR.glob("*/*.parquet.tmp"))
-    if orphans:
-        log.error("  %d orphaned .parquet.tmp file(s) — a previous write died "
-                  "between write and rename. Inspect before trusting the "
-                  "store: %s", len(orphans),
-                  ", ".join(str(p) for p in orphans[:5]))
-    else:
-        log.info("  no orphaned .tmp files")
-
-
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  force: bool = False, debug_response: bool = False) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
@@ -605,9 +333,9 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
     """
     years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
     t_lk = time.monotonic()
-    _set_local_busy(True)
+    set_local_busy(True)
     already = set() if force else loaded_keys(ticker, years)
-    _set_local_busy(False)
+    set_local_busy(False)
     TIMING.loaded_keys += time.monotonic() - t_lk
 
     fetched = 0
@@ -653,13 +381,13 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         def _enum_one(sess: date) -> tuple[float, set[date]]:
             t0 = time.monotonic()
-            with _track(f"enum {ticker} {sess}"):
+            with track(f"enum {ticker} {sess}"):
                 out = enumerate_expirations_eod(ticker, sess, sess)
             return time.monotonic() - t0, out
 
         def _fetch_one(sess: date, exp: date, snap: str) -> tuple[float, pd.DataFrame]:
             t0 = time.monotonic()
-            with _track(f"{ticker} exp={exp} {sess}@{snap}"):
+            with track(f"{ticker} exp={exp} {sess}@{snap}"):
                 out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
             return time.monotonic() - t0, out
 
@@ -675,7 +403,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                 TIMING.fanout_blocked += time.monotonic() - t_wait
 
                 t_local = time.monotonic()
-                _set_local_busy(True)
+                set_local_busy(True)
                 for fut in done:
                     kind, sess, exp, snap = pending.pop(fut)
 
@@ -740,7 +468,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         n_ok += 1
                         frames.append(projected)
 
-                _set_local_busy(False)
+                set_local_busy(False)
                 TIMING.local_compute += time.monotonic() - t_local
 
         batch_wall = time.monotonic() - batch_t0
@@ -793,7 +521,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         combined = pd.concat(frames, ignore_index=True)
         write_t0 = time.monotonic()
-        _set_local_busy(True)
+        set_local_busy(True)
         try:
             by_year = write_rows(ticker, combined)
         except Exception as exc:
@@ -815,7 +543,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                       ticker, w_start, w_end, len(combined))
             continue
 
-        _set_local_busy(False)
+        set_local_busy(False)
         write_secs = time.monotonic() - write_t0
         TIMING.parquet_write += write_secs
         TIMING.writes.append((write_secs, len(combined)))
@@ -858,12 +586,12 @@ def main() -> None:
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        tickers = _prompt_tickers()
+        tickers = prompt_tickers(list_oi_tickers)
 
     start = (datetime.strptime(args.start, "%Y%m%d").date()
-             if args.start else _prompt_date("Fetch start date"))
+             if args.start else prompt_date("Fetch start date"))
     end = (datetime.strptime(args.end, "%Y%m%d").date()
-           if args.end else _prompt_date("Fetch end   date"))
+           if args.end else prompt_date("Fetch end   date"))
     if end < start:
         raise SystemExit("End date must be >= start date.")
 
@@ -889,9 +617,9 @@ def main() -> None:
 
     run_t0 = time.monotonic()
     reset_snapshot_timing()
-    _start_sampler()
+    start_sampler()
 
-    _preflight_store()
+    preflight_store(CHAIN_SNAPSHOTS_DIR, CHAIN_EOD_DIR)
 
     print("Checking ThetaData ...", end=" ", flush=True)
     if not test_connection():
@@ -901,7 +629,7 @@ def main() -> None:
           f"{SNAPSHOT_TOTAL_TIMEOUT}s. Watchdog reports stalls every 30s.\n")
 
     TIMING.startup = time.monotonic() - run_t0
-    _start_watchdog()
+    start_watchdog()
 
     # Tickers are sequential on purpose: the 4-connection budget is spent
     # inside each chunk's fan-out, so ticker-level parallelism would buy
@@ -920,13 +648,12 @@ def main() -> None:
                 failed_tickers.append(t)
             bar.update(1)
 
-    _SAMPLER_STOP.set()
-    _WATCHDOG_STOP.set()
+    stop_background_threads()
 
     print(f"\n{total:,} rows fetched and merged into {CHAIN_SNAPSHOTS_DIR}")
     print("Fetch-and-store only — no metrics repointed, no cron wired.")
 
-    _print_timing_summary(time.monotonic() - run_t0)
+    print_timing_summary(time.monotonic() - run_t0)
 
     if failed_tickers:
         print(f"\n{len(failed_tickers)} ticker(s) FAILED: "

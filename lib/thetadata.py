@@ -1115,6 +1115,60 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
     return out
 
 
+def fetch_first_order_window(symbol: str, expiration: date, trade_date: date,
+                             start_time: str, end_time: str,
+                             interval: str = "5m",
+                             timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """Raw first-order greeks/quotes for ONE expiration over ONE session,
+    across a time window at `interval` granularity.
+
+    Generalises fetch_first_order_raw, which is the start_time == end_time
+    (single instant) case.  Used by fetch_chain_intraday.py to pull a full
+    day of 5-minute bars in one call:
+
+        start_date == end_date == trade_date     (one session, never a range)
+        start_time=09:35:00, end_time=16:00:00, interval=5m
+
+    The single-session constraint is deliberate and load-bearing — see
+    fetch_first_order_raw for why multi-day windows caused 570s and timeouts.
+
+    All strikes and both rights are returned — no `strike_range` is sent.
+
+    Returns ALL vendor fields with no field- or row-filtering.  Empty
+    DataFrame on NoDataError or an empty response.  A 570 propagates: the
+    window is already one session, so there is no date range left to split.
+    """
+    date_str = trade_date.strftime("%Y%m%d")
+    params = {
+        "symbol":     symbol.upper(),
+        "expiration": expiration.strftime("%Y%m%d"),
+        "start_date": date_str,
+        "end_date":   date_str,
+        "interval":   interval,
+        "start_time": start_time,
+        "end_time":   end_time,
+    }
+    label = (f"first_order {symbol} exp={expiration} {trade_date} "
+             f"{start_time}..{end_time} @{interval}")
+
+    try:
+        data = _get_with_retry(
+            "/v3/option/history/greeks/first_order", params, timeout, label
+        )
+    except NoDataError:
+        return pd.DataFrame()
+    except LargeRequestError:
+        log.warning("  570 on %s — already a single session, cannot split "
+                    "the date range further", label)
+        raise
+
+    t_parse = time.monotonic()
+    rows = _parse_rows(data)
+    out = pd.DataFrame(rows) if rows else pd.DataFrame()
+    _add_timing(parse_seconds=time.monotonic() - t_parse)
+    return out
+
+
 def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
                           snapshot_time: str,
                           interval: str = "5m",

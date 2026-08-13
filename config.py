@@ -38,3 +38,10 @@ CHAIN_EOD_DIR      = Path(os.environ.get("CHAIN_EOD_DIR", str(_default_chain_dir
 _default_chain_snap_dir = CHAIN_EOD_DIR.parent / "chain_snapshots"
 CHAIN_SNAPSHOTS_DIR     = Path(os.environ.get("CHAIN_SNAPSHOTS_DIR",
                                               str(_default_chain_snap_dir))).resolve()
+
+# --- Parquet store for full-day 5-minute intraday chain bars ----------------
+# Same sibling-of-chain_eod derivation as CHAIN_SNAPSHOTS_DIR above, for the
+# same reason: never PROJECT_ROOT, which is not where the data stores live.
+_default_chain_intraday_dir = CHAIN_EOD_DIR.parent / "chain_intraday"
+CHAIN_INTRADAY_DIR          = Path(os.environ.get("CHAIN_INTRADAY_DIR",
+                                                  str(_default_chain_intraday_dir))).resolve()
