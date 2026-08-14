@@ -161,6 +161,36 @@ def read_year(ticker: str, year: int,
     return pd.read_parquet(p, columns=columns)
 
 
+def loaded_cells(ticker: str,
+                 years: set[int] | None = None,
+                 dates: set[date] | None = None) -> set[tuple[date, date, str]]:
+    """(trade_date, expiration, snapshot) triples present in the store.
+
+    This is the granularity at which point queries actually fail, so it is the
+    granularity gap repair has to work at. `loaded_keys` below is coarser —
+    (trade_date, snapshot) — which is why a plain re-run cannot see a hole
+    inside a session that wrote *some* expirations.
+
+    Reads three columns only. Pass `years` and/or `dates` to bound the scan.
+    """
+    out: set[tuple[date, date, str]] = set()
+    for y in list_years(ticker):
+        if years is not None and y not in years:
+            continue
+        try:
+            tbl = pq.read_table(year_path(ticker, y),
+                                columns=["trade_date", "expiration", "snapshot"])
+        except Exception:
+            continue
+        df = tbl.to_pandas().drop_duplicates()
+        if dates is not None:
+            df = df[df["trade_date"].isin(dates)]
+        for td, exp, sn in zip(df["trade_date"], df["expiration"], df["snapshot"]):
+            if td is not None and exp is not None and sn is not None:
+                out.add((td, exp, str(sn)))
+    return out
+
+
 def loaded_keys(ticker: str, years: set[int] | None = None) -> set[tuple[date, str]]:
     """Distinct (trade_date, snapshot) pairs already present for this ticker.
 

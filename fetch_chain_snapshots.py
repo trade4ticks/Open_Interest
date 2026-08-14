@@ -117,6 +117,7 @@ from lib.chain_fetch_common import (
 )
 from lib.chain_snapshot_store import (
     SNAPSHOT_LABELS,
+    loaded_cells,
     loaded_keys,
     write_rows,
     year_path,
@@ -322,7 +323,8 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
 # --- Per-ticker fetch ------------------------------------------------------
 
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
-                 force: bool = False, debug_response: bool = False) -> int:
+                 force: bool = False, debug_response: bool = False,
+                 repair: bool = False) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
 
     Every ThetaData request issued here is a point query — one expiration,
@@ -340,7 +342,15 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
     years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
     t_lk = time.monotonic()
     set_local_busy(True)
-    already = set() if force else loaded_keys(ticker, years)
+    if repair:
+        # Repair works at (session, expiration, label) — the granularity at
+        # which point queries actually fail. The coarse (session, label) key
+        # cannot see a hole inside a session that wrote some expirations.
+        already = set()
+        present_cells = loaded_cells(ticker, years)
+    else:
+        already = set() if force else loaded_keys(ticker, years)
+        present_cells = set()
     set_local_busy(False)
     TIMING.loaded_keys += time.monotonic() - t_lk
 
@@ -350,8 +360,13 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         if not sessions:
             continue
 
-        todo = [d for d in sessions
-                if any((d, s) not in already for s in SNAPSHOT_LABELS)]
+        # In repair mode every session is re-enumerated: the whole point is to
+        # discover cells the store is missing, which by definition are not
+        # visible from what it already holds.
+        todo = sessions if repair else [
+            d for d in sessions
+            if any((d, s) not in already for s in SNAPSHOT_LABELS)
+        ]
         if not todo:
             log.info("  %s %s..%s: all %d sessions loaded — skip",
                      ticker, w_start, w_end, len(sessions))
@@ -379,6 +394,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         n_ok = n_empty = n_projected_away = 0
         raw_rows = proj_rows = 0
         n_queries = 0
+        n_repair_targets = 0
         first_raw_cols: list[str] | None = None
         # Sum of per-request wall time. Divided by batch wall time this gives
         # measured average concurrency — the direct check on whether the 4
@@ -438,7 +454,12 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         # for the other sessions to finish enumerating.
                         for e in exps:
                             for s in SNAPSHOT_LABELS:
-                                if (sess, s) in already:
+                                if repair:
+                                    # Refetch ONLY cells absent from the store.
+                                    if (sess, e, s) in present_cells:
+                                        continue
+                                    n_repair_targets += 1
+                                elif (sess, s) in already:
                                     continue
                                 n_queries += 1
                                 nf = pool.submit(_fetch_one, sess, e, s)
@@ -517,6 +538,18 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         # The one case that would otherwise look identical to "no data exists":
         # the vendor DID return rows and the projection discarded all of them.
+        if repair:
+            # A gap that refetches to nothing is not a failure — it means the
+            # vendor has no data for that (expiration, label) and the store is
+            # already as complete as it can be. Separating the two is the
+            # whole point: a second repair run should show recovered=0 and the
+            # same still-empty count, which is what "complete" looks like.
+            log.info("  %s %s..%s: REPAIR — %d missing cell(s) found, "
+                     "%d recovered with rows, %d returned no data (vendor has "
+                     "none), %d failed",
+                     ticker, w_start, w_end, n_repair_targets, n_ok, n_empty,
+                     len(failures))
+
         if raw_rows > 0 and proj_rows == 0:
             log.error("  %s %s..%s: %d raw rows returned but ALL were dropped "
                       "in projection — rows are dropped only when trade_date, "
@@ -579,7 +612,15 @@ def main() -> None:
         description="Fetch twice-daily (09:45 / 15:45) option chain snapshots."
     )
     ap.add_argument("--force", action="store_true",
-                    help="refetch (date, snapshot) cells already in the store")
+                    help=("refetch every (date, snapshot) cell in range. "
+                          "Overwrites in place — dedupe keeps the newest row, "
+                          "so re-running never duplicates."))
+    ap.add_argument("--repair", action="store_true",
+                    help=("gap repair: re-enumerate every session, diff "
+                          "against the (session, expiration, snapshot) cells "
+                          "actually stored, and refetch ONLY what is missing. "
+                          "This is the only mode that heals point-query "
+                          "failures inside an otherwise-written session."))
     ap.add_argument("--batch-days", type=int, default=DEFAULT_BATCH_DAYS,
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
@@ -599,6 +640,10 @@ def main() -> None:
     # Must happen before any request is in flight — it rebuilds the semaphore.
     if args.connections is not None:
         set_max_connections(args.connections)
+    if args.repair and args.force:
+        raise SystemExit("--repair and --force are mutually exclusive: "
+                         "--force refetches everything, --repair refetches "
+                         "only what is missing.")
 
     log_file = setup_file_logging("fetch_chain_snapshots")
 
@@ -666,7 +711,8 @@ def main() -> None:
         for t in tickers:
             try:
                 total += fetch_ticker(t, batches, force=args.force,
-                                      debug_response=args.debug_response)
+                                      debug_response=args.debug_response,
+                                      repair=args.repair)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
