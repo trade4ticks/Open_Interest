@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import math
 import threading
 import time
@@ -912,6 +913,53 @@ def fetch_option_quotes_at(symbol: str, expiration: date, trade_date: date,
 SNAPSHOT_MAX_CONNECTIONS = 4
 _SNAPSHOT_SEM = threading.BoundedSemaphore(SNAPSHOT_MAX_CONNECTIONS)
 
+
+def set_max_connections(n: int) -> None:
+    """Change the connection cap at runtime (--connections).
+
+    Rebuilds the semaphore, so callers must invoke this BEFORE any request is
+    in flight. Vendor guidance is that client in-flight requests should match
+    the Theta Terminal's HTTP_CONCURRENCY setting (default 4) — exceeding it
+    is documented to cause timeouts rather than clean rejections.
+    """
+    global SNAPSHOT_MAX_CONNECTIONS, _SNAPSHOT_SEM
+    if n < 1:
+        raise ValueError("connections must be >= 1")
+    SNAPSHOT_MAX_CONNECTIONS = n
+    _SNAPSHOT_SEM = threading.BoundedSemaphore(n)
+
+
+def max_connections() -> int:
+    """Current cap, read dynamically so --connections is reflected everywhere."""
+    return SNAPSHOT_MAX_CONNECTIONS
+
+
+# --- Retry policy -----------------------------------------------------------
+# Replaces a flat 60s sleep with one retry. That was both too long (the
+# documented API limit is ~10 req/s, and 4 workers at ~1s latency run at ~4/s,
+# so a full minute of penance was never proportionate) and too few attempts (a
+# second failure discarded the whole unit).
+#
+# Equal jitter — half the ceiling plus a random half — guarantees a real wait
+# while decorrelating the workers, which otherwise retry in lockstep and
+# recreate the burst that caused the 429.
+RETRY_MAX_ATTEMPTS = 5          # 1 initial attempt + 4 retries
+RETRY_BASE_SECONDS = 1.0
+RETRY_MAX_SLEEP    = 32.0
+
+
+def _backoff_delay(attempt: int) -> float:
+    ceiling = min(RETRY_MAX_SLEEP, RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    return ceiling / 2.0 + random.uniform(0.0, ceiling / 2.0)
+
+
+def describe_retry_policy() -> str:
+    return (f"exponential backoff with equal jitter, "
+            f"{RETRY_MAX_ATTEMPTS} attempts, base {RETRY_BASE_SECONDS:.0f}s, "
+            f"cap {RETRY_MAX_SLEEP:.0f}s (worst case ~"
+            f"{sum(min(RETRY_MAX_SLEEP, RETRY_BASE_SECONDS * 2 ** (a - 1)) for a in range(1, RETRY_MAX_ATTEMPTS)):.0f}s "
+            f"of sleep per unit)")
+
 # requests' scalar `timeout=` is a CONNECT and INTER-BYTE READ timeout, not a
 # cap on total request duration: every chunk received resets the read clock, so
 # a server that trickles bytes — or streams a very large body slowly — never
@@ -937,8 +985,9 @@ SNAPSHOT_TIMING: dict[str, float] = {
     "sem_wait_seconds": 0.0,   # blocked acquiring the connection semaphore
     "backoff_seconds":  0.0,   # sleeping in the 429 / 474 retry ladder
     "retry_count":      0.0,   # retries attempted (any reason)
-    "retry_429":        0.0,   # rate-limit retries       (60s sleep each)
-    "retry_474":        0.0,   # disconnect retries       (10s sleep each)
+    "retry_429":        0.0,   # rate-limit retries
+    "retry_474":        0.0,   # disconnect retries
+    "retry_exhausted":  0.0,   # units that used every attempt and still failed
 }
 
 
@@ -1071,22 +1120,30 @@ def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
                                the date window and retries both halves
     read timeout / 500      -> propagate; caller logs and excludes this unit
     """
-    try:
-        return _get_capped(endpoint, params, timeout=timeout)
-    except RateLimitError:
-        log.warning("Rate limited — sleeping 60s, retrying once (%s)", label)
+    last_exc: Exception | None = None
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return _get_capped(endpoint, params, timeout=timeout)
+        except RateLimitError as exc:
+            last_exc, reason = exc, "429"
+        except ServerDisconnectedError as exc:
+            last_exc, reason = exc, "474"
+
+        if attempt == RETRY_MAX_ATTEMPTS:
+            _add_timing(retry_exhausted=1)
+            log.warning("%s on %s — exhausted %d attempts, giving up",
+                        reason, label, RETRY_MAX_ATTEMPTS)
+            break
+
+        delay = _backoff_delay(attempt)
+        log.warning("%s on %s — attempt %d/%d, backing off %.1fs",
+                    reason, label, attempt, RETRY_MAX_ATTEMPTS, delay)
         t0 = time.monotonic()
-        time.sleep(60)
-        _add_timing(backoff_seconds=time.monotonic() - t0,
-                    retry_count=1, retry_429=1)
-        return _get_capped(endpoint, params, timeout=timeout)
-    except ServerDisconnectedError:
-        log.warning("Server disconnected — sleeping 10s, retrying once (%s)", label)
-        t0 = time.monotonic()
-        time.sleep(10)
-        _add_timing(backoff_seconds=time.monotonic() - t0,
-                    retry_count=1, retry_474=1)
-        return _get_capped(endpoint, params, timeout=timeout)
+        time.sleep(delay)
+        _add_timing(**{"backoff_seconds": time.monotonic() - t0,
+                       "retry_count": 1, f"retry_{reason}": 1})
+
+    raise last_exc
 
 
 def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,

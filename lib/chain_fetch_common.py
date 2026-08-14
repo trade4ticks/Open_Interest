@@ -25,9 +25,65 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from lib.thetadata import SNAPSHOT_MAX_CONNECTIONS, SNAPSHOT_TIMING, SNAPSHOT_TOTAL_TIMEOUT
+from lib.thetadata import (
+    SNAPSHOT_TIMING,
+    SNAPSHOT_TOTAL_TIMEOUT,
+    describe_retry_policy,
+    max_connections,
+)
 
 log = logging.getLogger(__name__)
+
+
+# --- File logging -----------------------------------------------------------
+# Everything a run produces must survive the terminal: log records AND the
+# summary tables. Both go through the same file object so their interleaving
+# on disk matches what was on screen.
+
+_LOG_STREAM = None
+_LOG_PATH: Path | None = None
+
+
+def setup_file_logging(script_name: str, log_dir: Path | None = None) -> Path:
+    """Tee all logging and summary output to logs/<script>_<timestamp>.log.
+
+    Returns the path. `logs/` is already gitignored.
+    """
+    global _LOG_STREAM, _LOG_PATH
+    d = log_dir or (Path(__file__).resolve().parent.parent / "logs")
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{script_name}_{datetime.now():%Y%m%d_%H%M%S}.log"
+    # Line-buffered so a killed run still leaves a usable log.
+    _LOG_STREAM = open(path, "w", encoding="utf-8", buffering=1)
+    _LOG_PATH = path
+    handler = logging.StreamHandler(_LOG_STREAM)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s", "%H:%M:%S"))
+    logging.getLogger().addHandler(handler)
+    return path
+
+
+def log_path() -> Path | None:
+    return _LOG_PATH
+
+
+def _emit(line: str = "") -> None:
+    """Write a summary line to stdout and to the run log."""
+    print(line)
+    if _LOG_STREAM is not None:
+        try:
+            _LOG_STREAM.write(line + "\n")
+        except Exception:
+            pass
+
+
+def close_file_logging() -> None:
+    global _LOG_STREAM
+    if _LOG_STREAM is not None:
+        try:
+            _LOG_STREAM.flush()
+        except Exception:
+            pass
 
 
 # --- Run timing accounting --------------------------------------------------
@@ -201,14 +257,14 @@ def print_timing_summary(wall_total: float,
         return (100.0 * x / wall_total) if wall_total > 0 else 0.0
 
     def row(label: str, secs: float) -> None:
-        print(f"  {label:<38}{secs:>9.1f}s {pct(secs):>6.1f}%")
+        _emit(f"  {label:<38}{secs:>9.1f}s {pct(secs):>6.1f}%")
 
-    print("\n" + "=" * 64)
-    print("TIMING SUMMARY")
-    print("=" * 64)
-    print("(A) WALL CLOCK — main-thread timeline, mutually exclusive,")
-    print("    sums to 100%. This is where the run's real time went.")
-    print(f"  {'TOTAL':<38}{wall_total:>9.1f}s {100.0:>6.1f}%")
+    _emit("\n" + "=" * 64)
+    _emit("TIMING SUMMARY")
+    _emit("=" * 64)
+    _emit("(A) WALL CLOCK — main-thread timeline, mutually exclusive,")
+    _emit("    sums to 100%. This is where the run's real time went.")
+    _emit(f"  {'TOTAL':<38}{wall_total:>9.1f}s {100.0:>6.1f}%")
     row("startup (preflight + conn test)", t.startup)
     row("loaded_keys (resumability read)", t.loaded_keys)
     row("fan-out: blocked on network", t.fanout_blocked)
@@ -221,26 +277,26 @@ def print_timing_summary(wall_total: float,
     parse = SNAPSHOT_TIMING["parse_seconds"]
     mb    = SNAPSHOT_TIMING["http_bytes"] / 1e6
 
-    print("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
-    print(f"    {SNAPSHOT_MAX_CONNECTIONS} workers accrue up to "
-          f"{SNAPSHOT_MAX_CONNECTIONS}s of request time per wall second,")
-    print("    so these deliberately do not sum into (A).")
-    print(f"  {'total request time (SUCCEEDED only)':<38}{worker_total:>9.1f}s")
+    _emit("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
+    _emit(f"    {max_connections()} workers accrue up to "
+          f"{max_connections()}s of request time per wall second,")
+    _emit("    so these deliberately do not sum into (A).")
+    _emit(f"  {'total request time (SUCCEEDED only)':<38}{worker_total:>9.1f}s")
     if worker_total > 0:
-        print(f"  {'  of which HTTP transfer':<38}{http:>9.1f}s "
+        _emit(f"  {'  of which HTTP transfer':<38}{http:>9.1f}s "
               f"{100.0 * http / worker_total:>6.1f}%")
-        print(f"  {'  of which decode (json/rows/frame)':<38}{parse:>9.1f}s "
+        _emit(f"  {'  of which decode (json/rows/frame)':<38}{parse:>9.1f}s "
               f"{100.0 * parse / worker_total:>6.1f}%")
-    print(f"  {'bytes received':<38}{mb:>9.1f} MB")
+    _emit(f"  {'bytes received':<38}{mb:>9.1f} MB")
     if t.enum_count:
-        print(f"  enumeration:   {t.enum_count:>6d} calls, {t.enum_secs:>8.1f}s "
+        _emit(f"  enumeration:   {t.enum_count:>6d} calls, {t.enum_secs:>8.1f}s "
               f"total, {t.enum_secs / t.enum_count:>6.2f}s avg")
     if t.query_count:
-        print(f"  {query_label + ':':<15}{t.query_count:>6d} calls, "
+        _emit(f"  {query_label + ':':<15}{t.query_count:>6d} calls, "
               f"{t.query_secs:>8.1f}s total, "
               f"{t.query_secs / t.query_count:>6.2f}s avg")
     if worker_total > 0 and t.enum_count and t.query_count:
-        print(f"  enumeration share of request time: "
+        _emit(f"  enumeration share of request time: "
               f"{100.0 * t.enum_secs / worker_total:.1f}%")
 
     # --- (B2) authoritative worker-side accounting --------------------------
@@ -250,73 +306,81 @@ def print_timing_summary(wall_total: float,
     backoff = SNAPSHOT_TIMING["backoff_seconds"]
     task    = t.task_secs
 
-    print("\n(B2) TASK TIME — every task, including ones that FAILED.")
-    print("     Measured in the worker, so nothing is lost on the error path.")
-    print(f"  {'total TASK time (all outcomes)':<38}{task:>9.1f}s")
-    print(f"  {'  succeeded':<38}{task - t.task_failed_secs:>9.1f}s "
+    _emit("\n(B2) TASK TIME — every task, including ones that FAILED.")
+    _emit("     Measured in the worker, so nothing is lost on the error path.")
+    _emit(f"  {'total TASK time (all outcomes)':<38}{task:>9.1f}s")
+    _emit(f"  {'  succeeded':<38}{task - t.task_failed_secs:>9.1f}s "
           f"({t.task_count - t.task_failed_count:,} tasks)")
-    print(f"  {'  FAILED / timed out':<38}{t.task_failed_secs:>9.1f}s "
+    _emit(f"  {'  FAILED / timed out':<38}{t.task_failed_secs:>9.1f}s "
           f"({t.task_failed_count:,} tasks)")
     if task > 0:
-        print(f"  {'    (failed share of task time)':<38}"
+        _emit(f"  {'    (failed share of task time)':<38}"
               f"{100.0 * t.task_failed_secs / task:>9.1f}%")
-    print("  attribution inside task time:")
-    print(f"  {'    HTTP transfer':<38}{http:>9.1f}s")
-    print(f"  {'    decode (json/rows/frame)':<38}{parse:>9.1f}s")
-    print(f"  {'    backoff sleep (429/474 retries)':<38}{backoff:>9.1f}s")
-    print(f"  {'    semaphore wait':<38}{sem:>9.1f}s")
-    print(f"  {'    unattributed inside tasks':<38}"
+    _emit("  attribution inside task time:")
+    _emit(f"  {'    HTTP transfer':<38}{http:>9.1f}s")
+    _emit(f"  {'    decode (json/rows/frame)':<38}{parse:>9.1f}s")
+    _emit(f"  {'    backoff sleep (429/474 retries)':<38}{backoff:>9.1f}s")
+    _emit(f"  {'    semaphore wait':<38}{sem:>9.1f}s")
+    _emit(f"  {'    unattributed inside tasks':<38}"
           f"{task - http - parse - backoff - sem:>9.1f}s")
-    print(f"  retries: {SNAPSHOT_TIMING['retry_count']:.0f} total "
-          f"(429 rate-limit: {SNAPSHOT_TIMING['retry_429']:.0f} x60s, "
-          f"474 disconnect: {SNAPSHOT_TIMING['retry_474']:.0f} x10s)")
+    _emit(f"  retry policy: {describe_retry_policy()}")
+    _emit(f"  retries: {SNAPSHOT_TIMING['retry_count']:.0f} total "
+          f"(429 rate-limit: {SNAPSHOT_TIMING['retry_429']:.0f}, "
+          f"474 disconnect: {SNAPSHOT_TIMING['retry_474']:.0f}), "
+          f"exhausted: {SNAPSHOT_TIMING['retry_exhausted']:.0f}")
+    # Headline for comparing connection settings: what fraction of work was
+    # lost, not just how long it took.
+    if t.task_count:
+        _emit(f"  {'TASK FAILURE RATE':<38}"
+              f"{100.0 * t.task_failed_count / t.task_count:>9.2f}% "
+              f"({t.task_failed_count:,} of {t.task_count:,})")
     if t.task_failures:
-        print("  failures by exception type:")
+        _emit("  failures by exception type:")
         for name, cnt in sorted(t.task_failures.items(),
                                 key=lambda kv: -t.task_failed_secs_by_type.get(kv[0], 0.0)):
             secs = t.task_failed_secs_by_type.get(name, 0.0)
-            print(f"    {name:<34}{cnt:>6d} x, {secs:>9.1f}s "
+            _emit(f"    {name:<34}{cnt:>6d} x, {secs:>9.1f}s "
                   f"({secs / cnt if cnt else 0:.1f}s avg)")
 
-    print("\n(C) CONCURRENCY / SATURATION")
+    _emit("\n(C) CONCURRENCY / SATURATION")
     # Computed from TASK time, which includes failures. The old figure used
     # successful-request time only and therefore under-read whenever tasks
     # failed — that is why it disagreed with the sampler.
     eff = (task / t.fanout_wall) if t.fanout_wall > 0 else 0.0
     eff_old = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
-    print(f"  {'effective concurrency (task time)':<38}{eff:>9.2f} of "
-          f"{SNAPSHOT_MAX_CONNECTIONS}")
-    print(f"  {'  legacy figure (succeeded only)':<38}{eff_old:>9.2f} of "
-          f"{SNAPSHOT_MAX_CONNECTIONS}")
-    avail = wall_total * SNAPSHOT_MAX_CONNECTIONS
-    print(f"  {'worker-seconds available (wall x N)':<38}{avail:>9.1f}s")
-    print(f"  {'worker-seconds accounted (task)':<38}{task:>9.1f}s "
+    _emit(f"  {'effective concurrency (task time)':<38}{eff:>9.2f} of "
+          f"{max_connections()}")
+    _emit(f"  {'  legacy figure (succeeded only)':<38}{eff_old:>9.2f} of "
+          f"{max_connections()}")
+    avail = wall_total * max_connections()
+    _emit(f"  {'worker-seconds available (wall x N)':<38}{avail:>9.1f}s")
+    _emit(f"  {'worker-seconds accounted (task)':<38}{task:>9.1f}s "
           f"{(100.0 * task / avail) if avail else 0:>6.1f}%")
-    print(f"  {'worker-seconds unaccounted':<38}{avail - task:>9.1f}s "
+    _emit(f"  {'worker-seconds unaccounted':<38}{avail - task:>9.1f}s "
           f"{(100.0 * (avail - task) / avail) if avail else 0:>6.1f}%")
     n = len(SAMPLES)
     if n:
         mean_inflight = sum(c for c, _ in SAMPLES) / n
         idle_frac  = sum(1 for c, busy in SAMPLES if c == 0 and not busy) / n
         under_frac = sum(1 for c, _ in SAMPLES
-                         if c < SNAPSHOT_MAX_CONNECTIONS) / n
-        print(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
-        print(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
+                         if c < max_connections()) / n
+        _emit(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
+        _emit(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
               f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
-        print(f"  {'under-saturated (<4 in flight)':<38}"
+        _emit(f"  {'under-saturated (<4 in flight)':<38}"
               f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
 
     if t.writes:
         secs = [s for s, _ in t.writes]
-        print("\n(D) PARQUET WRITE GROWTH")
-        print(f"  {'writes':<38}{len(t.writes):>9d}")
-        print(f"  {'first write':<38}{t.writes[0][0]:>9.1f}s "
+        _emit("\n(D) PARQUET WRITE GROWTH")
+        _emit(f"  {'writes':<38}{len(t.writes):>9d}")
+        _emit(f"  {'first write':<38}{t.writes[0][0]:>9.1f}s "
               f"({t.writes[0][1]:,} rows)")
-        print(f"  {'last write':<38}{t.writes[-1][0]:>9.1f}s "
+        _emit(f"  {'last write':<38}{t.writes[-1][0]:>9.1f}s "
               f"({t.writes[-1][1]:,} rows)")
-        print(f"  {'mean / max write':<38}"
+        _emit(f"  {'mean / max write':<38}"
               f"{sum(secs) / len(secs):>9.1f}s / {max(secs):.1f}s")
-    print("=" * 64)
+    _emit("=" * 64)
 
 
 # --- Store preflight --------------------------------------------------------
@@ -330,8 +394,8 @@ def preflight_store(store_dir: Path, sibling_dir: Path) -> None:
     is no longer ambiguous: the folder always exists, so an empty one means
     "no rows survived", not "the path was wrong".
     """
-    print(f"Store:    {store_dir}")
-    print(f"Sibling:  {sibling_dir}  (exists={sibling_dir.exists()})")
+    _emit(f"Store:    {store_dir}")
+    _emit(f"Sibling:  {sibling_dir}  (exists={sibling_dir.exists()})")
     log.info("store dir resolves to %s", store_dir)
 
     try:
@@ -401,7 +465,7 @@ def prompt_date(label: str) -> date:
         try:
             return datetime.strptime(raw, "%Y%m%d").date()
         except ValueError:
-            print("  Use YYYYMMDD (e.g. 20240102)")
+            _emit("  Use YYYYMMDD (e.g. 20240102)")
 
 
 # --- Vendor date parsing ----------------------------------------------------

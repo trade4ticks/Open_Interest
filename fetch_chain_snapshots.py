@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime
@@ -101,6 +102,7 @@ from config import CHAIN_EOD_DIR, CHAIN_SNAPSHOTS_DIR
 from lib.chain_fetch_common import (
     TIMING,
     chunk_range,
+    log_path,
     preflight_store,
     print_timing_summary,
     prompt_date,
@@ -108,6 +110,7 @@ from lib.chain_fetch_common import (
     set_local_busy,
     start_sampler,
     start_watchdog,
+    setup_file_logging,
     stop_background_threads,
     to_date_series,
     track,
@@ -121,12 +124,14 @@ from lib.chain_snapshot_store import (
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
-    SNAPSHOT_MAX_CONNECTIONS,
     SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
     describe_http_config,
+    describe_retry_policy,
     enumerate_expirations_eod,
+    max_connections,
+    set_max_connections,
     fetch_first_order_raw,
     reset_snapshot_timing,
     test_connection,
@@ -398,7 +403,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
             return time.monotonic() - t0, out
 
         batch_t0 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
+        with ThreadPoolExecutor(max_workers=max_connections()) as pool:
             # kind, session, expiration, snapshot
             pending: dict = {
                 pool.submit(_enum_one, d): ("enum", d, None, None) for d in todo
@@ -486,7 +491,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  ticker, w_start, w_end, len(exp_by_session), n_queries,
                  n_requests, batch_wall,
                  (busy_seconds / batch_wall) if batch_wall > 0 else 0.0,
-                 SNAPSHOT_MAX_CONNECTIONS,
+                 max_connections(),
                  (busy_seconds / n_requests) if n_requests else 0.0)
 
         if enum_failures:
@@ -579,6 +584,10 @@ def main() -> None:
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
                           "request size — every request is a point query."))
+    ap.add_argument("--connections", type=int, default=None,
+                    help=("concurrent ThetaData connections (default 4). "
+                          "Vendor guidance: this should MATCH the Theta "
+                          "Terminal's HTTP_CONCURRENCY setting."))
     ap.add_argument("--debug-response", action="store_true",
                     help="dump columns + first row of the first non-empty "
                          "response per batch (diagnosing empty stores)")
@@ -587,7 +596,17 @@ def main() -> None:
     ap.add_argument("--end", help="YYYYMMDD; skips the prompt")
     args = ap.parse_args()
 
-    print("=== Open_Interest — intraday chain snapshots (09:45 / 15:45) ===\n")
+    # Must happen before any request is in flight — it rebuilds the semaphore.
+    if args.connections is not None:
+        set_max_connections(args.connections)
+
+    log_file = setup_file_logging("fetch_chain_snapshots")
+
+    print("=== Open_Interest — intraday chain snapshots (09:45 / 15:45) ===")
+    print(f"Log: {log_file}\n")
+    log.info("argv: %s", " ".join(sys.argv[1:]))
+    log.info("connections=%d | retry: %s",
+             max_connections(), describe_retry_policy())
 
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
@@ -614,7 +633,7 @@ def main() -> None:
     print(f"\n{len(tickers)} tickers x {len(sessions)} sessions "
           f"({start} -> {end})")
     print(f"{len(batches)} write batch(es) of <= {args.batch_days} calendar days, "
-          f"{SNAPSHOT_MAX_CONNECTIONS} concurrent connections"
+          f"{max_connections()} concurrent connections"
           f"{', --force (ignoring loaded cells)' if args.force else ''}")
     print("Every request is a point query: one expiration, one session, "
           "one instant.")
@@ -659,6 +678,7 @@ def main() -> None:
 
     print(f"\n{total:,} rows fetched and merged into {CHAIN_SNAPSHOTS_DIR}")
     print("Fetch-and-store only — no metrics repointed, no cron wired.")
+    print(f"Log written to {log_path()}")
 
     print_timing_summary(time.monotonic() - run_t0)
 
