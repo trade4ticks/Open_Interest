@@ -13,8 +13,11 @@ diff it — which is what this does.
 
 Checks per (ticker, session):
 
-  1. SESSION MISSING      — a trading day inside the ticker's covered range
-                            with no rows at all.
+  1. SESSION MISSING      — a trading day inside a FETCHED BLOCK with no rows
+                            at all. Blocks are runs of stored sessions split
+                            on gaps > --max-gap trading days, so months you
+                            never requested are reported as unfetched rather
+                            than flagged as missing.
   2. SNAPSHOT MISSING     — session present but only one of '0945' / '1545'.
   3. EXPIRATIONS MISSING  — expirations the vendor lists for that session
                             (via /v3/option/history/eod, the same source the
@@ -56,6 +59,7 @@ from config import CHAIN_SNAPSHOTS_DIR
 from lib.chain_fetch_common import log_path, setup_file_logging, track
 from lib.chain_snapshot_store import SNAPSHOT_LABELS, list_tickers, list_years, year_path
 from lib.market_hours import get_trading_days
+from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
     enumerate_expirations_eod,
     max_connections,
@@ -115,30 +119,68 @@ def read_index(ticker: str) -> pd.DataFrame:
 
 # --- Per-ticker audit -------------------------------------------------------
 
+def coverage_blocks(present: list[date], all_days: list[date],
+                    max_gap: int) -> list[tuple[int, int]]:
+    """Split stored sessions into contiguously-fetched blocks.
+
+    Returns (start_idx, end_idx) pairs into `all_days`.
+
+    Without this the audit assumed everything between a ticker's first and
+    last stored session was requested, so every trading day in a month that
+    was never fetched got flagged SESSION_MISSING. A run of dense sessions
+    separated from the next by more than `max_gap` trading days is treated as
+    a separate fetch; the space between blocks is UNFETCHED, not missing.
+    """
+    pos = {d: i for i, d in enumerate(all_days)}
+    idxs = sorted(pos[d] for d in present if d in pos)
+    if not idxs:
+        return []
+    blocks: list[tuple[int, int]] = []
+    start_i = prev = idxs[0]
+    for i in idxs[1:]:
+        if i - prev > max_gap:
+            blocks.append((start_i, prev))
+            start_i = i
+        prev = i
+    blocks.append((start_i, prev))
+    return blocks
+
+
 def audit_ticker(ticker: str,
                  start: date | None,
                  end: date | None,
-                 do_enumerate: bool) -> list[dict]:
+                 do_enumerate: bool,
+                 max_gap: int = 5) -> tuple[list[dict], int]:
     idx = read_index(ticker)
     if idx.empty:
         log.warning("  %s: no rows in store", ticker)
-        return []
+        return [], 0
 
     if start is not None:
         idx = idx[idx["trade_date"] >= start]
     if end is not None:
         idx = idx[idx["trade_date"] <= end]
     if idx.empty:
-        return []
+        return [], 0
 
     present_sessions = sorted(idx["trade_date"].unique())
     lo = start or present_sessions[0]
     hi = end or present_sessions[-1]
 
-    # Expected = NYSE sessions across the covered range. Sessions outside the
-    # ticker's own coverage are not the audit's business.
-    expected = get_trading_days(lo, hi)
+    all_days = get_trading_days(lo, hi)
     present_set = set(present_sessions)
+
+    if start is not None and end is not None:
+        # An explicit range is a statement of intent: every session in it was
+        # meant to be fetched, so every absent one is genuinely missing.
+        expected = all_days
+        n_unfetched = 0
+    else:
+        # Otherwise only audit inside contiguously-fetched blocks. Trading days
+        # between blocks were never requested and are reported separately.
+        blocks = coverage_blocks(present_sessions, all_days, max_gap)
+        expected = [d for (a, b) in blocks for d in all_days[a:b + 1]]
+        n_unfetched = len(all_days) - len(expected)
 
     rows_by_session = idx.groupby("trade_date").size().to_dict()
     exps_by_session = idx.groupby("trade_date")["expiration"].apply(set).to_dict()
@@ -154,15 +196,19 @@ def audit_ticker(ticker: str,
                       if lo_i <= j < hi_i and j != i]
         median_adj[d] = float(pd.Series(neighbours).median()) if neighbours else 0.0
 
-    # Enumerate what SHOULD be there. One vendor call per present session.
+    # Enumerate what SHOULD be there — for MISSING sessions too, not just
+    # present ones. Without the missing ones a wholly-absent session reported
+    # zero missing cells, which is why the session count and the cell count
+    # could not be reconciled.
     enumerated: dict[date, set] = {}
-    if do_enumerate and present_sessions:
+    to_enum = [d for d in expected if d in present_set or d not in present_set]
+    if do_enumerate and to_enum:
         def _enum(sess: date):
             with track(f"enum {ticker} {sess}", kind="enum"):
                 return sess, enumerate_expirations_eod(ticker, sess, sess)
 
         with ThreadPoolExecutor(max_workers=max_connections()) as pool:
-            futs = [pool.submit(_enum, d) for d in present_sessions]
+            futs = [pool.submit(_enum, d) for d in to_enum]
             for fut in as_completed(futs):
                 try:
                     sess, exps = fut.result()
@@ -175,14 +221,22 @@ def audit_ticker(ticker: str,
 
     for d in expected:
         if d not in present_set:
+            # Every enumerated expiration is missing, for both labels — so the
+            # cell cost of a wholly-absent session is now counted, and the
+            # session count and cell count reconcile.
+            enum_set = enumerated.get(d)
+            n_enum = len(enum_set) if enum_set is not None else None
             out.append({
                 "ticker": ticker, "trade_date": d.isoformat(),
                 "severity": SEV_SESSION_MISSING,
                 "issue": SEV_NAME[SEV_SESSION_MISSING],
                 "snapshots_present": "", "rows": 0,
                 "median_adjacent_rows": "", "row_ratio": "",
-                "expirations_present": 0, "expirations_enumerated": "",
-                "expirations_missing": "", "missing_expiration_sample": "",
+                "expirations_present": 0,
+                "expirations_enumerated": n_enum if n_enum is not None else "",
+                "expirations_missing": n_enum if n_enum is not None else "",
+                "missing_expiration_sample": "|".join(
+                    e.isoformat() for e in sorted(enum_set)[:5]) if enum_set else "",
             })
             continue
 
@@ -225,7 +279,7 @@ def audit_ticker(ticker: str,
                 e.isoformat() for e in sorted(missing_exps)[:5]),
         })
 
-    return out
+    return out, n_unfetched
 
 
 # --- Summaries --------------------------------------------------------------
@@ -298,6 +352,15 @@ def main() -> None:
     ap.add_argument("--tickers", help="comma-separated; default = all in store")
     ap.add_argument("--start", help="YYYYMMDD; default = each ticker's earliest")
     ap.add_argument("--end", help="YYYYMMDD; default = each ticker's latest")
+    ap.add_argument("--max-gap", type=int, default=5,
+                    help=("trading-day gap that separates one fetched block "
+                          "from the next (default 5). Days BETWEEN blocks were "
+                          "never requested and are reported as unfetched, not "
+                          "missing. Ignored when --start and --end are given."))
+    ap.add_argument("--universe", default=None,
+                    help=("comma-separated expected ticker universe; default "
+                          "= tickers in the OI store. Tickers in the universe "
+                          "with no chain_snapshots data are listed."))
     ap.add_argument("--no-enumerate", action="store_true",
                     help="skip vendor enumeration — fast, offline, but cannot "
                          "detect missing expirations (checks 1, 2, 4 only)")
@@ -321,10 +384,32 @@ def main() -> None:
     if not CHAIN_SNAPSHOTS_DIR.exists():
         raise SystemExit(f"Store does not exist: {CHAIN_SNAPSHOTS_DIR}")
 
+    in_store = list_tickers()
     tickers = ([t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-               if args.tickers else list_tickers())
+               if args.tickers else in_store)
     if not tickers:
         raise SystemExit(f"No tickers found under {CHAIN_SNAPSHOTS_DIR}")
+
+    # Which of the intended universe never made it into the store at all?
+    # A ticker with no directory produces no rows and so would otherwise be
+    # invisible to every check below.
+    if args.universe:
+        universe = [t.strip().upper() for t in args.universe.split(",") if t.strip()]
+    else:
+        try:
+            universe = list_oi_tickers()
+        except Exception as exc:
+            log.warning("could not read the OI-store universe: %s", exc)
+            universe = []
+    absent = sorted(set(universe) - set(in_store))
+    if universe:
+        print(f"Universe: {len(universe)} tickers | in chain_snapshots: "
+              f"{len(in_store)} | ABSENT ENTIRELY: {len(absent)}")
+        if absent:
+            print("  " + ", ".join(absent))
+            log.warning("tickers absent from chain_snapshots entirely: %s",
+                        ", ".join(absent))
+        print()
 
     start = datetime.strptime(args.start, "%Y%m%d").date() if args.start else None
     end = datetime.strptime(args.end, "%Y%m%d").date() if args.end else None
@@ -342,10 +427,14 @@ def main() -> None:
 
     t0 = time.monotonic()
     all_rows: list[dict] = []
+    total_unfetched = 0
     with tqdm(total=len(tickers), unit="tk", ncols=90, desc="audit") as bar:
         for tk in tickers:
             try:
-                all_rows.extend(audit_ticker(tk, start, end, do_enum))
+                rows_t, unfetched_t = audit_ticker(tk, start, end, do_enum,
+                                                   max_gap=args.max_gap)
+                all_rows.extend(rows_t)
+                total_unfetched += unfetched_t
             except Exception as exc:
                 log.error("  FAIL %s: %s", tk, exc, exc_info=True)
             bar.update(1)
@@ -366,6 +455,12 @@ def main() -> None:
 
     print(f"\nAudited {len(all_rows):,} (ticker, session) cells across "
           f"{len(tickers)} tickers in {time.monotonic() - t0:.0f}s")
+    if total_unfetched and not (start and end):
+        print(f"Excluded {total_unfetched:,} trading day(s) outside any "
+              f"fetched block — never requested, not missing.")
+        print(f"  (blocks split on gaps > {args.max_gap} trading days; "
+              f"use --start/--end to audit an explicit range instead)")
+
     print("\nBy severity:")
     for sev in sorted(SEV_NAME, reverse=True):
         n = by_sev.get(sev, 0)
@@ -374,8 +469,19 @@ def main() -> None:
                   f"{100.0 * n / len(all_rows):>5.1f}%")
 
     if do_enum:
+        # Reconciliation: session count and cell count measure different
+        # things, so show how each contributes rather than leaving the reader
+        # to square two numbers that never had to match.
+        cells_from_missing_sessions = sum(
+            int(r["expirations_missing"]) * len(SNAPSHOT_LABELS)
+            for r in all_rows
+            if r["severity"] == SEV_SESSION_MISSING
+            and str(r["expirations_missing"]).isdigit())
+        cells_from_partial = total_missing_cells - cells_from_missing_sessions
         print(f"\nMissing (session, expiration, snapshot) cells: "
               f"{total_missing_cells:,}")
+        print(f"  from wholly-missing sessions      {cells_from_missing_sessions:>10,}")
+        print(f"  from partially-filled sessions    {cells_from_partial:>10,}")
         print("  Recover with:  python fetch_chain_snapshots.py --repair "
               "--tickers <t> --start <YYYYMMDD> --end <YYYYMMDD>")
     else:
