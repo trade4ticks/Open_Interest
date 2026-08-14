@@ -51,7 +51,11 @@ class RunTiming:
         self.fanout_blocked = 0.0      # main thread waiting on futures
         self.local_compute = 0.0       # projection / result handling
         self.parquet_write = 0.0
-        # (B) worker-side, concurrent
+        # (B) worker-side, accrued on the MAIN thread from returned elapsed.
+        # These count SUCCESSFUL calls only — a task whose future raises never
+        # reaches the accrual line, so its time is missing here by
+        # construction. Kept for run-to-run diffing; task_* below is the
+        # authoritative worker-side measure.
         self.enum_secs = 0.0
         self.enum_count = 0
         self.query_secs = 0.0
@@ -59,6 +63,19 @@ class RunTiming:
         self.fanout_wall = 0.0         # blocked + local_compute
         # write growth through the run
         self.writes: list[tuple[float, int]] = []   # (seconds, new rows)
+
+        # (B') worker-side, accrued IN THE WORKER by track(), in a finally
+        # block, so failed and timed-out tasks are counted too. This is what
+        # reconciles against the in-flight sampler.
+        self.lock = threading.Lock()
+        self.task_secs = 0.0
+        self.task_count = 0
+        self.enum_task_secs = 0.0
+        self.enum_task_count = 0
+        self.task_failed_secs = 0.0
+        self.task_failed_count = 0
+        self.task_failures: dict[str, int] = {}      # exception name -> count
+        self.task_failed_secs_by_type: dict[str, float] = {}
 
 
 TIMING = RunTiming()
@@ -95,16 +112,48 @@ def start_sampler(interval: float = 0.1) -> None:
 
 
 @contextmanager
-def track(label: str):
-    """Register an in-flight request for the watchdog and sampler."""
+def track(label: str, kind: str | None = None):
+    """Register an in-flight request, and time the whole task body.
+
+    This brackets EXACTLY the interval the sampler counts as "in flight", and
+    accrues the duration in a finally block — so a task that raises (timeout,
+    rate limit, server error) still contributes its time. The callers'
+    main-thread accrual cannot do this: it reads `elapsed` off the future's
+    return value, which never exists when the future raised, so failed tasks
+    silently contributed zero. That discrepancy is exactly the gap between
+    "effective concurrency" and the sampler's mean in-flight.
+
+    `kind` is inferred from the label prefix when not given, so callers that
+    have not been updated still classify enumeration correctly.
+    """
+    if kind is None:
+        kind = "enum" if label.startswith("enum ") else "query"
     key = next(_INFLIGHT_SEQ)
+    t0 = time.monotonic()
     with INFLIGHT_LOCK:
-        INFLIGHT[key] = (label, time.monotonic())
+        INFLIGHT[key] = (label, t0)
+    err: str | None = None
     try:
         yield
+    except BaseException as exc:
+        err = type(exc).__name__
+        raise
     finally:
+        dt = time.monotonic() - t0
         with INFLIGHT_LOCK:
             INFLIGHT.pop(key, None)
+        with TIMING.lock:
+            TIMING.task_secs += dt
+            TIMING.task_count += 1
+            if kind == "enum":
+                TIMING.enum_task_secs += dt
+                TIMING.enum_task_count += 1
+            if err is not None:
+                TIMING.task_failed_secs += dt
+                TIMING.task_failed_count += 1
+                TIMING.task_failures[err] = TIMING.task_failures.get(err, 0) + 1
+                TIMING.task_failed_secs_by_type[err] = (
+                    TIMING.task_failed_secs_by_type.get(err, 0.0) + dt)
 
 
 def start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
@@ -176,7 +225,7 @@ def print_timing_summary(wall_total: float,
     print(f"    {SNAPSHOT_MAX_CONNECTIONS} workers accrue up to "
           f"{SNAPSHOT_MAX_CONNECTIONS}s of request time per wall second,")
     print("    so these deliberately do not sum into (A).")
-    print(f"  {'total request time':<38}{worker_total:>9.1f}s")
+    print(f"  {'total request time (SUCCEEDED only)':<38}{worker_total:>9.1f}s")
     if worker_total > 0:
         print(f"  {'  of which HTTP transfer':<38}{http:>9.1f}s "
               f"{100.0 * http / worker_total:>6.1f}%")
@@ -194,10 +243,57 @@ def print_timing_summary(wall_total: float,
         print(f"  enumeration share of request time: "
               f"{100.0 * t.enum_secs / worker_total:.1f}%")
 
+    # --- (B2) authoritative worker-side accounting --------------------------
+    # Measured inside the worker in a finally block, so failed and timed-out
+    # tasks are included. The lines above count successful calls only.
+    sem     = SNAPSHOT_TIMING["sem_wait_seconds"]
+    backoff = SNAPSHOT_TIMING["backoff_seconds"]
+    task    = t.task_secs
+
+    print("\n(B2) TASK TIME — every task, including ones that FAILED.")
+    print("     Measured in the worker, so nothing is lost on the error path.")
+    print(f"  {'total TASK time (all outcomes)':<38}{task:>9.1f}s")
+    print(f"  {'  succeeded':<38}{task - t.task_failed_secs:>9.1f}s "
+          f"({t.task_count - t.task_failed_count:,} tasks)")
+    print(f"  {'  FAILED / timed out':<38}{t.task_failed_secs:>9.1f}s "
+          f"({t.task_failed_count:,} tasks)")
+    if task > 0:
+        print(f"  {'    (failed share of task time)':<38}"
+              f"{100.0 * t.task_failed_secs / task:>9.1f}%")
+    print("  attribution inside task time:")
+    print(f"  {'    HTTP transfer':<38}{http:>9.1f}s")
+    print(f"  {'    decode (json/rows/frame)':<38}{parse:>9.1f}s")
+    print(f"  {'    backoff sleep (429/474 retries)':<38}{backoff:>9.1f}s")
+    print(f"  {'    semaphore wait':<38}{sem:>9.1f}s")
+    print(f"  {'    unattributed inside tasks':<38}"
+          f"{task - http - parse - backoff - sem:>9.1f}s")
+    print(f"  retries: {SNAPSHOT_TIMING['retry_count']:.0f} total "
+          f"(429 rate-limit: {SNAPSHOT_TIMING['retry_429']:.0f} x60s, "
+          f"474 disconnect: {SNAPSHOT_TIMING['retry_474']:.0f} x10s)")
+    if t.task_failures:
+        print("  failures by exception type:")
+        for name, cnt in sorted(t.task_failures.items(),
+                                key=lambda kv: -t.task_failed_secs_by_type.get(kv[0], 0.0)):
+            secs = t.task_failed_secs_by_type.get(name, 0.0)
+            print(f"    {name:<34}{cnt:>6d} x, {secs:>9.1f}s "
+                  f"({secs / cnt if cnt else 0:.1f}s avg)")
+
     print("\n(C) CONCURRENCY / SATURATION")
-    eff = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
-    print(f"  {'effective concurrency':<38}{eff:>9.2f} of "
+    # Computed from TASK time, which includes failures. The old figure used
+    # successful-request time only and therefore under-read whenever tasks
+    # failed — that is why it disagreed with the sampler.
+    eff = (task / t.fanout_wall) if t.fanout_wall > 0 else 0.0
+    eff_old = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
+    print(f"  {'effective concurrency (task time)':<38}{eff:>9.2f} of "
           f"{SNAPSHOT_MAX_CONNECTIONS}")
+    print(f"  {'  legacy figure (succeeded only)':<38}{eff_old:>9.2f} of "
+          f"{SNAPSHOT_MAX_CONNECTIONS}")
+    avail = wall_total * SNAPSHOT_MAX_CONNECTIONS
+    print(f"  {'worker-seconds available (wall x N)':<38}{avail:>9.1f}s")
+    print(f"  {'worker-seconds accounted (task)':<38}{task:>9.1f}s "
+          f"{(100.0 * task / avail) if avail else 0:>6.1f}%")
+    print(f"  {'worker-seconds unaccounted':<38}{avail - task:>9.1f}s "
+          f"{(100.0 * (avail - task) / avail) if avail else 0:>6.1f}%")
     n = len(SAMPLES)
     if n:
         mean_inflight = sum(c for c, _ in SAMPLES) / n

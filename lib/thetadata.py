@@ -928,11 +928,37 @@ SNAPSHOT_TOTAL_TIMEOUT   = 180    # hard cap on total time for one request
 # vendor sent". Mutated from worker threads, hence the lock.
 _TIMING_LOCK = threading.Lock()
 SNAPSHOT_TIMING: dict[str, float] = {
-    "http_seconds":  0.0,   # connect + stream the body
-    "parse_seconds": 0.0,   # json.loads + row normalisation + DataFrame build
-    "http_count":    0.0,
-    "http_bytes":    0.0,
+    "http_seconds":     0.0,   # connect + stream the body
+    "parse_seconds":    0.0,   # json.loads + row normalisation + DataFrame build
+    "http_count":       0.0,
+    "http_bytes":       0.0,
+    # Time inside a task but OUTSIDE the HTTP call — the buckets that were
+    # previously invisible because only successful calls were ever accounted.
+    "sem_wait_seconds": 0.0,   # blocked acquiring the connection semaphore
+    "backoff_seconds":  0.0,   # sleeping in the 429 / 474 retry ladder
+    "retry_count":      0.0,   # retries attempted (any reason)
+    "retry_429":        0.0,   # rate-limit retries       (60s sleep each)
+    "retry_474":        0.0,   # disconnect retries       (10s sleep each)
 }
+
+
+def describe_http_config() -> str:
+    """Report the ACTUAL connection pooling in effect, not the intended one."""
+    try:
+        import requests as _rq
+        from requests.adapters import HTTPAdapter
+        d = HTTPAdapter()
+        return (
+            f"requests {_rq.__version__} | module-level requests.get() is used, "
+            f"which constructs a NEW Session per call — so connections are NOT "
+            f"reused and every request pays a fresh TCP handshake. Adapter "
+            f"defaults pool_connections={d._pool_connections}, "
+            f"pool_maxsize={d._pool_maxsize} apply per Session and are "
+            f"discarded with it. Workers therefore never block on connection "
+            f"checkout, but nor do they benefit from keep-alive."
+        )
+    except Exception as exc:                       # pragma: no cover
+        return f"(could not introspect requests config: {exc})"
 
 
 def reset_snapshot_timing() -> None:
@@ -1026,8 +1052,13 @@ def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
     workers rather than starving them, and the retry sleeps in
     `_get_with_retry` never hold a connection slot.
     """
-    with _SNAPSHOT_SEM:
+    t_sem = time.monotonic()
+    _SNAPSHOT_SEM.acquire()
+    _add_timing(sem_wait_seconds=time.monotonic() - t_sem)
+    try:
         return _get_snapshot(endpoint, params)
+    finally:
+        _SNAPSHOT_SEM.release()
 
 
 def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
@@ -1044,11 +1075,17 @@ def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
         return _get_capped(endpoint, params, timeout=timeout)
     except RateLimitError:
         log.warning("Rate limited — sleeping 60s, retrying once (%s)", label)
+        t0 = time.monotonic()
         time.sleep(60)
+        _add_timing(backoff_seconds=time.monotonic() - t0,
+                    retry_count=1, retry_429=1)
         return _get_capped(endpoint, params, timeout=timeout)
     except ServerDisconnectedError:
         log.warning("Server disconnected — sleeping 10s, retrying once (%s)", label)
+        t0 = time.monotonic()
         time.sleep(10)
+        _add_timing(backoff_seconds=time.monotonic() - t0,
+                    retry_count=1, retry_474=1)
         return _get_capped(endpoint, params, timeout=timeout)
 
 

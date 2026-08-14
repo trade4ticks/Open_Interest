@@ -125,6 +125,7 @@ from lib.thetadata import (
     SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
+    describe_http_config,
     enumerate_expirations_eod,
     fetch_first_order_raw,
     reset_snapshot_timing,
@@ -379,15 +380,20 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         # allowed connections are actually being kept busy.
         busy_seconds = 0.0
 
+        # track() times the whole task body in a finally block and accrues it
+        # to TIMING.task_secs, so tasks that RAISE are counted. The `elapsed`
+        # returned below is accrued on the main thread and is reached only on
+        # success — kept for run-to-run comparability, but see (B2) in the
+        # summary for the authoritative worker-side number.
         def _enum_one(sess: date) -> tuple[float, set[date]]:
             t0 = time.monotonic()
-            with track(f"enum {ticker} {sess}"):
+            with track(f"enum {ticker} {sess}", kind="enum"):
                 out = enumerate_expirations_eod(ticker, sess, sess)
             return time.monotonic() - t0, out
 
         def _fetch_one(sess: date, exp: date, snap: str) -> tuple[float, pd.DataFrame]:
             t0 = time.monotonic()
-            with track(f"{ticker} exp={exp} {sess}@{snap}"):
+            with track(f"{ticker} exp={exp} {sess}@{snap}", kind="query"):
                 out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
             return time.monotonic() - t0, out
 
@@ -626,7 +632,8 @@ def main() -> None:
         raise SystemExit("FAILED — terminal not reachable.")
     print("OK")
     print(f"Per-request caps: connect 10s, read 45s, hard total "
-          f"{SNAPSHOT_TOTAL_TIMEOUT}s. Watchdog reports stalls every 30s.\n")
+          f"{SNAPSHOT_TOTAL_TIMEOUT}s. Watchdog reports stalls every 30s.")
+    print(f"HTTP: {describe_http_config()}\n")
 
     TIMING.startup = time.monotonic() - run_t0
     start_watchdog()
