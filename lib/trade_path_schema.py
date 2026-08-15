@@ -32,6 +32,32 @@ def _validate(col: str) -> None:
         raise ValueError(f"unsafe or over-long column name from registry: {col!r}")
 
 
+class SchemaNotInitialised(RuntimeError):
+    """The skeleton tables from sql/07_trade_paths.sql are missing."""
+
+
+def _require_tables(conn) -> None:
+    """Fail with an actionable message rather than an UndefinedTable deep in an
+    ALTER TABLE. The skeleton lives in sql/07_trade_paths.sql and is applied by
+    init_db.py; this module only ADDS per-rule columns to it. Creating the
+    table here instead would duplicate its definition in two places and let
+    them drift.
+    """
+    missing = []
+    with conn.cursor() as cur:
+        for t in ("trade_paths", "trade_path_rules", "trade_paths_manifest"):
+            cur.execute("SELECT to_regclass(%s)", (f"public.{t}",))
+            if cur.fetchone()[0] is None:
+                missing.append(t)
+    if missing:
+        raise SchemaNotInitialised(
+            f"missing table(s): {', '.join(missing)}.\n"
+            f"Apply the skeleton first:  python init_db.py\n"
+            f"(it runs sql/07_trade_paths.sql, which owns these definitions; "
+            f"this module only adds the per-rule columns to them)"
+        )
+
+
 def existing_trade_paths_columns(conn) -> set:
     with conn.cursor() as cur:
         cur.execute(
@@ -43,6 +69,7 @@ def existing_trade_paths_columns(conn) -> set:
 
 def sync_trade_paths_schema(conn) -> tuple:
     """Add missing (xb_<rule>, xr_<rule>) pairs. Idempotent. Never drops."""
+    _require_tables(conn)
     existing = existing_trade_paths_columns(conn)
     added: list = []
     with conn.cursor() as cur:

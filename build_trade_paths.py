@@ -113,7 +113,11 @@ def load_entry_universe(conn, tickers=None, start=None, end=None) -> pd.DataFram
     if end:
         where.append("trade_date <= %(e)s")
         params["e"] = end
-    sql = "SELECT ticker, trade_date FROM daily_features"
+    # DISTINCT is insurance, not a fix: daily_features is keyed on
+    # (ticker, trade_date) so it cannot duplicate today. A duplicated staged
+    # row would make the upsert fail with "cannot affect row a second time",
+    # which is an unhelpful way to learn the spine changed shape.
+    sql = "SELECT DISTINCT ticker, trade_date FROM daily_features"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY ticker, trade_date"
@@ -316,7 +320,12 @@ def build_ticker(conn, ticker: str, entries: pd.DataFrame, anchor: str,
             row = {
                 "ticker": ticker, "trade_date": d, "entry_anchor": anchor,
                 "entry_price": float(entry_price[e]),
-                "entry_bar_ts": bars["timestamp"].values[start_idx[e]],
+                # numpy datetime64 stringifies with 'T' and nanoseconds
+                # ('2019-01-02T14:30:00.000000000'), which is past the
+                # microsecond precision a Postgres TIMESTAMP accepts. Convert
+                # once here rather than relying on the parser to round.
+                "entry_bar_ts": pd.Timestamp(
+                    bars["timestamp"].values[start_idx[e]]).to_pydatetime(),
                 "atr_14d": _f(atr[e]),
                 "swing_low_1": _f(ctx["swing_low_1"][e]),
                 "swing_low_3": _f(ctx["swing_low_3"][e]),
@@ -346,11 +355,22 @@ def _f(v):
 # --- Write ------------------------------------------------------------------
 
 def write_rows(conn, rows: list) -> int:
-    """COPY into a temp table, then upsert. execute_values on 129 columns x
-    450k rows is minutes slower for no benefit."""
+    """COPY into a temp table, then upsert. execute_values on 131 columns x
+    450k rows is minutes slower for no benefit.
+
+    INCLUDING DEFAULTS is load-bearing. A bare `LIKE trade_paths` copies column
+    types and NOT NULL constraints but NOT defaults, so the staged
+    built_at — which this function deliberately does not supply, leaving it to
+    the table — arrives NULL and violates its own NOT NULL. Carrying the
+    defaults across makes the stage table behave like the target it mirrors.
+    """
     if not rows:
         return 0
     cols = list(rows[0].keys())
+    assert "built_at" not in cols, (
+        "built_at is supplied by the table default, not by the row dicts; "
+        "if that changes, drop it from the DO UPDATE SET below too."
+    )
     buf = io.StringIO()
     for r in rows:
         buf.write("\t".join(
@@ -358,12 +378,15 @@ def write_rows(conn, rows: list) -> int:
     buf.seek(0)
     collist = ", ".join(cols)
     with conn.cursor() as cur:
-        cur.execute(f"CREATE TEMP TABLE _tp_stage (LIKE trade_paths) "
-                    f"ON COMMIT DROP")
+        cur.execute("CREATE TEMP TABLE _tp_stage "
+                    "(LIKE trade_paths INCLUDING DEFAULTS) ON COMMIT DROP")
         cur.copy_expert(
             f"COPY _tp_stage ({collist}) FROM STDIN WITH (FORMAT text)", buf)
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols
                             if c not in ("ticker", "trade_date", "entry_anchor"))
+        # built_at is not in `cols`, so a rebuild would otherwise keep the
+        # first build's timestamp and misreport when this row was computed.
+        updates += ", built_at = now()"
         cur.execute(
             f"INSERT INTO trade_paths ({collist}) "
             f"SELECT {collist} FROM _tp_stage "
@@ -480,7 +503,9 @@ def main() -> int:
     log.info("argv: %s", " ".join(sys.argv[1:]))
 
     from db import get_connection
-    from lib.trade_path_schema import sync_rule_catalog, sync_trade_paths_schema
+    from lib.trade_path_schema import (
+        SchemaNotInitialised, sync_rule_catalog, sync_trade_paths_schema,
+    )
 
     anchors = [a.strip() for a in args.anchors.split(",") if a.strip()]
     bad = [a for a in anchors if a not in ANCHORS]
@@ -495,8 +520,12 @@ def main() -> int:
     run_t0 = time.monotonic()
     with get_connection() as conn:
         print("Syncing trade_paths schema ...", end=" ", flush=True)
-        n_added, _ = sync_trade_paths_schema(conn)
-        n_rules = sync_rule_catalog(conn)
+        try:
+            n_added, _ = sync_trade_paths_schema(conn)
+            n_rules = sync_rule_catalog(conn)
+        except SchemaNotInitialised as exc:
+            print("FAILED")
+            raise SystemExit(f"\n{exc}")
         print(f"OK ({n_added} new column pair(s), {n_rules} rules catalogued)")
 
         universe = load_entry_universe(conn, tickers, start, end)
@@ -531,27 +560,53 @@ def main() -> int:
                         continue
                     t0 = time.monotonic()
                     try:
-                        set_local_busy(True)
-                        rows, stats = build_ticker(conn, tk, ent, anchor,
-                                                   args.session_filter, args.block)
-                        set_local_busy(False)
+                        try:
+                            set_local_busy(True)
+                            rows, stats = build_ticker(
+                                conn, tk, ent, anchor,
+                                args.session_filter, args.block)
+                        finally:
+                            # Without the finally, a raising build leaves the
+                            # occupancy sampler believing local work is still
+                            # running for the rest of the run.
+                            set_local_busy(False)
                         TIMING.local_compute += time.monotonic() - t0
                         w0 = time.monotonic()
                         total += write_rows(conn, rows)
                         TIMING.parquet_write += time.monotonic() - w0
                         TIMING.writes.append((time.monotonic() - w0, len(rows)))
                         record_manifest(conn, tk, anchor, stats)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
                     except Exception as exc:
-                        log.error("  FAIL %s/%s: %s", tk, anchor, exc,
-                                  exc_info=True)
+                        # ROLLBACK FIRST. A failed COPY leaves the connection in
+                        # an aborted transaction, so recording the manifest
+                        # before clearing it fails too — which is how a write
+                        # failure ended up unrecorded, with a traceback as the
+                        # only evidence. One ticker-anchor failing must record
+                        # and continue, exactly as fetch_equity_1min does.
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         failed.append(f"{tk}/{anchor}")
+                        log.error("  FAIL %s/%s: %s: %s — recorded, continuing",
+                                  tk, anchor, type(exc).__name__, exc)
+                        log.debug("  traceback for %s/%s", tk, anchor,
+                                  exc_info=True)
                         try:
                             record_manifest(conn, tk, anchor, {
                                 "status": "failed", "n": len(ent),
                                 "resolved": 0,
                                 "note": f"{type(exc).__name__}: {exc}"[:300]})
-                        except Exception:
-                            conn.rollback()
+                        except Exception as exc2:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            log.error("  %s/%s: could not record the failure "
+                                      "either (%s) — it will simply be retried "
+                                      "on the next run", tk, anchor, exc2)
                     bar.update(1)
 
         stop_background_threads()
