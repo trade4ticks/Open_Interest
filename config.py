@@ -20,6 +20,12 @@ PG_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "portfolio")
 # --- ThetaData --------------------------------------------------------------
 THETADATA_BASE_URL = os.environ.get("THETADATA_BASE_URL", "http://localhost:25503")
 
+# --- Polygon.io / Massive ----------------------------------------------------
+# Rebranded to Massive in 2026; api.polygon.io still resolves and is what the
+# published REST docs use, so the host stays until the vendor retires it.
+POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
+POLYGON_BASE_URL = os.environ.get("POLYGON_BASE_URL", "https://api.polygon.io")
+
 # --- Parquet store for raw OI -----------------------------------------------
 _default_oi_dir = PROJECT_ROOT / "data" / "oi_raw"
 OI_RAW_DIR      = Path(os.environ.get("OI_RAW_DIR", str(_default_oi_dir))).resolve()
@@ -45,3 +51,10 @@ CHAIN_SNAPSHOTS_DIR     = Path(os.environ.get("CHAIN_SNAPSHOTS_DIR",
 _default_chain_intraday_dir = CHAIN_EOD_DIR.parent / "chain_intraday"
 CHAIN_INTRADAY_DIR          = Path(os.environ.get("CHAIN_INTRADAY_DIR",
                                                   str(_default_chain_intraday_dir))).resolve()
+
+# --- Parquet store for 1-minute equity bars (Polygon/Massive) ---------------
+# Same sibling-of-chain_eod derivation as the two stores above, for the same
+# reason: PROJECT_ROOT is not where bulk data lives on the VPS.
+_default_equity_1min_dir = CHAIN_EOD_DIR.parent / "equity_1min"
+EQUITY_1MIN_DIR          = Path(os.environ.get("EQUITY_1MIN_DIR",
+                                               str(_default_equity_1min_dir))).resolve()
