@@ -98,10 +98,78 @@ def check_forward_returns(conn, tol: float) -> int:
     return bad_total
 
 
+def check_basis_continuity(conn, tol: float = 0.25) -> int:
+    """entry_price must not step by the split ratio across an ex-date.
+
+    This is the primary split check, and it replaces reasoning from returns.
+    A return-based test is drift-dependent: it compares the observed return
+    against 1/ratio - 1, so it only fires when the underlying happened not to
+    move much over the hold, and it is blind to the case where BOTH ends of a
+    hold carry the same wrong factor (they cancel, and the return is
+    numerically identical to no adjustment at all).
+
+    entry_price is stored per session, already adjusted, so the ratio of
+    consecutive sessions' entry prices across the ex-date tests the basis
+    directly. It should be ~1 give or take one day's move, never ~ratio or
+    ~1/ratio. This fires on unadjusted history AND on an over-adjusted
+    ex-date, which is what the return-band test could not separate.
+    """
+    from db import read_sql_df
+    print("\n" + "=" * 70)
+    print("2a. BASIS CONTINUITY  (entry_price must not step across an ex-date)")
+    print("=" * 70)
+    df = read_sql_df(conn, """
+        WITH s AS (
+            SELECT ticker, trade_date AS split_date, splits
+            FROM underlying_ohlc
+            WHERE splits IS NOT NULL AND splits <> 0 AND splits <> 1
+        ),
+        b AS (
+            SELECT s.ticker, s.split_date, s.splits,
+                   (SELECT p.entry_price FROM trade_paths p
+                     WHERE p.ticker = s.ticker AND p.entry_anchor = 'open'
+                       AND p.trade_date < s.split_date
+                     ORDER BY p.trade_date DESC LIMIT 1) AS px_before,
+                   (SELECT p.entry_price FROM trade_paths p
+                     WHERE p.ticker = s.ticker AND p.entry_anchor = 'open'
+                       AND p.trade_date >= s.split_date
+                     ORDER BY p.trade_date ASC LIMIT 1) AS px_on_after
+            FROM s
+        )
+        SELECT * FROM b WHERE px_before IS NOT NULL AND px_on_after IS NOT NULL
+    """)
+    if df.empty:
+        print("  No split dates with entry prices on both sides — nothing to check.")
+        return 0
+    df["step"] = df["px_before"].astype(float) / df["px_on_after"].astype(float)
+    df["expected_if_raw"] = df["splits"].astype(float)
+    df["bad"] = (df["step"] - 1.0).abs() > tol
+    n_bad = int(df["bad"].sum())
+    print(f"  {'ticker':<8}{'ex-date':<12}{'ratio':>7}{'px_before':>11}"
+          f"{'px_on/after':>13}{'step':>8}  verdict")
+    for _, r in df.iterrows():
+        v = "OK" if not r["bad"] else (
+            "RAW/UNADJUSTED" if abs(r["step"] - r["expected_if_raw"]) < 0.3
+            else "EX-DATE OVER-ADJUSTED"
+            if abs(r["step"] - 1.0 / r["expected_if_raw"]) < 0.3 else "DISCONTINUOUS")
+        print(f"  {r['ticker']:<8}{str(r['split_date']):<12}"
+              f"{r['splits']:>7.2f}{r['px_before']:>11.2f}"
+              f"{r['px_on_after']:>13.2f}{r['step']:>8.3f}  {v}")
+    if n_bad:
+        print(f"\n  FAIL — {n_bad} split boundary(ies) show a price basis step.")
+        print("  step ~= ratio  means the history was never adjusted.")
+        print("  step ~= 1/ratio means the EX-DATE was adjusted when it should")
+        print("  not have been (make_split_factors inclusive boundary applied")
+        print("  to a price series).")
+    else:
+        print("\n  OK — price basis is continuous across every split.")
+    return n_bad
+
+
 def check_split_spanning(conn) -> int:
     from db import read_sql_df
     print("\n" + "=" * 70)
-    print("2. SPLIT-SPANNING HOLDS  (must NOT read as a large negative return)")
+    print("2b. SPLIT-SPANNING HOLDS  (must NOT read as a large negative return)")
     print("=" * 70)
     xr = BY_KEY[HORIZON_RULE_KEY].ret_col
     df = read_sql_df(conn, f"""
@@ -194,8 +262,10 @@ def main() -> int:
                                  "build_trade_paths.py first.")
 
         n_fwd = check_forward_returns(conn, args.tolerance)
+        n_basis = check_basis_continuity(conn)
         n_split = check_split_spanning(conn)
         n_horizon = check_horizon_invariant(conn)
+        n_split += n_basis
         if not args.skip_coverage:
             check_coverage(conn)
 

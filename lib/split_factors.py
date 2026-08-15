@@ -38,15 +38,32 @@ def load_splits(conn, ticker: str) -> pd.DataFrame:
     return df
 
 
-def make_split_factors(splits_df: pd.DataFrame, dates: list) -> pd.DataFrame:
+def make_split_factors(splits_df: pd.DataFrame, dates: list,
+                       inclusive: bool = True) -> pd.DataFrame:
     """Return DataFrame(trade_date, adj_factor) for each date in `dates`.
 
-    adj_factor = product of (1/ratio) for all splits with split_date >= date.
-    Multiply raw strikes by adj_factor to get split-adjusted strikes that
-    align with yfinance-adjusted spot prices.
+    adj_factor = product of (1/ratio) over the splits on the far side of the
+    boundary. Multiply raw strikes (or raw prices) by adj_factor to express
+    them in current, post-split units.
 
-    Boundary convention: trade_date <= split_date -> adjust (split affects this date);
-                         trade_date >  split_date -> no adjustment (already past it).
+    THE BOUNDARY IS NOT THE SAME FOR EVERY DATA FAMILY.
+
+    inclusive=True (default, OI/strike semantics):
+        trade_date <= split_date -> adjust.
+        Correct for open interest because of the 1-day publication lag: OI
+        stamped trade_date T reports the position as of T-1's close, so on the
+        ex-date it is still pre-split. See build_features.py, where this
+        convention is chosen explicitly.
+
+    inclusive=False (price semantics):
+        trade_date <  split_date -> adjust; the ex-date itself is NOT adjusted.
+        Correct for a traded price series, which has no such lag — on the
+        ex-date the stock already trades post-split. Applying the inclusive
+        boundary to prices divides the ex-date by the split ratio, which shows
+        up as a ~+3 return for entries ON the ex-date (4:1) and, for a hold
+        whose exit lands on it, as a return numerically identical to no
+        adjustment at all because the two equal factors cancel.
+
     Handles forward (ratio>1) and reverse (ratio<1) splits uniformly.
     Tickers with no splits get adj_factor = 1.0 for every date (no-op).
     """
@@ -63,11 +80,16 @@ def make_split_factors(splits_df: pd.DataFrame, dates: list) -> pd.DataFrame:
     for i in range(n - 1, -1, -1):
         suffix_factors[i] = suffix_factors[i + 1] / split_ratios[i]
 
-    factors = [suffix_factors[bisect.bisect_left(split_dates, td)] for td in dates]
+    # bisect_left puts a date EQUAL to a split date on the pre-split side;
+    # bisect_right puts it on the post-split side. That single choice is the
+    # whole difference between the two conventions above.
+    locate = bisect.bisect_left if inclusive else bisect.bisect_right
+    factors = [suffix_factors[locate(split_dates, td)] for td in dates]
     return pd.DataFrame({"trade_date": dates, "adj_factor": factors})
 
 
-def make_split_factor_map(splits_df: pd.DataFrame, dates: list) -> dict:
+def make_split_factor_map(splits_df: pd.DataFrame, dates: list,
+                          inclusive: bool = True) -> dict:
     """Convenience: same as make_split_factors but returns {date: factor} dict."""
-    df = make_split_factors(splits_df, dates)
+    df = make_split_factors(splits_df, dates, inclusive=inclusive)
     return dict(zip(df["trade_date"], df["adj_factor"]))

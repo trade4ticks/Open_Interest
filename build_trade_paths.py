@@ -151,11 +151,34 @@ def load_bars(conn, ticker: str, session_filter: str = "regular") -> pd.DataFram
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     splits = load_splits(conn, ticker)
-    if not splits.empty:
-        fmap = make_split_factor_map(splits, sorted(df["trade_date"].unique()))
-        f = df["trade_date"].map(fmap).astype(float).values
-        for c in ("open", "high", "low", "close"):
-            df[c] = df[c].values * f
+    if splits.empty:
+        log.info("  %s: no split events — no price adjustment needed", ticker)
+        return df
+
+    # inclusive=False is REQUIRED here. The default boundary adjusts
+    # trade_date <= split_date, which is right for OI (1-day publication lag,
+    # so the ex-date's OI is still pre-split) and wrong for a traded price
+    # series, which is already post-split on the ex-date. With the inclusive
+    # boundary the ex-date gets divided by the split ratio, which reads as a
+    # ~+3 return for entries on that date and — where a hold's exit lands on
+    # it — as a return numerically identical to no adjustment, because the two
+    # equal factors cancel. Both were observed on AAPL 2020-08-31.
+    fmap = make_split_factor_map(splits, sorted(df["trade_date"].unique()),
+                                 inclusive=False)
+    f = df["trade_date"].map(fmap).astype(float).values
+    if not np.isfinite(f).all():
+        raise ValueError(
+            f"{ticker}: {int((~np.isfinite(f)).sum())} bar(s) got no split "
+            f"factor — the factor map does not cover every bar date."
+        )
+    for c in ("open", "high", "low", "close"):
+        df[c] = df[c].values * f
+    n_adj = int((f != 1.0).sum())
+    log.info("  %s: applied %d split event(s) (%s); %d/%d bars rescaled",
+             ticker, len(splits),
+             ", ".join(f"{r.trade_date}x{r.splits:g}"
+                       for r in splits.itertuples()),
+             n_adj, len(f))
     return df
 
 
