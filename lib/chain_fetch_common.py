@@ -212,7 +212,8 @@ def track(label: str, kind: str | None = None):
                     TIMING.task_failed_secs_by_type.get(err, 0.0) + dt)
 
 
-def start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
+def start_watchdog(interval: float = 30.0, stall_after: float = 90.0,
+                   hard_cap: float | None = None) -> None:
     """Log in-flight requests whenever one has been running unusually long.
 
     Also reports "0 in flight", which is the diagnostic that matters most: it
@@ -233,7 +234,7 @@ def start_watchdog(interval: float = 30.0, stall_after: float = 90.0) -> None:
             if ages[-1][0] >= stall_after:
                 log.warning("WATCHDOG: %d in flight, oldest %.0fs (hard cap "
                             "%ds): %s", len(ages), ages[-1][0],
-                            SNAPSHOT_TOTAL_TIMEOUT,
+                            hard_cap if hard_cap is not None else SNAPSHOT_TOTAL_TIMEOUT,
                             "; ".join(f"{lab} {age:.0f}s"
                                       for age, lab in ages[-4:]))
 
@@ -246,9 +247,22 @@ def stop_background_threads() -> None:
 
 
 def print_timing_summary(wall_total: float,
-                         query_label: str = "point queries") -> None:
-    """Attribute the run's wall clock, then report the concurrent overlay."""
+                         query_label: str = "point queries",
+                         timing: dict | None = None,
+                         retry_policy: str | None = None,
+                         connections: int | None = None) -> None:
+    """Attribute the run's wall clock, then report the concurrent overlay.
+
+    `timing` / `retry_policy` / `connections` default to the ThetaData module's
+    values so the existing callers are unchanged. They are injectable so a
+    fetcher against a different vendor (lib/polygon.py) renders the SAME
+    summary format — the point of the format is diffing runs, which only works
+    if every fetcher emits it identically.
+    """
     t = TIMING
+    vt = timing if timing is not None else SNAPSHOT_TIMING
+    policy = retry_policy if retry_policy is not None else describe_retry_policy()
+    conns = connections if connections is not None else max_connections()
     accounted = (t.startup + t.loaded_keys + t.fanout_blocked
                  + t.local_compute + t.parquet_write)
     unaccounted = wall_total - accounted
@@ -273,13 +287,13 @@ def print_timing_summary(wall_total: float,
     row("unaccounted", unaccounted)
 
     worker_total = t.enum_secs + t.query_secs
-    http  = SNAPSHOT_TIMING["http_seconds"]
-    parse = SNAPSHOT_TIMING["parse_seconds"]
-    mb    = SNAPSHOT_TIMING["http_bytes"] / 1e6
+    http  = vt.get("http_seconds", 0.0)
+    parse = vt.get("parse_seconds", 0.0)
+    mb    = vt.get("http_bytes", 0.0) / 1e6
 
     _emit("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
-    _emit(f"    {max_connections()} workers accrue up to "
-          f"{max_connections()}s of request time per wall second,")
+    _emit(f"    {conns} workers accrue up to "
+          f"{conns}s of request time per wall second,")
     _emit("    so these deliberately do not sum into (A).")
     _emit(f"  {'total request time (SUCCEEDED only)':<38}{worker_total:>9.1f}s")
     if worker_total > 0:
@@ -302,8 +316,8 @@ def print_timing_summary(wall_total: float,
     # --- (B2) authoritative worker-side accounting --------------------------
     # Measured inside the worker in a finally block, so failed and timed-out
     # tasks are included. The lines above count successful calls only.
-    sem     = SNAPSHOT_TIMING["sem_wait_seconds"]
-    backoff = SNAPSHOT_TIMING["backoff_seconds"]
+    sem     = vt.get("sem_wait_seconds", 0.0)
+    backoff = vt.get("backoff_seconds", 0.0)
     task    = t.task_secs
 
     _emit("\n(B2) TASK TIME — every task, including ones that FAILED.")
@@ -323,11 +337,15 @@ def print_timing_summary(wall_total: float,
     _emit(f"  {'    semaphore wait':<38}{sem:>9.1f}s")
     _emit(f"  {'    unattributed inside tasks':<38}"
           f"{task - http - parse - backoff - sem:>9.1f}s")
-    _emit(f"  retry policy: {describe_retry_policy()}")
-    _emit(f"  retries: {SNAPSHOT_TIMING['retry_count']:.0f} total "
-          f"(429 rate-limit: {SNAPSHOT_TIMING['retry_429']:.0f}, "
-          f"474 disconnect: {SNAPSHOT_TIMING['retry_474']:.0f}), "
-          f"exhausted: {SNAPSHOT_TIMING['retry_exhausted']:.0f}")
+    _emit(f"  retry policy: {policy}")
+    _emit(f"  retries: {vt.get('retry_count', 0.0):.0f} total "
+          f"(429 rate-limit: {vt.get('retry_429', 0.0):.0f}, "
+          f"474 disconnect: {vt.get('retry_474', 0.0):.0f}, "
+          f"5xx: {vt.get('retry_5xx', 0.0):.0f}), "
+          f"exhausted: {vt.get('retry_exhausted', 0.0):.0f}")
+    if vt.get("pages_followed", 0.0) or vt.get("truncated", 0.0):
+        _emit(f"  pagination: {vt.get('pages_followed', 0.0):.0f} next_url page(s) "
+              f"followed, {vt.get('truncated', 0.0):.0f} truncated response(s)")
     # Headline for comparing connection settings: what fraction of work was
     # lost, not just how long it took.
     if t.task_count:
@@ -349,10 +367,10 @@ def print_timing_summary(wall_total: float,
     eff = (task / t.fanout_wall) if t.fanout_wall > 0 else 0.0
     eff_old = (worker_total / t.fanout_wall) if t.fanout_wall > 0 else 0.0
     _emit(f"  {'effective concurrency (task time)':<38}{eff:>9.2f} of "
-          f"{max_connections()}")
+          f"{conns}")
     _emit(f"  {'  legacy figure (succeeded only)':<38}{eff_old:>9.2f} of "
-          f"{max_connections()}")
-    avail = wall_total * max_connections()
+          f"{conns}")
+    avail = wall_total * conns
     _emit(f"  {'worker-seconds available (wall x N)':<38}{avail:>9.1f}s")
     _emit(f"  {'worker-seconds accounted (task)':<38}{task:>9.1f}s "
           f"{(100.0 * task / avail) if avail else 0:>6.1f}%")
@@ -363,11 +381,11 @@ def print_timing_summary(wall_total: float,
         mean_inflight = sum(c for c, _ in SAMPLES) / n
         idle_frac  = sum(1 for c, busy in SAMPLES if c == 0 and not busy) / n
         under_frac = sum(1 for c, _ in SAMPLES
-                         if c < max_connections()) / n
+                         if c < conns) / n
         _emit(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
         _emit(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
               f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
-        _emit(f"  {'under-saturated (<4 in flight)':<38}"
+        _emit(f"  {f'under-saturated (<{conns} in flight)':<38}"
               f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
 
     if t.writes:
@@ -459,9 +477,20 @@ def prompt_tickers(fallback) -> list[str]:
     return out
 
 
-def prompt_date(label: str) -> date:
+def prompt_date(label: str, default: date | None = None) -> date:
+    """Prompt for a YYYYMMDD date.
+
+    `default` is optional and backwards-compatible: callers that pass none get
+    the original behaviour (a date must be typed). When given, it is shown in
+    the prompt and accepted on a blank line — useful where a fetcher has an
+    obvious canonical value, such as a backfill that always starts at the same
+    history epoch.
+    """
+    suffix = f" [{default:%Y%m%d}]" if default is not None else ""
     while True:
-        raw = input(f"{label} (YYYYMMDD): ").strip()
+        raw = input(f"{label} (YYYYMMDD){suffix}: ").strip()
+        if not raw and default is not None:
+            return default
         try:
             return datetime.strptime(raw, "%Y%m%d").date()
         except ValueError:
