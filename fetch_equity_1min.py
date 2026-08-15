@@ -106,7 +106,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DEFAULT_START = date(2019, 1, 1)
+# 2018-10-01, not 2019-01-01: build_trade_paths.py derives ATR(14), MA20 and
+# swing_low(5) from this store, and those need trailing sessions BEFORE the
+# first entry date. Starting at the entry epoch would leave every ATR- and
+# MA-based exit NULL for the first ~20 sessions of 2019. Three extra months is
+# ~3% more requests and buys ~60 sessions of warmup for every window in use.
+DEFAULT_START = date(2018, 10, 1)
 
 # Chunks accumulated in memory before a parquet write + manifest record.
 # Lower = less lost to an interrupt; higher = fewer year-file rewrites.
