@@ -21,6 +21,7 @@ FILES   = [
     "04_backtest.sql",
     "05_bin_tables.sql",
     "06_25d_skew_metrics.sql",
+    "07_trade_paths.sql",
 ]
 
 
