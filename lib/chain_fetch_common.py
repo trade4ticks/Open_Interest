@@ -117,8 +117,19 @@ class RunTiming:
         self.query_secs = 0.0
         self.query_count = 0
         self.fanout_wall = 0.0         # blocked + local_compute
-        # write growth through the run
-        self.writes: list[tuple[float, int]] = []   # (seconds, new rows)
+        # write growth through the run. Entries are
+        # (seconds, new_rows, total_rows_after_merge, file_mb) — the last two
+        # are what make the read-modify-rewrite cost visible. Recording only
+        # new_rows hid it: batch size is roughly constant while the file the
+        # batch is merged into grows all year, so the cost driver never
+        # appeared in the summary.
+        self.writes: list[tuple] = []
+
+        # (E) background writer, when the fetcher hands writes to a thread.
+        # Overlaps everything else by design, so it is NOT part of (A).
+        self.writer_secs = 0.0         # time the writer thread spent writing
+        self.writer_count = 0
+        self.writer_wait = 0.0         # main thread blocked on a full queue
 
         # (B') worker-side, accrued IN THE WORKER by track(), in a finally
         # block, so failed and timed-out tasks are counted too. This is what
@@ -389,15 +400,55 @@ def print_timing_summary(wall_total: float,
               f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
 
     if t.writes:
-        secs = [s for s, _ in t.writes]
+        secs = [w[0] for w in t.writes]
         _emit("\n(D) PARQUET WRITE GROWTH")
         _emit(f"  {'writes':<38}{len(t.writes):>9d}")
         _emit(f"  {'first write':<38}{t.writes[0][0]:>9.1f}s "
-              f"({t.writes[0][1]:,} rows)")
+              f"({t.writes[0][1]:,} new rows)")
         _emit(f"  {'last write':<38}{t.writes[-1][0]:>9.1f}s "
-              f"({t.writes[-1][1]:,} rows)")
+              f"({t.writes[-1][1]:,} new rows)")
         _emit(f"  {'mean / max write':<38}"
               f"{sum(secs) / len(secs):>9.1f}s / {max(secs):.1f}s")
+
+        # The store's write path is read-modify-rewrite of a whole year file,
+        # so cost tracks the FILE, not the batch. Reporting both side by side
+        # is what separates "the writes are uneven" from "the writes grow".
+        full = [w for w in t.writes if len(w) >= 4 and w[2]]
+        if full:
+            _emit(f"  {'file rows: first -> last':<38}"
+                  f"{full[0][2]:>9,} -> {full[-1][2]:,}")
+            _emit(f"  {'file MB:   first -> last':<38}"
+                  f"{full[0][3]:>9.1f} -> {full[-1][3]:.1f}")
+            slow = max(full, key=lambda w: w[0])
+            fast = min(full, key=lambda w: w[0])
+            _emit(f"  {'slowest write':<38}{slow[0]:>9.1f}s "
+                  f"({slow[1]:,} new rows into {slow[2]:,} / {slow[3]:.1f} MB)")
+            _emit(f"  {'fastest write':<38}{fast[0]:>9.1f}s "
+                  f"({fast[1]:,} new rows into {fast[2]:,} / {fast[3]:.1f} MB)")
+            if fast[2] and slow[2]:
+                _emit(f"  {'  size ratio slow/fast':<38}"
+                      f"{slow[2] / max(fast[2], 1):>9.1f}x")
+                _emit(f"  {'  time ratio slow/fast':<38}"
+                      f"{slow[0] / max(fast[0], 1e-9):>9.1f}x")
+                _emit("  (the two ratios tracking each other means the spread "
+                      "is file")
+                _emit("   size under read-modify-rewrite, not contention)")
+
+    if t.writer_count:
+        _emit("\n(E) BACKGROUND WRITER — overlaps (A), so not part of it.")
+        _emit(f"  {'writes off the main thread':<38}{t.writer_count:>9d}")
+        _emit(f"  {'writer thread busy':<38}{t.writer_secs:>9.1f}s "
+              f"{pct(t.writer_secs):>6.1f}%")
+        _emit(f"  {'main thread blocked on queue':<38}{t.writer_wait:>9.1f}s "
+              f"{pct(t.writer_wait):>6.1f}%")
+        hidden = t.writer_secs - t.writer_wait
+        _emit(f"  {'write time hidden behind fetching':<38}{hidden:>9.1f}s "
+              f"{pct(hidden):>6.1f}%")
+        if t.writer_wait > 0.25 * t.writer_secs:
+            _emit("  NOTE: the writer is the bottleneck for a meaningful share "
+                  "of the run;")
+            _emit("        raising --write-queue only defers it, the fix is a "
+                  "cheaper write.")
     _emit("=" * 64)
 
 

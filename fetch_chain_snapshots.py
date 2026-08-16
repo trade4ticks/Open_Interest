@@ -90,7 +90,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import queue
 import sys
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime
@@ -174,6 +176,7 @@ _KNOWN_VENDOR_FIELDS = {
 }
 _UNKNOWN_WARNED: set[str] = set()
 _MISSING_WARNED: set[str] = set()
+_WARN_LOCK = threading.Lock()
 
 # Fields we expect to store; a persistent absence is worth knowing about.
 _EXPECTED_VENDOR_FIELDS = {
@@ -186,9 +189,19 @@ _EXPECTED_VENDOR_FIELDS = {
 # --- Projection ------------------------------------------------------------
 
 def _warn_unknown_fields(raw: pd.DataFrame) -> None:
-    """Report unexpected / absent vendor fields once per run."""
+    """Report unexpected / absent vendor fields once per run.
+
+    Projection now runs on pool threads, so the once-per-run sets are guarded:
+    without the lock a check-then-update race would emit the same warning from
+    several workers, which reads like several distinct schema changes.
+    """
     cols = set(raw.columns)
 
+    with _WARN_LOCK:
+        _warn_unknown_fields_locked(cols)
+
+
+def _warn_unknown_fields_locked(cols: set) -> None:
     unknown = cols - _KNOWN_VENDOR_FIELDS - _UNKNOWN_WARNED
     if unknown:
         _UNKNOWN_WARNED.update(unknown)
@@ -320,9 +333,117 @@ def _project(raw: pd.DataFrame, ticker: str, snapshot: str,
     return out.dropna(subset=["trade_date", "expiration", "strike", "option_type"])
 
 
+# --- Background writer ------------------------------------------------------
+
+class _WriterThread(threading.Thread):
+    """Serialises parquet writes off the main thread.
+
+    The fan-out and the write were sharing one thread, so ~30% of the run had
+    zero requests in flight while a year file was being merged and rewritten.
+    Handing the frame to a writer lets the next batch's requests start
+    immediately; network time and write time then overlap instead of summing.
+
+    Still exactly ONE writer. The store's write path is read-modify-rewrite of
+    a whole year file, so two threads writing the same (ticker, year) would
+    interleave read and rename and lose rows. Serialising here keeps the
+    store's contract intact while still removing it from the critical path.
+
+    The queue is bounded. An unbounded one would let a slow writer accumulate
+    batches until the process died of memory rather than of anything
+    diagnosable; blocking the producer instead makes backpressure visible as
+    TIMING.writer_wait, which is the number that says whether the writer has
+    become the bottleneck.
+    """
+
+    def __init__(self, maxsize: int = 2):
+        super().__init__(daemon=True, name="parquet-writer")
+        self.q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.error: BaseException | None = None
+        self.error_ctx: str = ""
+
+    def submit(self, ticker: str, frame: pd.DataFrame, ctx: str) -> None:
+        """Block until the writer has room, then hand off. Raises whatever the
+        writer already failed with, so a write failure stops the run promptly
+        rather than after every remaining ticker has been fetched for nothing."""
+        self._raise_if_failed()
+        t0 = time.monotonic()
+        self.q.put((ticker, frame, ctx))
+        waited = time.monotonic() - t0
+        with TIMING.lock:
+            TIMING.writer_wait += waited
+
+    def _raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise SystemExit(
+                f"FATAL: parquet write failed ({self.error_ctx}): {self.error}\n"
+                f"Store dir: {CHAIN_SNAPSHOTS_DIR}\n"
+                "Aborting rather than continuing to fetch with nothing stored."
+            )
+
+    def run(self) -> None:
+        while True:
+            item = self.q.get()
+            try:
+                if item is None:
+                    return
+                ticker, frame, ctx = item
+                t0 = time.monotonic()
+                try:
+                    by_year = write_rows(ticker, frame)
+                except BaseException as exc:          # noqa: BLE001
+                    # A write failure is systemic (permissions, schema, disk),
+                    # not batch-specific. Record it; the main thread raises.
+                    self.error, self.error_ctx = exc, ctx
+                    log.error("  %s: PARQUET WRITE FAILED — %s", ctx, exc,
+                              exc_info=True)
+                    continue
+                secs = time.monotonic() - t0
+
+                if not by_year:
+                    log.error("  %s: write_rows accepted %d rows but wrote no "
+                              "year file — every row had an unusable "
+                              "trade_date", ctx, len(frame))
+                    continue
+
+                total_rows = 0
+                total_mb = 0.0
+                for y, n in sorted(by_year.items()):
+                    p = year_path(ticker, y)
+                    mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
+                    total_rows += n
+                    total_mb += mb
+                    log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, mb)
+                with TIMING.lock:
+                    TIMING.writer_secs += secs
+                    TIMING.writer_count += 1
+                    TIMING.writes.append((secs, len(frame), total_rows, total_mb))
+                log.info("    write took %.1fs for %d new rows into %d rows / "
+                         "%.1f MB (fetching continued throughout)",
+                         secs, len(frame), total_rows, total_mb)
+            finally:
+                self.q.task_done()
+
+    def close(self) -> None:
+        """Drain, stop, and surface any failure."""
+        self.q.put(None)
+        self.join()
+        self._raise_if_failed()
+
+
 # --- Per-ticker fetch ------------------------------------------------------
 
+# Worker threads per allowed connection. Above 1.0 so a projecting worker does
+# not hold a slot that could be issuing a request; the semaphore still caps
+# actual network concurrency, so this cannot exceed the vendor's limit.
+POOL_OVERSUBSCRIBE = 2
+
+
+def pool_size() -> int:
+    return max(max_connections() * POOL_OVERSUBSCRIBE, max_connections() + 1)
+
+
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
+                 writer: "_WriterThread",
                  force: bool = False, debug_response: bool = False,
                  repair: bool = False) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
@@ -412,14 +533,38 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                 out = enumerate_expirations_eod(ticker, sess, sess)
             return time.monotonic() - t0, out
 
-        def _fetch_one(sess: date, exp: date, snap: str) -> tuple[float, pd.DataFrame]:
+        def _fetch_one(sess: date, exp: date, snap: str):
+            """Fetch AND project, on the pool thread.
+
+            Projection used to run on the main thread while it collected
+            futures, which stalled the fan-out for ~19% of the run. Doing it
+            here overlaps it with other requests. The pool is sized above the
+            connection cap (see below) so a projecting worker does not occupy
+            a slot that could be fetching.
+
+            Returns (elapsed, raw_rows, raw_cols, projected). raw_cols is
+            carried out only so the main thread can report the first response's
+            shape without keeping the raw frame alive.
+            """
             t0 = time.monotonic()
             with track(f"{ticker} exp={exp} {sess}@{snap}", kind="query"):
-                out = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
-            return time.monotonic() - t0, out
+                raw = fetch_first_order_raw(ticker, exp, sess, SNAPSHOT_TIMES[snap])
+            elapsed = time.monotonic() - t0
+            if raw.empty:
+                return elapsed, 0, None, None
+            cols = list(raw.columns)
+            first_row = raw.iloc[0].to_dict() if debug_response else None
+            projected = _project(raw, ticker, snap, sess)
+            return elapsed, len(raw), (cols, first_row), projected
 
         batch_t0 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=max_connections()) as pool:
+        # Pool is deliberately WIDER than the connection cap. The semaphore in
+        # lib/thetadata is what actually bounds in-flight HTTP, so extra
+        # workers cannot exceed it — they exist so that a worker busy
+        # projecting a response is not occupying a slot that could be
+        # fetching. With pool == cap, every projection directly cost a
+        # connection.
+        with ThreadPoolExecutor(max_workers=pool_size()) as pool:
             # kind, session, expiration, snapshot
             pending: dict = {
                 pool.submit(_enum_one, d): ("enum", d, None, None) for d in todo
@@ -467,26 +612,30 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         continue
 
                     try:
-                        elapsed, raw = fut.result()
+                        # Projection already happened on the pool thread; a
+                        # malformed response still surfaces here as a unit
+                        # failure, because the worker raised inside its future.
+                        elapsed, n_raw, shape, projected = fut.result()
                         busy_seconds += elapsed
                         TIMING.query_secs += elapsed
                         TIMING.query_count += 1
-                        if raw.empty:
+                        # None means the worker saw an empty response. Keyed on
+                        # `projected` alone rather than on n_raw too: the two
+                        # always agree today, but a disagreement would reach
+                        # len(projected) below, which is past the except blocks
+                        # and would take the whole ticker down instead of one
+                        # unit.
+                        if projected is None:
                             n_empty += 1
                             continue
-                        raw_rows += len(raw)
-                        if first_raw_cols is None:
-                            first_raw_cols = list(raw.columns)
+                        raw_rows += n_raw
+                        if first_raw_cols is None and shape is not None:
+                            first_raw_cols, first_row = shape
                             if debug_response:
                                 log.info("  DEBUG first non-empty response "
                                          "(%s exp=%s %s @%s): columns=%s",
                                          ticker, exp, sess, snap, first_raw_cols)
-                                log.info("  DEBUG first row: %s",
-                                         raw.iloc[0].to_dict())
-                        # Projection is inside the try so one malformed
-                        # response is recorded as a unit failure instead of
-                        # aborting the whole ticker.
-                        projected = _project(raw, ticker, snap, sess)
+                                log.info("  DEBUG first row: %s", first_row)
                     except (TerminalTimeoutError, TerminalServerError) as exc:
                         failures.append((sess, exp, snap, f"{type(exc).__name__}: {exc}"))
                         continue
@@ -564,43 +713,13 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
             continue
 
         combined = pd.concat(frames, ignore_index=True)
-        write_t0 = time.monotonic()
-        set_local_busy(True)
-        try:
-            by_year = write_rows(ticker, combined)
-        except Exception as exc:
-            # A write failure is systemic (permissions, schema, disk), not
-            # ticker-specific: continuing would fetch for hours and store
-            # nothing. Fail loudly and immediately instead.
-            log.error("  %s %s..%s: PARQUET WRITE FAILED — %s",
-                      ticker, w_start, w_end, exc, exc_info=True)
-            raise SystemExit(
-                f"FATAL: parquet write failed for {ticker} "
-                f"({w_start}..{w_end}): {exc}\n"
-                f"Store dir: {CHAIN_SNAPSHOTS_DIR}\n"
-                "Aborting rather than continuing to fetch with nothing stored."
-            )
-
-        if not by_year:
-            log.error("  %s %s..%s: write_rows accepted %d rows but wrote no "
-                      "year file — every row had an unusable trade_date",
-                      ticker, w_start, w_end, len(combined))
-            continue
-
-        set_local_busy(False)
-        write_secs = time.monotonic() - write_t0
-        TIMING.parquet_write += write_secs
-        TIMING.writes.append((write_secs, len(combined)))
+        # Hand off and move on. The next batch's enumeration and point queries
+        # start immediately; the merge-and-rewrite happens behind them. Blocks
+        # only if the writer is still busy with the previous batch, which is
+        # recorded as writer_wait so backpressure is measured rather than
+        # guessed at.
+        writer.submit(ticker, combined, f"{ticker} {w_start}..{w_end}")
         fetched += len(combined)
-        for y, n in sorted(by_year.items()):
-            p = year_path(ticker, y)
-            size_mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
-            log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, size_mb)
-        # The year-file merge is read-modify-rewrite and grows through the
-        # year, so it is a real candidate for a stall with 0 requests in
-        # flight. Timing it makes that visible instead of inferred.
-        log.info("    write took %.1fs for %d new rows (no requests in flight "
-                 "during this)", write_secs, len(combined))
 
     return fetched
 
@@ -629,6 +748,13 @@ def main() -> None:
                     help=("concurrent ThetaData connections (default 4). "
                           "Vendor guidance: this should MATCH the Theta "
                           "Terminal's HTTP_CONCURRENCY setting."))
+    ap.add_argument("--write-queue", type=int, default=2,
+                    help=("parquet batches that may sit queued for the writer "
+                          "thread (default 2). Bounded on purpose: the queue "
+                          "holds whole batch frames, so a large value trades "
+                          "memory for the ability to hide a slow writer. If "
+                          "the summary shows a large 'main thread blocked on "
+                          "queue', raising this only defers the problem."))
     ap.add_argument("--debug-response", action="store_true",
                     help="dump columns + first row of the first non-empty "
                          "response per batch (diagnosing empty stores)")
@@ -702,15 +828,18 @@ def main() -> None:
     TIMING.startup = time.monotonic() - run_t0
     start_watchdog()
 
-    # Tickers are sequential on purpose: the 4-connection budget is spent
-    # inside each chunk's fan-out, so ticker-level parallelism would buy
-    # nothing and could only risk exceeding the cap.
+    writer = _WriterThread(maxsize=args.write_queue)
+    writer.start()
+
+    # Tickers are sequential on purpose: the connection budget is spent inside
+    # each chunk's fan-out, so ticker-level parallelism would buy nothing and
+    # could only risk exceeding the cap.
     total = 0
     failed_tickers: list[str] = []
     with tqdm(total=len(tickers), unit="tk", ncols=90, desc="snapshots") as bar:
         for t in tickers:
             try:
-                total += fetch_ticker(t, batches, force=args.force,
+                total += fetch_ticker(t, batches, writer, force=args.force,
                                       debug_response=args.debug_response,
                                       repair=args.repair)
             except (KeyboardInterrupt, SystemExit):
@@ -719,6 +848,15 @@ def main() -> None:
                 log.error("  FAIL %s: %s", t, exc, exc_info=True)
                 failed_tickers.append(t)
             bar.update(1)
+
+    # Drain BEFORE the summary and before reporting row counts: queued batches
+    # are fetched but not yet on disk, and a run that reported success while
+    # the tail of its data was still in memory would be lying in the one place
+    # it matters. close() also re-raises a writer failure the loop never saw.
+    print("\nFlushing pending parquet writes ...", end=" ", flush=True)
+    flush_t0 = time.monotonic()
+    writer.close()
+    print(f"OK ({time.monotonic() - flush_t0:.1f}s)")
 
     stop_background_threads()
 
