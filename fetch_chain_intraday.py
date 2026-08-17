@@ -86,13 +86,14 @@ from lib.chain_intraday_store import loaded_dates, write_rows, year_path
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
-    SNAPSHOT_MAX_CONNECTIONS,
     SNAPSHOT_TOTAL_TIMEOUT,
     TerminalServerError,
     TerminalTimeoutError,
     enumerate_expirations_eod,
     fetch_first_order_window,
+    max_connections,
     reset_snapshot_timing,
+    set_max_connections,
     test_connection,
 )
 
@@ -288,7 +289,12 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
             return time.monotonic() - t0, out
 
         batch_t0 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=SNAPSHOT_MAX_CONNECTIONS) as pool:
+        # max_connections() is CALLED, not imported as a value. Importing
+        # SNAPSHOT_MAX_CONNECTIONS bound the module default (4) at import time,
+        # so set_max_connections could rebuild the semaphore to 8 and this pool
+        # would still be 4 — the run would sit at 4 and --connections would
+        # look like it did nothing.
+        with ThreadPoolExecutor(max_workers=max_connections()) as pool:
             pending: dict = {
                 pool.submit(_enum_one, d): ("enum", d, None) for d in todo
             }
@@ -369,7 +375,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  ticker, w_start, w_end, len(exp_by_session), n_queries,
                  n_requests, batch_wall,
                  (busy_seconds / batch_wall) if batch_wall > 0 else 0.0,
-                 SNAPSHOT_MAX_CONNECTIONS,
+                 max_connections(),
                  (busy_seconds / n_requests) if n_requests else 0.0)
 
         if enum_failures:
@@ -452,6 +458,14 @@ def main() -> None:
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
                           "request size — every request is one session."))
+    ap.add_argument("--connections", type=int, default=None,
+                    help=("concurrent ThetaData connections (default 4). "
+                          "Vendor guidance: this should MATCH the Theta "
+                          "Terminal's HTTP_CONCURRENCY setting — exceeding it "
+                          "is documented to cause timeouts rather than clean "
+                          "rejections. Note this also raises peak memory: "
+                          "each in-flight response is a full session of "
+                          "5-minute bars for one expiration."))
     ap.add_argument("--debug-response", action="store_true",
                     help="dump columns, first row and distinct-timestamp count "
                          "of the first non-empty response per batch")
@@ -459,6 +473,10 @@ def main() -> None:
     ap.add_argument("--start", help="YYYYMMDD; skips the prompt")
     ap.add_argument("--end", help="YYYYMMDD; skips the prompt")
     args = ap.parse_args()
+
+    # Must happen before any request is in flight — it rebuilds the semaphore.
+    if args.connections is not None:
+        set_max_connections(args.connections)
 
     print("=== Open_Interest — intraday 5-minute chain bars "
           f"({INTRADAY_START_TIME[:5]}–{INTRADAY_END_TIME[:5]}) ===\n")
@@ -492,7 +510,7 @@ def main() -> None:
     print(f"{len(tickers)} tickers x {len(sessions)} sessions "
           f"({start} -> {end})")
     print(f"{len(batches)} write batch(es) of <= {args.batch_days} calendar "
-          f"day(s), {SNAPSHOT_MAX_CONNECTIONS} concurrent connections"
+          f"day(s), {max_connections()} concurrent connections"
           f"{', --force' if args.force else ''}")
     print(f"Request shape: ONE interval call per (session, expiration), "
           f"{INTRADAY_START_TIME}..{INTRADAY_END_TIME} @ {INTRADAY_INTERVAL} "
