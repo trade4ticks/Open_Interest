@@ -22,8 +22,7 @@ import time
 
 import pandas as pd
 
-import fetch_chain_snapshots as F
-from lib.chain_fetch_common import TIMING
+from lib.chain_fetch_common import TIMING, ParquetWriterThread
 
 PASS, FAIL = [], []
 
@@ -62,7 +61,11 @@ def fake_write_rows(ticker, frame, delay=0.0):
     return {2024: len(frame) * 10}
 
 
-F.year_path = lambda t, y: FakePath()
+
+
+def mk(write_fn, maxsize):
+    return ParquetWriterThread(write_fn, lambda t, y: FakePath(),
+                               "/fake/store", maxsize=maxsize)
 
 
 def frame(n):
@@ -71,8 +74,7 @@ def frame(n):
 
 print("\n=== 1. every submitted batch reaches disk; close() drains ===")
 reset(); written.clear()
-F.write_rows = lambda t, f: fake_write_rows(t, f)
-w = F._WriterThread(maxsize=2)
+w = mk(lambda t, f: fake_write_rows(t, f), maxsize=2)
 w.start()
 for i in range(6):
     w.submit("AAPL", frame(i + 1), f"batch{i}")
@@ -86,8 +88,7 @@ check("total_rows recorded", TIMING.writes[0][2], 10)
 
 print("\n=== 2. queue is bounded -> backpressure is real and measured ===")
 reset(); written.clear()
-F.write_rows = lambda t, f: fake_write_rows(t, f, delay=0.15)
-w = F._WriterThread(maxsize=1)
+w = mk(lambda t, f: fake_write_rows(t, f, delay=0.15), maxsize=1)
 w.start()
 t0 = time.monotonic()
 for i in range(5):
@@ -101,8 +102,7 @@ print(f"         submit wall {submit_wall:.2f}s, writer_wait "
 
 print("\n=== 3. a fast writer hides behind fetching (no wait) ===")
 reset(); written.clear()
-F.write_rows = lambda t, f: fake_write_rows(t, f, delay=0.01)
-w = F._WriterThread(maxsize=2)
+w = mk(lambda t, f: fake_write_rows(t, f, delay=0.01), maxsize=2)
 w.start()
 for i in range(4):
     w.submit("AAPL", frame(1), f"fast{i}")
@@ -119,8 +119,7 @@ def boom(t, f):
     raise OSError("disk full")
 
 
-F.write_rows = boom
-w = F._WriterThread(maxsize=2)
+w = mk(boom, maxsize=2)
 w.start()
 raised = None
 try:
@@ -140,8 +139,7 @@ check("message names the store dir", "Store" in (raised or ""), True)
 
 print("\n=== 5. close() is safe when nothing was ever submitted ===")
 reset()
-F.write_rows = lambda t, f: fake_write_rows(t, f)
-w = F._WriterThread(maxsize=2)
+w = mk(lambda t, f: fake_write_rows(t, f), maxsize=2)
 w.start()
 w.close()
 check("empty close() returns", True, True)

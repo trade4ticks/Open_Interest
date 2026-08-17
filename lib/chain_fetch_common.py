@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import queue
 import threading
 import time
 from contextlib import contextmanager
@@ -450,6 +451,111 @@ def print_timing_summary(wall_total: float,
             _emit("        raising --write-queue only defers it, the fix is a "
                   "cheaper write.")
     _emit("=" * 64)
+
+
+# --- Background parquet writer ----------------------------------------------
+
+class ParquetWriterThread(threading.Thread):
+    """Serialises parquet writes off the main thread.
+
+    Both fetchers had the fan-out and the write sharing one thread, so a
+    sizeable share of every run had zero requests in flight while a year file
+    was merged and rewritten. Handing the frame over lets the next batch's
+    requests start immediately; network time and write time overlap instead of
+    summing.
+
+    Exactly ONE writer, always. The stores' write path is read-modify-rewrite
+    of a whole year file, so two threads writing the same (ticker, year) would
+    interleave read and rename and lose rows. Serialising here keeps that
+    contract while still taking it off the critical path.
+
+    The queue is bounded. An unbounded one would let a slow writer accumulate
+    batch frames until the process died of memory rather than of anything
+    diagnosable; blocking the producer instead makes backpressure visible as
+    TIMING.writer_wait, which is the number that says whether the writer has
+    become the bottleneck. Sizing matters more for the intraday store, where a
+    single batch frame is a full session of 5-minute bars.
+
+    write_rows / year_path are injected rather than imported so the two stores
+    can share this without it knowing which one it is writing to.
+    """
+
+    def __init__(self, write_rows, year_path, store_dir, maxsize: int = 2):
+        super().__init__(daemon=True, name="parquet-writer")
+        self._write_rows = write_rows
+        self._year_path = year_path
+        self._store_dir = store_dir
+        self.q: "queue.Queue" = queue.Queue(maxsize=maxsize)
+        self.error: BaseException | None = None
+        self.error_ctx: str = ""
+
+    def submit(self, ticker: str, frame, ctx: str) -> None:
+        """Block until the writer has room, then hand off. Raises whatever the
+        writer already failed with, so a write failure stops the run promptly
+        rather than after every remaining ticker has been fetched for nothing."""
+        self._raise_if_failed()
+        t0 = time.monotonic()
+        self.q.put((ticker, frame, ctx))
+        waited = time.monotonic() - t0
+        with TIMING.lock:
+            TIMING.writer_wait += waited
+
+    def _raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise SystemExit(
+                f"FATAL: parquet write failed ({self.error_ctx}): {self.error}\n"
+                f"Store dir: {self._store_dir}\n"
+                "Aborting rather than continuing to fetch with nothing stored."
+            )
+
+    def run(self) -> None:
+        while True:
+            item = self.q.get()
+            try:
+                if item is None:
+                    return
+                ticker, frame, ctx = item
+                t0 = time.monotonic()
+                try:
+                    by_year = self._write_rows(ticker, frame)
+                except BaseException as exc:            # noqa: BLE001
+                    # A write failure is systemic (permissions, schema, disk),
+                    # not batch-specific. Record it; the main thread raises.
+                    self.error, self.error_ctx = exc, ctx
+                    log.error("  %s: PARQUET WRITE FAILED — %s", ctx, exc,
+                              exc_info=True)
+                    continue
+                secs = time.monotonic() - t0
+
+                if not by_year:
+                    log.error("  %s: write_rows accepted %d rows but wrote no "
+                              "year file — every row had an unusable "
+                              "trade_date", ctx, len(frame))
+                    continue
+
+                total_rows = 0
+                total_mb = 0.0
+                for y, n in sorted(by_year.items()):
+                    p = self._year_path(ticker, y)
+                    mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
+                    total_rows += n
+                    total_mb += mb
+                    log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, mb)
+                with TIMING.lock:
+                    TIMING.writer_secs += secs
+                    TIMING.writer_count += 1
+                    TIMING.writes.append((secs, len(frame), total_rows, total_mb))
+                log.info("    write took %.1fs for %d new rows into %d rows / "
+                         "%.1f MB (fetching continued throughout)",
+                         secs, len(frame), total_rows, total_mb)
+            finally:
+                self.q.task_done()
+
+    def close(self) -> None:
+        """Drain, stop, and surface any failure."""
+        self.q.put(None)
+        self.join()
+        self._raise_if_failed()
 
 
 # --- Store preflight --------------------------------------------------------
