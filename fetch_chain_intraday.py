@@ -48,8 +48,11 @@ carries its own timestamp. So:
 --- Volume ------------------------------------------------------------------
 
 ~78x the rows per session of the snapshots store. SPY is ~14.3k contracts, so
-~1.1M rows per session, roughly 300-500MB in memory before the write. Hence
---batch-days 1 by default: one session per parquet write.
+~1.1M rows per session. That session is NEVER held in memory: each expiration
+is projected, written into the session file as its own row group, and
+released, so peak is one expiration (~31K rows, ~5MB) regardless of chain
+width. Accumulating the session with pd.concat before writing is what got
+this script OOM-killed on SPY/QQQ; see lib/chain_intraday_store.py.
 
 Usage:
     python fetch_chain_intraday.py
@@ -71,7 +74,6 @@ from tqdm import tqdm
 from config import CHAIN_INTRADAY_DIR, CHAIN_SNAPSHOTS_DIR
 from lib.chain_fetch_common import (
     TIMING,
-    ParquetWriterThread,
     chunk_range,
     preflight_store,
     print_timing_summary,
@@ -84,7 +86,7 @@ from lib.chain_fetch_common import (
     to_date_series,
     track,
 )
-from lib.chain_intraday_store import loaded_dates, write_rows, year_path
+from lib.chain_intraday_store import SessionWriter, loaded_dates
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
@@ -278,7 +280,6 @@ def _project(raw: pd.DataFrame, ticker: str, session: date) -> pd.DataFrame:
 # --- Per-ticker fetch ------------------------------------------------------
 
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
-                 writer: ParquetWriterThread,
                  force: bool = False, debug_response: bool = False) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
 
@@ -308,8 +309,50 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
 
         exp_by_session: dict[date, list[date]] = {}
         enum_failures: list[tuple[date, str]] = []
-        frames: list[pd.DataFrame] = []
         failures: list[tuple[date, date, str]] = []
+
+        # One open SessionWriter per in-flight session. Sessions are pipelined,
+        # so several can be open at once; each holds only footer metadata (a
+        # few KB), never rows, so this does not reintroduce accumulation. At
+        # the default --batch-days 1 there is exactly one.
+        writers: dict[date, SessionWriter] = {}
+        outstanding: dict[date, int] = {}      # unresolved expirations
+        failed_by_sess: dict[date, list[str]] = {}
+
+        def _finalize(sess: date) -> None:
+            """Close a session once every expiration has resolved."""
+            w = writers.pop(sess, None)
+            if w is None:
+                return
+            t_w = time.monotonic()
+            rows = w.finalize(enumerated=len(exp_by_session.get(sess, [])),
+                              failed=failed_by_sess.get(sess, []))
+            secs = time.monotonic() - t_w
+            TIMING.parquet_write += secs
+
+            if w.max_frame_bytes > TIMING.max_frame_bytes:
+                TIMING.max_frame_bytes = w.max_frame_bytes
+                TIMING.max_frame_rows = w.max_frame_rows
+                TIMING.max_frame_label = (
+                    f"{ticker} {sess} exp={w.max_frame_expiration}")
+
+            if rows == 0:
+                log.warning("  %s %s: 0 rows across %d expiration(s) — nothing "
+                            "written, session stays unloaded and will retry",
+                            ticker, sess, len(exp_by_session.get(sess, [])))
+                return
+
+            p = w.final_path
+            mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
+            TIMING.writes.append((secs, rows, rows, mb))
+            log.info("    WROTE %s -> %d rows, %d row group(s), %.1f MB "
+                     "(largest frame %.1f MB)",
+                     p, rows, w.row_groups, mb, w.max_frame_bytes / 1e6)
+            if failed_by_sess.get(sess):
+                log.warning("  %s %s: session written with %d FAILED "
+                            "expiration(s) — manifest records them, so a plain "
+                            "re-run retries this day (no --force needed)",
+                            ticker, sess, len(failed_by_sess[sess]))
         n_ok = n_empty = n_projected_away = 0
         raw_rows = proj_rows = 0
         n_queries = 0
@@ -359,7 +402,8 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         # so set_max_connections could rebuild the semaphore to 8 and this pool
         # would still be 4 — the run would sit at 4 and --connections would
         # look like it did nothing.
-        with ThreadPoolExecutor(max_workers=max_connections()) as pool:
+        try:
+          with ThreadPoolExecutor(max_workers=max_connections()) as pool:
             pending: dict = {
                 pool.submit(_enum_one, d): ("enum", d, None) for d in todo
             }
@@ -387,6 +431,13 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         if not exps:
                             continue
                         exp_by_session[sess] = exps
+                        # Open the session file now; expirations stream into it
+                        # as they land, one row group each.
+                        w = SessionWriter(ticker, sess)
+                        w.__enter__()
+                        writers[sess] = w
+                        outstanding[sess] = len(exps)
+                        failed_by_sess[sess] = []
                         for e in exps:
                             n_queries += 1
                             nf = pool.submit(_fetch_one, sess, e)
@@ -408,6 +459,9 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                         # down instead of one unit.
                         if projected is None:
                             n_empty += 1
+                            outstanding[sess] = outstanding.get(sess, 1) - 1
+                            if outstanding[sess] == 0:
+                                _finalize(sess)
                             continue
                         raw_rows += n_raw
                         if first_raw_cols is None and shape is not None:
@@ -423,19 +477,50 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                                              "this response: %d", n_distinct_ts)
                     except (TerminalTimeoutError, TerminalServerError) as exc:
                         failures.append((sess, exp, f"{type(exc).__name__}: {exc}"))
+                        failed_by_sess.setdefault(sess, []).append(str(exp))
+                        outstanding[sess] = outstanding.get(sess, 1) - 1
+                        if outstanding[sess] == 0:
+                            _finalize(sess)
                         continue
                     except Exception as exc:
                         failures.append((sess, exp, f"{type(exc).__name__}: {exc}"))
+                        failed_by_sess.setdefault(sess, []).append(str(exp))
+                        outstanding[sess] = outstanding.get(sess, 1) - 1
+                        if outstanding[sess] == 0:
+                            _finalize(sess)
                         continue
+
                     proj_rows += len(projected)
                     if projected.empty:
                         n_projected_away += 1
                     else:
                         n_ok += 1
-                        frames.append(projected)
+                        # Write THIS expiration's row group and release it.
+                        # Nothing is accumulated across expirations — the
+                        # session frame that used to be built here with
+                        # pd.concat is what made a wide chain an OOM.
+                        w = writers.get(sess)
+                        if w is not None:
+                            w.write_expiration(exp, projected)
+                    del projected
+
+                    outstanding[sess] = outstanding.get(sess, 1) - 1
+                    if outstanding[sess] == 0:
+                        _finalize(sess)
 
                 set_local_busy(False)
                 TIMING.local_compute += time.monotonic() - t_local
+        finally:
+            # Any session still open here never resolved every expiration —
+            # an exception, KeyboardInterrupt, or a kill. Drop the .tmp so the
+            # day stays absent rather than half-present. A .tmp has no parquet
+            # footer, so it could not have been read as data anyway; removing
+            # it just keeps the store tidy.
+            for sess, w in list(writers.items()):
+                log.warning("  %s %s: session abandoned mid-write — discarding "
+                            "partial file, day will refetch", ticker, sess)
+                w.abort()
+            writers.clear()
 
         batch_wall = time.monotonic() - batch_t0
         TIMING.fanout_wall += batch_wall
@@ -475,17 +560,12 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                       "in projection. Vendor columns were: %s",
                       ticker, w_start, w_end, raw_rows, first_raw_cols)
 
-        if not frames:
+        if proj_rows == 0:
             log.warning("  %s %s..%s: NOTHING WRITTEN — no rows survived "
                         "(see the counts above)", ticker, w_start, w_end)
             continue
 
-        combined = pd.concat(frames, ignore_index=True)
-        # Hand off and move on: the next session's enumeration and interval
-        # calls start immediately while this frame is merged and rewritten.
-        # Blocks only if the writer is still busy, recorded as writer_wait.
-        writer.submit(ticker, combined, f"{ticker} {w_start}..{w_end}")
-        fetched += len(combined)
+        fetched += proj_rows
 
     return fetched
 
@@ -502,11 +582,6 @@ def main() -> None:
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
                           "request size — every request is one session."))
-    ap.add_argument("--write-queue", type=int, default=1,
-                    help=("parquet batches that may sit queued for the writer "
-                          "thread (default 1). Lower than the snapshots "
-                          "default because a batch here is a whole session of "
-                          "5-minute bars — hundreds of MB per frame."))
     ap.add_argument("--connections", type=int, default=None,
                     help=("concurrent ThetaData connections (default 4). "
                           "Vendor guidance: this should MATCH the Theta "
@@ -577,20 +652,17 @@ def main() -> None:
     TIMING.startup = time.monotonic() - run_t0
     start_watchdog()
 
-    # maxsize defaults to 1 here, not 2 as in snapshots: a batch frame is a
-    # whole session of 5-minute bars (~1.1M rows for a wide chain), so each
-    # queued frame is hundreds of MB. One in flight plus one being written is
-    # already the memory that --batch-days 1 exists to bound.
-    writer = ParquetWriterThread(write_rows, year_path, CHAIN_INTRADAY_DIR,
-                                 maxsize=args.write_queue)
-    writer.start()
+    # No writer thread here, unlike snapshots. Each session is streamed
+    # straight into its own file one row group per expiration, so writes are
+    # already incremental and small; handing them to a queue would only put a
+    # whole session back into memory, which is the thing this design removes.
 
     total = 0
     failed_tickers: list[str] = []
     with tqdm(total=len(tickers), unit="tk", ncols=90, desc="intraday") as bar:
         for t in tickers:
             try:
-                total += fetch_ticker(t, batches, writer, force=args.force,
+                total += fetch_ticker(t, batches, force=args.force,
                                       debug_response=args.debug_response)
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -599,14 +671,8 @@ def main() -> None:
                 failed_tickers.append(t)
             bar.update(1)
 
-    # Drain BEFORE the summary and the row count: queued batches are fetched
-    # but not yet on disk, and a run reporting success with its tail still in
-    # memory would be lying where it matters most. close() also re-raises a
-    # writer failure the loop never saw.
-    print("\nFlushing pending parquet writes ...", end=" ", flush=True)
-    flush_t0 = time.monotonic()
-    writer.close()
-    print(f"OK ({time.monotonic() - flush_t0:.1f}s)")
+    # Nothing to drain: every session file was closed and renamed as its last
+    # expiration landed, so on-disk state already matches the reported count.
 
     stop_background_threads()
 

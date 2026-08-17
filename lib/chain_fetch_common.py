@@ -132,6 +132,14 @@ class RunTiming:
         self.writer_count = 0
         self.writer_wait = 0.0         # main thread blocked on a full queue
 
+        # (F) largest single frame held in memory during the run. The intraday
+        # fetcher streams one expiration at a time into a session file, and
+        # this is the number that proves it: if accumulation is ever
+        # reintroduced this jumps from single-digit MB to hundreds.
+        self.max_frame_bytes = 0
+        self.max_frame_rows = 0
+        self.max_frame_label = ""
+
         # (B') worker-side, accrued IN THE WORKER by track(), in a finally
         # block, so failed and timed-out tasks are counted too. This is what
         # reconciles against the in-flight sampler.
@@ -399,6 +407,17 @@ def print_timing_summary(wall_total: float,
               f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
         _emit(f"  {f'under-saturated (<{conns} in flight)':<38}"
               f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
+
+    if t.max_frame_bytes:
+        # The memory bound, observed. The intraday fetcher streams one
+        # expiration at a time into a session file and must never hold a whole
+        # session; single-digit MB here confirms that, hundreds means
+        # accumulation has crept back in.
+        _emit("\n(F) PEAK IN-MEMORY FRAME")
+        _emit(f"  {'largest single frame':<38}"
+              f"{t.max_frame_bytes / 1e6:>9.1f} MB "
+              f"({t.max_frame_rows:,} rows)")
+        _emit(f"  {'  from':<38}{t.max_frame_label}")
 
     if t.writes:
         secs = [w[0] for w in t.writes]
