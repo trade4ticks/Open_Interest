@@ -71,6 +71,7 @@ from tqdm import tqdm
 from config import CHAIN_INTRADAY_DIR, CHAIN_SNAPSHOTS_DIR
 from lib.chain_fetch_common import (
     TIMING,
+    ParquetWriterThread,
     chunk_range,
     preflight_store,
     print_timing_summary,

@@ -36,8 +36,6 @@ from datetime import date
 import pandas as pd
 import psycopg2.extras
 
-from datetime import date
-
 from db import get_connection, read_sql_df
 from lib.bin_compute import (
     TRAIN_TEST_CUTOFF_DEFAULT,
