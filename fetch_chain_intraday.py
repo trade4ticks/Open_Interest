@@ -97,7 +97,9 @@ from lib.thetadata import (
     fetch_first_order_window,
     max_connections,
     reset_snapshot_timing,
+    response_format,
     set_max_connections,
+    set_response_format,
     test_connection,
 )
 
@@ -591,6 +593,12 @@ def main() -> None:
                     help=("calendar days accumulated per parquet write "
                           f"(default {DEFAULT_BATCH_DAYS}). Does not affect "
                           "request size — every request is one session."))
+    ap.add_argument("--response-format", choices=("csv", "json"), default=None,
+                    help=("vendor response format (default csv). CSV parses in "
+                          "pyarrow's C++ reader, which releases the GIL; JSON "
+                          "builds a Python object graph per response and was "
+                          "measured as the largest GIL consumer in the run. "
+                          "Use json to fall back without a rebuild."))
     ap.add_argument("--connections", type=int, default=None,
                     help=("concurrent ThetaData connections (default 4). "
                           "Vendor guidance: this should MATCH the Theta "
@@ -610,6 +618,8 @@ def main() -> None:
     # Must happen before any request is in flight — it rebuilds the semaphore.
     if args.connections is not None:
         set_max_connections(args.connections)
+    if args.response_format is not None:
+        set_response_format(args.response_format)
 
     print("=== Open_Interest — intraday 5-minute chain bars "
           f"({INTRADAY_START_TIME[:5]}–{INTRADAY_END_TIME[:5]}) ===\n")
@@ -647,7 +657,9 @@ def main() -> None:
           f"{', --force' if args.force else ''}")
     print(f"Request shape: ONE interval call per (session, expiration), "
           f"{INTRADAY_START_TIME}..{INTRADAY_END_TIME} @ {INTRADAY_INTERVAL} "
-          f"(~78 bars/contract-day)\n")
+          f"(~78 bars/contract-day)")
+    print(f"Response format: {response_format()}"
+          f"{'  (pyarrow C++ reader, releases the GIL)' if response_format() == 'csv' else '  (Python object graph — GIL-held)'}\n")
 
     preflight_store(CHAIN_INTRADAY_DIR, CHAIN_SNAPSHOTS_DIR)
 

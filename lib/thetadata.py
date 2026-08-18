@@ -24,7 +24,9 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
 import requests
+from pyarrow import csv as pacsv
 
 from config import THETADATA_BASE_URL
 
@@ -1056,8 +1058,84 @@ def _add_timing(**kw: float) -> None:
             SNAPSHOT_TIMING[k] += v
 
 
+# --- Response format --------------------------------------------------------
+# The vendor serves the same content as JSON or CSV. JSON costs a full Python
+# object graph per response — json.loads, then a list per row, then pandas
+# transposing it — all of which holds the GIL. On a 43,992-row response that
+# measured 0.090s + 0.068s; across a 121-ticker run it was 1,076.7s of
+# GIL-held worker time, which starved the main thread's transform (measured
+# 22.6s at 8 connections against 4.0s at 1 connection — 5.6x pure contention).
+#
+# CSV parses in pyarrow's C++ reader, which RELEASES the GIL and produces an
+# Arrow table directly, skipping the object graph entirely.
+#
+# JSON is kept switchable, not removed: if the vendor's CSV has an edge case
+# we have not hit — empty results, a session with no data, an unquoted field
+# containing a comma — switching back must not need a rebuild. There is no
+# automatic fallback on parse failure, deliberately: silently reverting would
+# hide exactly the edge cases this flag exists to expose.
+_RESPONSE_FORMAT = "csv"
+
+
+def set_response_format(fmt: str) -> None:
+    if fmt not in ("csv", "json"):
+        raise ValueError(f"response format must be csv or json, got {fmt!r}")
+    global _RESPONSE_FORMAT
+    _RESPONSE_FORMAT = fmt
+
+
+def response_format() -> str:
+    return _RESPONSE_FORMAT
+
+
+# Explicit types, never Arrow's inference. Inference would decide per response
+# what a column is, so a session where every iv_error happened to be integral
+# would come back int64 while its neighbours came back double — and the
+# schema cast at write time would be the first thing to notice. `timestamp`
+# and `expiration` stay strings so the downstream projection parses them
+# exactly as it does on the JSON path; making the CSV reader parse them would
+# be a second, differently-behaved date parser to keep in agreement.
+_CSV_STRING_COLS = ("symbol", "root", "ticker", "expiration", "right",
+                    "option_type", "date", "timestamp", "underlying_timestamp")
+_CSV_FLOAT_COLS = ("strike", "bid", "ask", "delta", "theta", "vega", "rho",
+                   "epsilon", "lambda", "implied_vol", "iv", "iv_error",
+                   "underlying_price")
+_CSV_COLUMN_TYPES = {c: pa.string() for c in _CSV_STRING_COLS}
+_CSV_COLUMN_TYPES.update({c: pa.float64() for c in _CSV_FLOAT_COLS})
+
+_CSV_SCHEMA_WARNED = False
+
+
+def _parse_csv_frame(body: bytes) -> pd.DataFrame:
+    """CSV bytes -> DataFrame via pyarrow's C++ reader.
+
+    Columns not in _CSV_COLUMN_TYPES are left to inference; unknown fields are
+    reported once per run rather than silently typed.
+    """
+    global _CSV_SCHEMA_WARNED
+    if not body or not body.strip():
+        return pd.DataFrame()
+
+    table = pacsv.read_csv(
+        pa.BufferReader(body),
+        convert_options=pacsv.ConvertOptions(
+            column_types=_CSV_COLUMN_TYPES,
+            null_values=["", "NaN", "nan", "null", "NULL"],
+            strings_can_be_null=True,
+        ),
+    )
+    if not _CSV_SCHEMA_WARNED:
+        unknown = [n for n in table.schema.names if n not in _CSV_COLUMN_TYPES]
+        if unknown:
+            _CSV_SCHEMA_WARNED = True
+            log.warning("CSV response has column(s) with no explicit type, "
+                        "left to inference: %s", ", ".join(unknown))
+    return table.to_pandas()
+
+
 def _get_snapshot(endpoint: str, params: dict,
-                  total_timeout: int = SNAPSHOT_TOTAL_TIMEOUT):
+                  total_timeout: int = SNAPSHOT_TOTAL_TIMEOUT,
+                  fmt: str = "json"):
     """GET with a hard total-duration deadline, for the snapshot endpoints.
 
     Streams the body and checks elapsed wall time between chunks, so a
@@ -1066,7 +1144,7 @@ def _get_snapshot(endpoint: str, params: dict,
     total deadline; callers record the unit as failed and move on.
     """
     base   = f"{THETADATA_BASE_URL}{endpoint}"
-    params = {**params, "format": "json"}
+    params = {**params, "format": fmt}
     # Query string built manually so * is not percent-encoded, as in _get.
     qs  = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"{base}?{qs}"
@@ -1120,6 +1198,13 @@ def _get_snapshot(endpoint: str, params: dict,
     http_secs = time.monotonic() - t0
     body = b"".join(chunks)
 
+    if fmt != "json":
+        # CSV is handed back undecoded — pyarrow's reader consumes the bytes
+        # directly, so there is deliberately no Python object graph built here.
+        _add_timing(http_seconds=http_secs, http_count=1,
+                    http_bytes=float(nbytes))
+        return body
+
     t1 = time.monotonic()
     out = json.loads(body) if body else {}
     _add_timing(http_seconds=http_secs, parse_seconds=time.monotonic() - t1,
@@ -1127,7 +1212,8 @@ def _get_snapshot(endpoint: str, params: dict,
     return out
 
 
-def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
+def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT,
+                fmt: str = "json"):
     """`_get_snapshot` behind the 4-connection snapshot semaphore.
 
     The semaphore is released as soon as the request returns OR raises —
@@ -1139,12 +1225,13 @@ def _get_capped(endpoint: str, params: dict, timeout: int = _DEFAULT_TIMEOUT):
     _SNAPSHOT_SEM.acquire()
     _add_timing(sem_wait_seconds=time.monotonic() - t_sem)
     try:
-        return _get_snapshot(endpoint, params)
+        return _get_snapshot(endpoint, params, fmt=fmt)
     finally:
         _SNAPSHOT_SEM.release()
 
 
-def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
+def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str,
+                    fmt: str = "json"):
     """Shared retry ladder for the snapshot endpoints.
 
     429 (rate limit)        -> sleep 60s, retry once
@@ -1157,7 +1244,7 @@ def _get_with_retry(endpoint: str, params: dict, timeout: int, label: str):
     last_exc: Exception | None = None
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
-            return _get_capped(endpoint, params, timeout=timeout)
+            return _get_capped(endpoint, params, timeout=timeout, fmt=fmt)
         except RateLimitError as exc:
             last_exc, reason = exc, "429"
         except ServerDisconnectedError as exc:
@@ -1294,10 +1381,12 @@ def fetch_first_order_window(symbol: str, expiration: date, trade_date: date,
     }
     label = (f"first_order {symbol} exp={expiration} {trade_date} "
              f"{start_time}..{end_time} @{interval}")
+    fmt = response_format()
 
     try:
         data = _get_with_retry(
-            "/v3/option/history/greeks/first_order", params, timeout, label
+            "/v3/option/history/greeks/first_order", params, timeout, label,
+            fmt=fmt,
         )
     except NoDataError:
         return pd.DataFrame()
@@ -1307,7 +1396,9 @@ def fetch_first_order_window(symbol: str, expiration: date, trade_date: date,
         raise
 
     t_parse = time.monotonic()
-    out = _parse_frame(data)
+    # CSV bytes go straight into pyarrow's C++ reader; JSON still builds the
+    # Python object graph. Same downstream frame either way.
+    out = _parse_csv_frame(data) if fmt == "csv" else _parse_frame(data)
     _add_timing(parse_seconds=time.monotonic() - t_parse)
     return out
 
