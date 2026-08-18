@@ -21,7 +21,7 @@ never show it.
 
 Usage:
     python diagnose_transform.py
-    python diagnose_transform.py --ticker SPY --date 20260814
+    python diagnose_transform.py --ticker SPY --date 20260804
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ import platform
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -48,8 +48,32 @@ from fetch_chain_intraday import (
 from lib.chain_intraday_store import (
     COLUMNS, DEDUPE_KEYS, SORT_KEYS, _SCHEMA, coerce,
 )
-from lib.market_hours import get_trading_days, last_trading_day
-from lib.thetadata import enumerate_expirations_eod, fetch_first_order_window
+from lib.market_hours import get_trading_days
+from lib.thetadata import (
+    enumerate_expirations_eod,
+    fetch_first_order_window,
+    today_et,
+)
+
+
+def last_completed_session() -> date:
+    """Most recent NYSE session strictly BEFORE today (ET).
+
+    Not lib.market_hours.last_trading_day: despite its docstring saying
+    "fully-completed", it returns TODAY when today is a trading day, because
+    it takes the last row of a schedule ending at today. For an EOD
+    enumeration that is the one date guaranteed to fail — the session has not
+    closed, so /v3/option/history/eod answers 400, which is not in the
+    retry-ladder's status map and surfaces as a raw HTTPError.
+
+    Stepping strictly back one session is always safe and always closed,
+    whatever time of day this runs.
+    """
+    today = today_et()
+    sched = get_trading_days(today - timedelta(days=14), today - timedelta(days=1))
+    if not sched:
+        raise SystemExit("No completed NYSE session in the last 14 days.")
+    return sched[-1]
 
 
 def hdr(t: str) -> None:
@@ -111,7 +135,10 @@ def describe_objects(df: pd.DataFrame, label: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ticker", default="QQQ")
-    ap.add_argument("--date", help="YYYYMMDD; default = last trading day")
+    ap.add_argument("--date",
+                    help=("YYYYMMDD. Default = most recent COMPLETED session; "
+                          "today is excluded because an unclosed session "
+                          "400s on the EOD enumeration."))
     ap.add_argument("--expiration", help="YYYYMMDD; default = first enumerated")
     args = ap.parse_args()
 
@@ -133,14 +160,39 @@ def main() -> None:
     except Exception:
         print("  pd string dtype default  (option not present — pandas < 2.1)")
 
-    sess = (datetime.strptime(args.date, "%Y%m%d").date()
-            if args.date else last_trading_day())
+    if args.date:
+        sess = datetime.strptime(args.date, "%Y%m%d").date()
+        why = "from --date"
+    else:
+        sess = last_completed_session()
+        why = "most recent COMPLETED session (today is excluded — an unclosed "
+        why += "session 400s on the EOD enumeration)"
     if not get_trading_days(sess, sess):
         raise SystemExit(f"{sess} is not a trading day.")
+    if sess >= today_et():
+        print(f"\n  WARNING: {sess} is today or later. The EOD enumeration will "
+              f"400 because the session has not closed.")
     ticker = args.ticker.upper()
 
     hdr(f"FETCH  {ticker}  {sess}")
-    el, exps = t(enumerate_expirations_eod, ticker, sess, sess)
+    print(f"  session       {sess}  ({why})")
+    # Printed so the call can be compared against production by eye. This is
+    # byte-identical to what fetch_chain_intraday.py:370 issues; the only
+    # difference there is a track() wrapper, which adds no parameters.
+    print(f"  enumeration   GET /v3/option/history/eod  "
+          f"symbol={ticker} expiration=* "
+          f"start_date={sess:%Y%m%d} end_date={sess:%Y%m%d}")
+    print(f"                (same call as fetch_chain_intraday.py:370 — "
+          f"enumerate_expirations_eod(ticker, sess, sess))")
+
+    try:
+        el, exps = t(enumerate_expirations_eod, ticker, sess, sess)
+    except Exception as exc:
+        raise SystemExit(
+            f"\n  enumeration FAILED: {type(exc).__name__}: {exc}\n"
+            f"  A 400 here almost always means {sess} has not closed. Pass a "
+            f"known-good date, e.g. --date 20260804."
+        )
     exps = sorted(e for e in exps if e >= sess)
     print(f"  enumerated {len(exps)} expirations in {el:.2f}s")
     if not exps:
