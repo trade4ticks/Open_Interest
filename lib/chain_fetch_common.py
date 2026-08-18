@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import queue
 import threading
 import time
@@ -139,6 +140,18 @@ class RunTiming:
         self.max_frame_bytes = 0
         self.max_frame_rows = 0
         self.max_frame_label = ""
+
+        # (G) local_compute, split. The aggregate bucket said 78.8% of a run
+        # was "local compute" while bench-marking showed the data work is ~19s
+        # per session — the name promised compute the number was not
+        # measuring. These sub-buckets sum to local_compute, with whatever is
+        # left surfaced as an explicit remainder, so the next run attributes
+        # it instead of inviting another guess.
+        self.lc_result = 0.0            # unwrapping completed futures
+        self.lc_enum = 0.0              # enum branch: open writer, submit
+        self.lc_write_transform = 0.0   # dedupe / sort / coerce / to_arrow
+        self.lc_write_io = 0.0          # ParquetWriter.write_table only
+        self.lc_finalize = 0.0          # close + rename + manifest
 
         # (B') worker-side, accrued IN THE WORKER by track(), in a finally
         # block, so failed and timed-out tasks are counted too. This is what
@@ -408,6 +421,25 @@ def print_timing_summary(wall_total: float,
         _emit(f"  {f'under-saturated (<{conns} in flight)':<38}"
               f"{under_frac * wall_total:>9.1f}s {under_frac * 100:>6.1f}%")
 
+    sub = (t.lc_result + t.lc_enum + t.lc_write_transform
+           + t.lc_write_io + t.lc_finalize)
+    if sub or t.local_compute:
+        _emit("\n(G) LOCAL COMPUTE, SPLIT — sums to the (A) local compute row")
+        _emit(f"  {'fan-out: local compute (A)':<38}{t.local_compute:>9.1f}s")
+
+        def lrow(label: str, secs: float) -> None:
+            share = (100.0 * secs / t.local_compute) if t.local_compute else 0.0
+            _emit(f"  {label:<38}{secs:>9.1f}s {share:>6.1f}%")
+
+        lrow("  future unwrap", t.lc_result)
+        lrow("  enum handling (open writer)", t.lc_enum)
+        lrow("  write: transform (sort/coerce)", t.lc_write_transform)
+        lrow("  write: ParquetWriter.write_table", t.lc_write_io)
+        lrow("  finalize (close/rename/manifest)", t.lc_finalize)
+        # Anything here is time the main thread spent inside the loop but
+        # outside every operation it performs — i.e. blocked, not computing.
+        lrow("  UNATTRIBUTED (blocked, not compute)", t.local_compute - sub)
+
     if t.max_frame_bytes:
         # The memory bound, observed. The intraday fetcher streams one
         # expiration at a time into a session file and must never hold a whole
@@ -579,6 +611,98 @@ class ParquetWriterThread(threading.Thread):
 
 # --- Store preflight --------------------------------------------------------
 
+_NETWORK_FSTYPES = {
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "lustre",
+    "fuse.sshfs", "fuse.s3fs", "fuse.rclone", "9p", "afs",
+}
+
+
+def describe_storage(path: Path) -> list[str]:
+    """Report which device backs `path`, and how fast it actually is.
+
+    An attached block volume presents as a normal local device, so fstype
+    alone cannot tell you whether writes cross a network. The latency probe
+    is the part that settles it: a boot SSD fsyncs in single-digit
+    milliseconds, network-backed storage is typically an order of magnitude
+    slower, and that difference is what would show up in write_table time.
+
+    Best-effort and never fatal — this is diagnostics, not a gate.
+    """
+    out: list[str] = []
+
+    # --- which mount backs this path -------------------------------------
+    dev = fstype = opts = mount = "?"
+    try:
+        entries = []
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4:
+                    entries.append((parts[1], parts[0], parts[2], parts[3]))
+        # longest mount point that prefixes the path wins
+        resolved = str(path.resolve())
+        best = None
+        for mp, d, ft, op in entries:
+            if resolved == mp or resolved.startswith(mp.rstrip("/") + "/"):
+                if best is None or len(mp) > len(best[0]):
+                    best = (mp, d, ft, op)
+        if best:
+            mount, dev, fstype, opts = best
+    except Exception:
+        pass
+
+    networked = fstype in _NETWORK_FSTYPES
+    out.append(f"  mount point       {mount}")
+    out.append(f"  device            {dev}")
+    out.append(f"  filesystem        {fstype}"
+               + ("   [NETWORK FILESYSTEM]" if networked else ""))
+    out.append(f"  options           {opts[:70]}")
+
+    # Cloud attached volumes look local but are network-backed; the by-id
+    # alias is usually where the provider names them.
+    try:
+        byid = Path("/dev/disk/by-id")
+        if byid.is_dir():
+            base = Path(dev).name
+            for link in byid.iterdir():
+                try:
+                    if link.resolve().name == base:
+                        out.append(f"  by-id             {link.name}")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # --- write + fsync latency, on the store itself ----------------------
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".io_probe"
+        payload = b"\0" * (8 << 20)          # 8 MiB, ~1/15th of a session file
+        t0 = time.monotonic()
+        with open(probe, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        elapsed = time.monotonic() - t0
+        # separate the fsync from the write to see which side is slow
+        t1 = time.monotonic()
+        with open(probe, "wb") as fh:
+            fh.write(b"\0" * 4096)
+            fh.flush()
+            os.fsync(fh.fileno())
+        sync_latency = time.monotonic() - t1
+        probe.unlink(missing_ok=True)
+        out.append(f"  8MiB write+fsync  {elapsed:.3f}s "
+                   f"({8 / elapsed:.0f} MB/s)")
+        out.append(f"  4KiB write+fsync  {sync_latency * 1000:.1f} ms"
+                   + ("   [slow — consistent with network-attached]"
+                      if sync_latency > 0.02 else ""))
+    except Exception as exc:
+        out.append(f"  io probe failed   {exc}")
+
+    return out
+
+
 def preflight_store(store_dir: Path, sibling_dir: Path) -> None:
     """Resolve the store path, prove it is writable, report .tmp orphans.
 
@@ -606,6 +730,10 @@ def preflight_store(store_dir: Path, sibling_dir: Path) -> None:
             f"FATAL: {store_dir} is not writable by this process: {exc}"
         )
     log.info("  write permission OK")
+
+    _emit("Storage backing the store:")
+    for line in describe_storage(store_dir):
+        _emit(line)
 
     orphans = sorted(store_dir.glob("*/*.parquet.tmp"))
     if orphans:

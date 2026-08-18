@@ -329,6 +329,11 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                               failed=failed_by_sess.get(sess, []))
             secs = time.monotonic() - t_w
             TIMING.parquet_write += secs
+            TIMING.lc_finalize += secs
+            # Transform (CPU) and write_table (storage I/O) accrued per
+            # expiration on the writer; fold them in once the session closes.
+            TIMING.lc_write_transform += w.transform_secs
+            TIMING.lc_write_io += w.io_secs
 
             if w.max_frame_bytes > TIMING.max_frame_bytes:
                 TIMING.max_frame_bytes = w.max_frame_bytes
@@ -418,6 +423,7 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                     kind, sess, exp = pending.pop(fut)
 
                     if kind == "enum":
+                        t_enum_h = time.monotonic()
                         try:
                             elapsed, raw_exps = fut.result()
                         except Exception as exc:
@@ -442,13 +448,16 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                             n_queries += 1
                             nf = pool.submit(_fetch_one, sess, e)
                             pending[nf] = ("fetch", sess, e)
+                        TIMING.lc_enum += time.monotonic() - t_enum_h
                         continue
 
+                    t_res = time.monotonic()
                     try:
                         # Projection already happened on the pool thread; a
                         # malformed response still surfaces here as a unit
                         # failure, because the worker raised inside its future.
                         elapsed, n_raw, shape, projected = fut.result()
+                        TIMING.lc_result += time.monotonic() - t_res
                         busy_seconds += elapsed
                         TIMING.query_secs += elapsed
                         TIMING.query_count += 1

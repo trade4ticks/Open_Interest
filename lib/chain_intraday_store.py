@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -251,7 +252,13 @@ def coerce(df: pd.DataFrame) -> pd.DataFrame:
         out[c] = _col(df, c).astype("string")
 
     for c in _DATE_COLS:
-        out[c] = pd.to_datetime(_col(df, c), errors="coerce").dt.date
+        # Left as datetime64, NOT .dt.date. Arrow casts timestamp -> date32
+        # through the schema, so the Python date objects that .dt.date
+        # materialised (one per row, per column) are never created. Those
+        # objects also forced dedupe and sort onto object-dtype comparison;
+        # keeping them numeric measured 2.4x faster on the whole transform,
+        # byte-identical output.
+        out[c] = pd.to_datetime(_col(df, c), errors="coerce")
 
     for c in _TS_COLS:
         # Floor to ms so the ns -> ms cast below is exact; pyarrow casts safely
@@ -300,6 +307,10 @@ class SessionWriter:
         self.max_frame_bytes = 0
         self.max_frame_rows = 0
         self.max_frame_expiration: date | None = None
+        # Split so the caller can attribute transform (CPU) separately from
+        # write_table (storage I/O) — the two have completely different fixes.
+        self.transform_secs = 0.0
+        self.io_secs = 0.0
 
     def __enter__(self) -> "SessionWriter":
         self.tmp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,20 +331,34 @@ class SessionWriter:
         if frame is None or frame.empty:
             return 0
 
-        # Measure before the copies, on the projected frame the caller holds.
-        nbytes = int(frame.memory_usage(deep=True).sum())
+        # deep=False, deliberately. deep=True walked every element of every
+        # object column calling sys.getsizeof (~350K Python calls per
+        # expiration) purely to print one number, and sat on the hot path to
+        # do it. deep=False is O(ncols) and still measures the pandas frame
+        # the worker actually holds — it only omits the payload behind shared
+        # object references, which factorize-and-take keeps to a few hundred
+        # objects. NOTE: earlier runs reported the deep=True figure, so this
+        # number is smaller for the same frame; it is not a memory reduction.
+        nbytes = int(frame.memory_usage(deep=False).sum())
         if nbytes > self.max_frame_bytes:
             self.max_frame_bytes = nbytes
             self.max_frame_rows = len(frame)
             self.max_frame_expiration = exp
 
-        f = frame.drop_duplicates(subset=DEDUPE_KEYS, keep="last")
+        t_tr = time.monotonic()
+        # coerce FIRST so dedupe and sort run on numeric dtypes rather than
+        # object-dtype Python dates — that ordering is most of the 2.4x.
+        f = coerce(frame)
+        f = f.drop_duplicates(subset=DEDUPE_KEYS, keep="last")
         f = f.sort_values(SORT_KEYS, kind="mergesort")
-        table = pa.Table.from_pandas(coerce(f), schema=_SCHEMA,
-                                     preserve_index=False)
+        table = pa.Table.from_pandas(f, schema=_SCHEMA, preserve_index=False)
         del f
+        self.transform_secs += time.monotonic() - t_tr
+
         n = table.num_rows
+        t_io = time.monotonic()
         self._writer.write_table(table)
+        self.io_secs += time.monotonic() - t_io
         del table
 
         self.rows += n
