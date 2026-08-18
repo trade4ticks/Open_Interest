@@ -49,9 +49,18 @@ class ServerDisconnectedError(ThetaDataError): """HTTP 474."""
 class LargeRequestError(ThetaDataError): """HTTP 570 — split needed."""
 class TerminalTimeoutError(ThetaDataError): """Read timeout."""
 class TerminalServerError(ThetaDataError):  """HTTP 500."""
+class BadRequestError(ThetaDataError):
+    """HTTP 400 — the terminal rejected the request.
+
+    Most often an EOD request for a session that has not closed: the data does
+    not exist yet, so the endpoint refuses rather than returning 472. Untyped
+    this escaped as a raw requests.HTTPError, bypassing every caller's
+    handling and killing the run.
+    """
 
 
 _STATUS_EXC = {
+    400: BadRequestError,
     429: RateLimitError,
     472: NoDataError,
     474: ServerDisconnectedError,
@@ -1214,6 +1223,22 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
         data = _get_with_retry("/v3/option/history/eod", params, timeout, label)
     except NoDataError:
         return set()
+    except BadRequestError as exc:
+        # EOD data does not exist until the session closes (~17:15 ET), and the
+        # terminal answers 400 rather than 472 for a session that has not
+        # happened yet. lib.market_hours.last_trading_day returns TODAY when
+        # today is a trading day, so both fetchers routinely ask for it — a
+        # run started before the close would otherwise die on a raw HTTPError.
+        #
+        # Treated as "nothing listed yet" ONLY when the window could plausibly
+        # be unclosed. A 400 on a historical date is a real malformed request
+        # and still propagates.
+        if end_date >= today_et():
+            log.warning("  %s: EOD not published yet for %s (session not "
+                        "closed) — enumerating nothing; a later run will "
+                        "pick it up", symbol, end_date)
+            return set()
+        raise
     except LargeRequestError:
         if start_date >= end_date:
             raise   # cannot split a single day — let the caller see it
