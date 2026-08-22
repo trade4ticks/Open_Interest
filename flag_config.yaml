@@ -1,0 +1,27 @@
+# Data quality flag thresholds.
+#
+# NOTE: all values except iv_error_high are inherited from an index-options
+# implementation and are known to be mis-tuned for single-name equities.
+# They are intentionally unchanged for now: flags drop no rows, so a wrong
+# threshold costs nothing but a noisy column, and the intent is to retune
+# from observed flag rates (see clean_summary) rather than guess up front.
+#
+# Known-wrong, expected behaviour on equities:
+#   wide_spread_abs  -- $5 is large relative to equity option prices;
+#                       expect this to fire almost never.
+#   wide_spread_pct  -- expect a high fire rate even on liquid near-the-money
+#                       strikes. On AAPL 7-DTE near-the-money rows this trips
+#                       on roughly a quarter of quotes.
+#   deep_otm         -- a fixed +/-15% band against a universe spanning ~12-vol
+#                       to ~80-vol names. At 30 DTE and 25 vol this is under
+#                       2 sigma, i.e. inside normal trading range.
+
+wide_spread_abs: 5.0          # absolute spread, dollars
+wide_spread_pct: 0.20         # spread / mid_price
+iv_extreme_high: 5.0          # implied vol, 500%
+iv_extreme_low: 0.05          # implied vol, 5%
+deep_otm_lower: 0.85          # moneyness (S/K) below this: strike well above spot
+deep_otm_upper: 1.15          # moneyness (S/K) above this: strike well below spot
+near_expiry_dte: 1            # DTE at or under which the near-expiry check applies
+near_expiry_spread_pct: 0.10  # spread_pct threshold when near expiry
+iv_error_high: 0.05           # PLACEHOLDER - no basis yet, tune from observed rates
