@@ -1,0 +1,508 @@
+"""
+test_equity_metrics.py — stage 4, with no database.
+
+Every expected value here is hand-computed and written out as arithmetic, not
+captured from a run. A snapshot test on 600 generated columns would lock in
+whatever the code did the first time, including the sign errors.
+
+The tests that matter most:
+
+  * OHLC windows end at T-1. A close on T that the snapshot could not have
+    known is planted in the fixture; if it leaks into log_ret_d or rv_1w, vrp
+    carries a full session of lookahead and a variance-premium backtest looks
+    excellent for the wrong reason.
+  * The zero-cost solve returns NULL rather than extrapolating past the
+    5-delta node.
+  * compute_metrics emits EXACTLY the registry's column set. A typo'd key is
+    otherwise a permanently NULL column, not an error.
+  * A calendar-arbitrage forward variance is NULL, not a clamp to zero.
+
+Run:  python test_equity_metrics.py     (exit 1 on any failure)
+"""
+from __future__ import annotations
+
+import math
+import sys
+from datetime import date, datetime, timedelta
+
+import lib.metrics_compute as C
+import lib.metrics_config as M
+from lib.metrics_store import zscore_row
+
+PASS, FAIL = [], []
+TOL = 1e-9
+
+
+def check(name, got, want):
+    ok = got == want
+    (PASS if ok else FAIL).append(name)
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {name:<57} got={got!r} want={want!r}")
+
+
+def close(name, got, want, tol=TOL):
+    ok = (got is not None and want is not None
+          and abs(got - want) <= tol * max(1.0, abs(want)))
+    (PASS if ok else FAIL).append(name)
+    g = f"{got:.10g}" if isinstance(got, float) else repr(got)
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {name:<57} got={g} want={want:.10g}")
+
+
+# =============================================================================
+# Fixture: one snapshot with a hand-chosen smile
+# =============================================================================
+SPOT = 100.0
+# (tenor, delta label) -> (iv, strike)
+SMILE = {
+    (30, "10p"): (0.40, 80.0), (30, "25p"): (0.32, 90.0),
+    (30, "atm"): (0.28, 100.0), (30, "25c"): (0.26, 110.0),
+    (30, "10c"): (0.27, 120.0),
+    (7, "10p"): (0.52, 88.0), (7, "25p"): (0.42, 94.0),
+    (7, "atm"): (0.35, 100.0), (7, "25c"): (0.33, 106.0),
+    (7, "10c"): (0.34, 112.0),
+}
+# put_delta -> (price, strike) at 30d
+# Strikes at nodes 10 and 25 MUST match SMILE's — the same node cannot sit at
+# two strikes, and .update() below would silently win.
+PUT_LADDER = {5: (0.50, 76.0), 10: (1.00, 80.0), 15: (1.80, 84.0),
+              20: (2.80, 87.0), 25: (4.00, 90.0)}
+ATM_PUT_PRICE_30 = 5.00
+CALL_25_PRICE_30 = 3.00
+
+SQRT30 = math.sqrt(30.0 / 365.0)
+
+
+def build_snap():
+    nodes, atm = {}, {}
+    for t in (7, 30):
+        nodes[t] = {}
+        for lbl, node in M.DELTA_NODE.items():
+            iv, k = SMILE[(t, lbl)]
+            nodes[t][node] = {"iv": iv, "strike": k, "price": None,
+                              "call_price": None, "extrapolated": False,
+                              "captured_at": datetime(2026, 6, 1, 15, 47),
+                              "source": "live"}
+        nodes[t][50] = {"iv": SMILE[(t, "atm")][0], "strike": 100.0,
+                        "price": None, "call_price": None,
+                        "extrapolated": (t == 7),   # 7d ATM read is fabricated
+                        "captured_at": datetime(2026, 6, 1, 15, 47),
+                        "source": "live"}
+        atm[t] = {"atm_iv": SMILE[(t, "atm")][0], "atm_strike": 100.0,
+                  "atm_forward": 100.5, "underlying_price": SPOT,
+                  "price": ATM_PUT_PRICE_30 if t == 30 else 3.0,
+                  "captured_at": datetime(2026, 6, 1, 15, 47),
+                  "source": "live"}
+    for d, (px, k) in PUT_LADDER.items():
+        nodes[30].setdefault(d, {"iv": None, "extrapolated": False,
+                                 "captured_at": None, "source": None})
+        nodes[30][d].update({"price": px, "strike": k, "call_price": None})
+    nodes[30][75] = {"iv": SMILE[(30, "25c")][0], "strike": 110.0,
+                     "price": 14.0, "call_price": CALL_25_PRICE_30,
+                     "extrapolated": False, "captured_at": None,
+                     "source": "live"}
+    diag = [
+        {"forward_method": "pcp", "n_strikes_clean": 100.0,
+         "domain_reach": 4.0, "calendar_arb": False, "butterfly_arb": True,
+         "skipped": False},
+        {"forward_method": "spot_fallback", "n_strikes_clean": 50.0,
+         "domain_reach": 2.0, "calendar_arb": True, "butterfly_arb": False,
+         "skipped": False},
+        {"forward_method": None, "n_strikes_clean": None,
+         "domain_reach": None, "calendar_arb": False, "butterfly_arb": False,
+         "skipped": True},
+    ]
+    return {"nodes": nodes, "atm": atm, "diag": diag}
+
+
+SNAP = build_snap()
+_, IV, STRIKE, EXTRAP = C._level(SNAP)
+
+print("\n=== 0. the fixture is self-consistent ===")
+for _lbl, _node in M.DELTA_NODE.items():
+    if _node in PUT_LADDER:
+        check(f"ladder and smile agree on the {_lbl} strike",
+              PUT_LADDER[_node][1], SMILE[(30, _lbl)][1])
+check("ladder strikes rise with put_delta",
+      [PUT_LADDER[d][1] for d in sorted(PUT_LADDER)]
+      == sorted(PUT_LADDER[d][1] for d in PUT_LADDER), True)
+check("ladder prices rise with put_delta (further ITM costs more)",
+      [PUT_LADDER[d][0] for d in sorted(PUT_LADDER)]
+      == sorted(PUT_LADDER[d][0] for d in PUT_LADDER), True)
+
+
+print("\n=== 1. skew slopes: sqrt(dte/365) * dIV / dln(K) ===")
+sk = C._skew(IV, STRIKE)
+close("skew_30d_10p_25p", sk["skew_30d_10p_25p"],
+      SQRT30 * (0.32 - 0.40) / math.log(90.0 / 80.0))
+close("skew_30d_atm_10c", sk["skew_30d_atm_10c"],
+      SQRT30 * (0.27 - 0.28) / math.log(120.0 / 100.0))
+close("skew_30d_25p_25c (the wide pair)", sk["skew_30d_25p_25c"],
+      SQRT30 * (0.26 - 0.32) / math.log(110.0 / 90.0))
+check("put skew is negative (IV falls as strike rises)",
+      sk["skew_30d_10p_25p"] < 0, True)
+check("a missing tenor gives NULL, not 0.0", sk["skew_60d_10p_25p"], None)
+# Uses the ACTUAL strikes: same IVs on a different ladder must differ.
+alt = C._skew({(30, "10p"): 0.40, (30, "25p"): 0.32},
+              {(30, "10p"): 70.0, (30, "25p"): 90.0})
+check("slope tracks strikes, not delta labels",
+      abs(alt["skew_30d_10p_25p"] - sk["skew_30d_10p_25p"]) > 1e-6, True)
+# Degenerate denominator.
+same = C._skew({(30, "10p"): 0.40, (30, "25p"): 0.32},
+               {(30, "10p"): 90.0, (30, "25p"): 90.0})
+check("identical strikes -> NULL, not a divide-by-zero",
+      same["skew_30d_10p_25p"], None)
+
+print("\n=== 2. convexity: delta-interpolated wings minus the centre ===")
+cx = C._convexity(IV)
+# 10p=10, 25p=25, atm=50 -> w_left=(50-25)/40=0.625, w_right=(25-10)/40=0.375
+close("convex_30d_10p_25p_atm", cx["convex_30d_10p_25p_atm"],
+      0.625 * 0.40 + 0.375 * 0.28 - 0.32)
+# 25p=25, atm=50, 25c=75 -> symmetric, both weights 0.5
+close("convex_30d_25p_atm_25c (symmetric)", cx["convex_30d_25p_atm_25c"],
+      0.5 * 0.32 + 0.5 * 0.26 - 0.28)
+close("convex_30d_10p_atm_10c", cx["convex_30d_10p_atm_10c"],
+      0.5 * 0.40 + 0.5 * 0.27 - 0.28)
+check("weights sum to 1 for every triple",
+      all(abs(((M.DELTA_COORD[r] - M.DELTA_COORD[c])
+               + (M.DELTA_COORD[c] - M.DELTA_COORD[l]))
+              / (M.DELTA_COORD[r] - M.DELTA_COORD[l]) - 1.0) < 1e-12
+          for l, c, r in M.CONVEX_TRIPLES), True)
+
+print("\n=== 3. risk reversal: call minus put ===")
+rr = C._risk_reversal(IV)
+close("rr_30d_25", rr["rr_30d_25"], 0.26 - 0.32)
+close("rr_30d_10", rr["rr_30d_10"], 0.27 - 0.40)
+check("negative on an equity skew", rr["rr_30d_25"] < 0 and rr["rr_30d_10"] < 0,
+      True)
+
+print("\n=== 4. term structure ===")
+tm = C._term(IV)
+close("term_ratio_7d_30d", tm["term_ratio_7d_30d"], 0.35 / 0.28)
+t7, t30 = 7.0 / 365.0, 30.0 / 365.0
+close("term_slope_7d_30d_atm (forward vol)", tm["term_slope_7d_30d_atm"],
+      math.sqrt((0.28 ** 2 * t30 - 0.35 ** 2 * t7) / (t30 - t7)))
+check("front-loaded term structure -> ratio > 1",
+      tm["term_ratio_7d_30d"] > 1.0, True)
+# Calendar arbitrage: total variance FALLS with maturity.
+arb = C._term({(7, "atm"): 0.90, (30, "atm"): 0.28})
+check("negative forward variance -> NULL, not 0.0 and not a crash",
+      arb["term_slope_7d_30d_atm"], None)
+check("  (and it really was negative)",
+      (0.28 ** 2 * t30 - 0.90 ** 2 * t7) < 0, True)
+
+print("\n=== 5. structure prices ===")
+st = C._structure(SNAP, IV, SPOT)
+close("ratio_price_30d = 2*p(10p) - p(25p)", st["ratio_price_30d"],
+      2 * 1.00 - 4.00)
+close("straddle_price_30d = 2*atm put", st["straddle_price_30d"],
+      2 * ATM_PUT_PRICE_30)
+close("rr_price_30d = call(pd75) - put(pd25)", st["rr_price_30d"],
+      CALL_25_PRICE_30 - 4.00)
+close("wing_cost_10p_5p_30d", st["wing_cost_10p_5p_30d"], 1.00 - 0.50)
+# Delta-neutral short = half of 25 = 12.5, interpolated between 10 and 15.
+close("cost_at_delta_neutral_30d (p@12.5 interpolated)",
+      st["cost_at_delta_neutral_30d"],
+      2 * (1.00 + 0.5 * (1.80 - 1.00)) - 4.00)
+# Zero cost: target = 4.00/2 = 2.00, between pd15 (1.80) and pd20 (2.80).
+frac = (2.00 - 1.80) / (2.80 - 1.80)
+close("zc_short_delta_30d", st["zc_short_delta_30d"], 15 + frac * 5)
+k_short = 84.0 + frac * (87.0 - 84.0)
+close("zc_width_sigma_30d", st["zc_width_sigma_30d"],
+      math.log(k_short / SPOT) / (0.28 * SQRT30))
+check("zc_width_sigma is negative (short strike below spot)",
+      st["zc_width_sigma_30d"] < 0, True)
+check("zero-cost sits further out than delta-neutral on this skew",
+      st["zc_short_delta_30d"] > 12.5, True)
+
+print("\n=== 6. zero-cost solve refuses to extrapolate ===")
+d, k = C._zero_cost_short({dd: {"price": p, "strike": kk}
+                           for dd, (p, kk) in PUT_LADDER.items()}, 4.00)
+close("  solves inside the ladder", d, 16.0)
+# Target below the 5-delta node: the surface does not reach that far out.
+thin = {dd: {"price": p, "strike": kk} for dd, (p, kk) in PUT_LADDER.items()}
+d2, k2 = C._zero_cost_short(thin, 0.90)      # target 0.45 < p(5d) = 0.50
+check("target beyond the 5-delta node -> NULL, not an invented strike",
+      (d2, k2), (None, None))
+check("no 25-delta long leg -> NULL", C._zero_cost_short(thin, None),
+      (None, None))
+check("interp refuses to extrapolate past the ladder",
+      C._interp_node(thin, 2.0, "price"), None)
+close("interp is exact on a node", C._interp_node(thin, 15, "price"), 1.80)
+close("interp is linear between nodes",
+      C._interp_node(thin, 12.5, "price"), 1.40)
+
+
+print("\n=== 7. realized vol: the window ENDS AT T-1 ===")
+T = date(2026, 6, 15)
+# Closes ending the day before T, then a planted 100% move ON T that no
+# 13:45 snapshot could know about.
+hist = [100.0, 101.0, 99.0, 102.0, 103.0, 101.5, 104.0]
+bars = []
+for i, c in enumerate(hist):
+    d = T - timedelta(days=len(hist) - i)
+    bars.append({"d": d, "o": c * 0.995, "h": c * 1.01, "l": c * 0.99, "c": c})
+bars.append({"d": T, "o": 104.0, "h": 210.0, "l": 104.0, "c": 200.0})
+
+rvrow = C._realized(bars, T, {(7, "atm"): 0.35, (30, "atm"): 0.28,
+                              (90, "atm"): 0.30})
+close("log_ret_d uses close[T-1]/close[T-2]", rvrow["log_ret_d"],
+      math.log(104.0 / 101.5))
+check("  and NOT the planted close on T",
+      abs(rvrow["log_ret_d"] - math.log(200.0 / 104.0)) > 0.1, True)
+close("log_ret_1w over 5 sessions", rvrow["log_ret_1w"],
+      math.log(104.0 / 101.0))
+
+rets = [math.log(b / a) for a, b in zip(hist[:-1], hist[1:])]
+m = sum(rets[-5:]) / 5
+sd = math.sqrt(sum((r - m) ** 2 for r in rets[-5:]) / 4)
+close("rv_1w = stdev(5 returns, ddof=1) * sqrt(252)", rvrow["rv_1w"],
+      sd * math.sqrt(252))
+check("rv_1w excludes T's 92% move", rvrow["rv_1w"] < 1.0, True)
+
+pk = [math.log(b["h"] / b["l"]) ** 2 for b in bars[-6:-1]]
+close("rv_park_1w (Parkinson)", rvrow["rv_park_1w"],
+      math.sqrt(sum(pk) / (4 * math.log(2) * 5)) * math.sqrt(252))
+gk = [0.5 * math.log(b["h"] / b["l"]) ** 2
+      - (2 * math.log(2) - 1) * math.log(b["c"] / b["o"]) ** 2
+      for b in bars[-6:-1]]
+close("rv_gk_1w (Garman-Klass)", rvrow["rv_gk_1w"],
+      math.sqrt(sum(gk) / 5) * math.sqrt(252))
+check("Parkinson is not equal to close-close (it is a different estimator)",
+      abs(rvrow["rv_park_1w"] - rvrow["rv_1w"]) > 1e-6, True)
+
+close("vrp_1w = iv_7d_atm - rv_1w", rvrow["vrp_1w"], 0.35 - rvrow["rv_1w"])
+close("vrp_ratio_1w", rvrow["vrp_ratio_1w"], 0.35 / rvrow["rv_1w"])
+check("insufficient history -> NULL", rvrow["rv_3m"], None)
+check("  and its vrp too", rvrow["vrp_3m"], None)
+
+flat = [{"d": T - timedelta(days=30 - i), "o": 100.0, "h": 100.0,
+         "l": 100.0, "c": 100.0} for i in range(30)]
+z = C._realized(flat, T, {(7, "atm"): 0.35, (30, "atm"): 0.28,
+                          (90, "atm"): 0.30})
+check("rv -> 0 gives vrp_ratio NULL, not inf", z["vrp_ratio_1w"], None)
+check("  (rv really is zero)", z["rv_1w"], 0.0)
+check("no down days -> downside_semivol NULL", z["downside_semivol_1m"], None)
+
+
+print("\n=== 8. spot-vol regression, snapshot-aligned ===")
+# iv moves at exactly -2x the underlying log return, so beta = -2, R2 = 1.
+pattern = [0.01, -0.02, 0.015, -0.005]
+ivh, s, ivv = [], 100.0, 0.30
+d0 = date(2026, 1, 5)
+for i in range(30):
+    ivh.append({"d": d0 + timedelta(days=i), "iv": ivv, "s": s})
+    r = pattern[i % 4]
+    s *= math.exp(r)
+    ivv += -2.0 * r
+sv = C._spot_vol(ivh, ivh[-1]["d"])
+close("spotvol_beta_1m recovers the planted -2.0", sv["spotvol_beta_1m"], -2.0,
+      tol=1e-6)
+close("spotvol_r2_1m = 1 on an exact relation", sv["spotvol_r2_1m"], 1.0,
+      tol=1e-9)
+check("vov_30d_1m computed with 21+ diffs", sv["vov_30d_1m"] is not None, True)
+d_iv = [-2.0 * pattern[i % 4] for i in range(29)]
+mm = sum(d_iv[-21:]) / 21
+close("vov_30d_1m = stdev(d iv, 21) * sqrt(252)", sv["vov_30d_1m"],
+      math.sqrt(sum((x - mm) ** 2 for x in d_iv[-21:]) / 20) * math.sqrt(252))
+short = C._spot_vol(ivh[:4], ivh[3]["d"])
+check("too little history -> beta NULL", short["spotvol_beta_1m"], None)
+check("  and vov NULL", short["vov_30d_1m"], None)
+# A hole in the snapshot history is not a one-day move.
+gapped = ivh[:10] + [{"d": ivh[9]["d"] + timedelta(days=40),
+                      "iv": 9.9, "s": 500.0}] + ivh[10:]
+gv = C._spot_vol(gapped, gapped[-1]["d"])
+check("a 40-day gap does not enter the regression as a daily move",
+      abs(gv["spotvol_beta_1m"] - (-2.0)) < 1e-6, True)
+
+
+print("\n=== 9. quality ===")
+q = C._quality(SNAP, EXTRAP)
+check("n_expiries_fitted", q["n_expiries_fitted"], 2)
+check("n_expiries_skipped", q["n_expiries_skipped"], 1)
+close("pct_spot_fallback (1 of 2 FITTED, skipped excluded)",
+      q["pct_spot_fallback"], 0.5)
+check("n_butterfly_arb", q["n_butterfly_arb"], 1)
+check("n_calendar_arb", q["n_calendar_arb"], 1)
+close("median_domain_reach over fitted only", q["median_domain_reach"], 3.0)
+check("source carried", q["source"], "live")
+check("captured_at carried", q["captured_at"], datetime(2026, 6, 1, 15, 47))
+# The 7d ATM proxy node was flagged; the 30d one was not.
+check("extrap_atm_7d proxied from the put_delta 50 node",
+      q["extrap_atm_7d"], True)
+check("extrap_atm_30d", q["extrap_atm_30d"], False)
+check("extrap_10p_30d", q["extrap_10p_30d"], False)
+# 7d and 30d are both <= 30: 10 nodes, 1 of them extrapolated.
+close("extrap_rate_short = 1/10", q["extrap_rate_short"], 0.1)
+check("absent tenors are excluded from the rate, not counted as clean",
+      q["extrap_10p_60d"], None)
+empty = C._quality({"nodes": {}, "atm": {}, "diag": []}, {})
+check("no diagnostics -> pct_spot_fallback NULL, not 0.0",
+      empty["pct_spot_fallback"], None)
+check("  and extrap_rate_short NULL", empty["extrap_rate_short"], None)
+
+
+print("\n=== 10. calendar ===")
+check("third Friday, June 2026", C.third_friday(2026, 6), date(2026, 6, 19))
+check("third Friday, Jan 2027", C.third_friday(2027, 1), date(2027, 1, 15))
+c1 = C._calendar(date(2026, 6, 1))
+check("day_of_week: 2026-06-01 is a Monday", c1["day_of_week"], 1)
+check("days_to_monthly_opex", c1["days_to_monthly_opex"], 18)
+check("0 on opex day itself",
+      C._calendar(date(2026, 6, 19))["days_to_monthly_opex"], 0)
+check("rolls to next month's opex once passed",
+      C._calendar(date(2026, 6, 20))["days_to_monthly_opex"],
+      (date(2026, 7, 17) - date(2026, 6, 20)).days)
+check("December rolls the YEAR, not to month 13",
+      C._calendar(date(2026, 12, 25))["days_to_monthly_opex"],
+      (date(2027, 1, 15) - date(2026, 12, 25)).days)
+check("days_to_earnings is NULL (no source wired up)",
+      c1["days_to_earnings"], None)
+
+
+print("\n=== 11. z-scores ===")
+base = M.Z_BASE_COLUMNS[0].name
+series = [float(i) for i in range(21)]            # today = 20, mean = 10
+w = {(base, 63): series, (base, 252): series}
+zr = zscore_row(w, "SPY", date(2026, 6, 1), "1545")
+sd21 = math.sqrt(sum((x - 10.0) ** 2 for x in series) / 20)
+close(f"{base}_z_63 (21 obs meets the minimum)", zr[f"{base}_z_63"],
+      (20.0 - 10.0) / sd21)
+check("z_252 NULL — 21 obs is below its 63 minimum",
+      zr[f"{base}_z_252"], None)
+check("today IS inside its own window", M.Z_MIN_OBS[63], 21)
+zc = zscore_row({(base, 63): [5.0] * 21}, "SPY", date(2026, 6, 1), "1545")
+check("constant series -> NULL, not 0/0", zc[f"{base}_z_63"], None)
+zn = zscore_row({(base, 63): series[:-1] + [None]}, "SPY", date(2026, 6, 1),
+                "1545")
+check("today NULL -> z NULL", zn[f"{base}_z_63"], None)
+zg = zscore_row({(base, 63): [None] * 10 + series[:11]}, "SPY",
+                date(2026, 6, 1), "1545")
+check("gaps counted as absent, not as zeros", zg[f"{base}_z_63"], None)
+check("z row carries the join key",
+      (zr["ticker"], zr["trade_date"], zr["snapshot"]),
+      ("SPY", date(2026, 6, 1), "1545"))
+
+
+# =============================================================================
+print("\n=== 12. registry / compute agreement (the drift check) ===")
+
+
+class FakeCursor:
+    """Dispatches on the SQL text. Ordered most-specific first."""
+
+    def __init__(self, data):
+        self.data, self._rows = data, []
+
+    def execute(self, sql, params=None):
+        if "equity_surface_diagnostics" in sql:
+            self._rows = self.data["diag"]
+        elif "underlying_ohlc" in sql:
+            self._rows = self.data["ohlc"]
+        elif "dte = 30" in sql:
+            self._rows = self.data["ivhist"]
+        elif "FROM equity_surface " in sql:
+            self._rows = self.data["surface"]
+        elif "FROM equity_atm" in sql:
+            self._rows = self.data["atm"]
+        else:
+            raise AssertionError(f"unrouted query: {sql[:90]}")
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeConn:
+    def __init__(self, data):
+        self.data = data
+
+    def cursor(self):
+        return FakeCursor(self.data)
+
+
+cap = datetime(2026, 6, 1, 15, 47)
+data = {
+    "surface": [(30, 10, 0.40, 80.0, 1.00, None, False, cap, "live"),
+                (30, 25, 0.32, 90.0, 4.00, None, False, cap, "live"),
+                (30, 50, 0.28, 100.0, 5.00, None, False, cap, "live"),
+                (30, 75, 0.26, 110.0, 14.0, 3.00, False, cap, "live"),
+                (30, 90, 0.27, 120.0, 24.0, 0.50, True, cap, "live")],
+    "atm": [(30, 0.28, 100.0, 100.5, 100.0, 5.00, cap, "live")],
+    "diag": [("pcp", 100.0, 4.0, False, False, False)],
+    "ohlc": [(date(2026, 5, 1) + timedelta(days=i), 100.0, 101.0, 99.0,
+              100.0 + i) for i in range(40)],
+    "ivhist": [(date(2026, 5, 1) + timedelta(days=i), 0.28, 100.0)
+               for i in range(40)],
+}
+row = C.compute_metrics(FakeConn(data), "SPY", date(2026, 6, 15), "1545")
+
+check("compute_metrics returns a row", row is not None, True)
+produced = set(row) - set(M.KEY_COLUMNS)
+registry = set(M.BASE_NAMES)
+missing = sorted(registry - produced)
+extra = sorted(produced - registry)
+check(f"every registry column is produced ({len(registry)} of them)",
+      missing, [])
+check("no column is produced that the registry does not know", extra, [])
+check("key columns present",
+      (row["ticker"], row["trade_date"], row["snapshot"]),
+      ("SPY", date(2026, 6, 15), "1545"))
+check("an absent surface returns None, not an empty row",
+      C.compute_metrics(FakeConn({**data, "surface": [], "atm": []}),
+                        "ZZZ", date(2026, 6, 15), "1545"), None)
+# A tenor with no rows must not fabricate anything.
+check("every 60d column is NULL on a fixture that has only 30d",
+      all(row[n] is None for n in M.BASE_NAMES
+          if n.endswith("_60d") and not n.startswith("extrap_")), True)
+close("spot", row["spot"], 100.0)
+close("iv_30d_10p", row["iv_30d_10p"], 0.40)
+close("rr_30d_25", row["rr_30d_25"], 0.26 - 0.32)
+
+
+print("\n=== 13. the registry itself ===")
+cat = M.catalog_rows()
+check("catalog covers every column",
+      len(cat), len(M.BASE_NAMES) + len(M.Z_NAMES))
+check("catalog names are unique",
+      len({c["column_name"] for c in cat}), len(cat))
+check("every z row points at a real base column",
+      all(c["base_column"] in registry for c in cat if c["form"] != "base"),
+      True)
+check("every base row points at itself",
+      all(c["base_column"] == c["column_name"]
+          for c in cat if c["form"] == "base"), True)
+check("every column has units and a description",
+      all(c["units"] and c["description"] for c in cat), True)
+check("no name exceeds Postgres' 63-char identifier limit",
+      max(len(c["column_name"]) for c in cat) <= 63, True)
+check("table_name is one of the two fact tables",
+      {c["table_name"] for c in cat},
+      {"equity_metrics", "equity_metrics_z"})
+check("tenor 1 is excluded from the grid", 1 in M.TENORS, False)
+check("  (and 0)", 0 in M.TENORS, False)
+excluded = {c.family for c in M.BASE_COLUMNS if not c.z_eligible}
+check("spot and forwards are not z-scored",
+      any(n.startswith(("spot_z", "forward_7d_z")) for n in M.Z_NAMES), False)
+check("quality columns are not z-scored",
+      any(n.startswith("extrap_") for n in M.Z_NAMES), False)
+check("calendar columns are not z-scored",
+      any(n.startswith(("day_of_week", "days_to_")) for n in M.Z_NAMES), False)
+check("IV columns ARE z-scored",
+      "iv_30d_25p_z_63" in set(M.Z_NAMES), True)
+check("structure prices ARE z-scored",
+      "zc_width_sigma_30d_z_252" in set(M.Z_NAMES), True)
+check("excluded families are exactly the three intended",
+      excluded, {"level_price", "quality", "calendar"})
+
+
+print("\n" + "=" * 68)
+print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}")
+if FAIL:
+    for f in FAIL:
+        print("  -", f)
+    sys.exit(1)
+print("ALL GREEN")

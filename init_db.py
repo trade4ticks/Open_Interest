@@ -23,6 +23,7 @@ FILES   = [
     "06_25d_skew_metrics.sql",
     "07_trade_paths.sql",
     "08_equity_surface.sql",
+    "09_equity_metrics.sql",
 ]
 
 
@@ -60,6 +61,24 @@ def main() -> None:
             print(f"SKIPPED ({type(e).__name__}: {e})")
             print("  (Run `python build_bin_tables.py --tier EVENING` later "
                   "to sync; metric_classification may not be populated yet.)")
+
+        # Same pattern for the equity metrics tables: 09_equity_metrics.sql
+        # creates key-only skeletons and the ~600 metric columns are generated
+        # from lib/metrics_config.py. Without this the tables exist but hold
+        # nothing, which is the failure mode the drift check exists to catch.
+        try:
+            from lib.metrics_store import (
+                check_catalog_drift, sync_catalog, sync_metrics_schema,
+            )
+            print("Syncing equity_metrics columns      ...", end=" ", flush=True)
+            n_base, n_z = sync_metrics_schema(conn)
+            n_cat = sync_catalog(conn)
+            check_catalog_drift(conn)
+            print(f"OK ({n_base} base + {n_z} z column(s), "
+                  f"{n_cat} catalog row(s))")
+        except Exception as e:
+            print(f"FAILED ({type(e).__name__}: {e})")
+            print("  (Run `python build_equity_metrics.py init-db` to retry.)")
     print("\nDatabase initialised.")
 
 

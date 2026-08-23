@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS equity_surface (
     strike        DOUBLE PRECISION,
     forward       DOUBLE PRECISION,
     log_moneyness DOUBLE PRECISION,
-    price         DOUBLE PRECISION,
+    price         DOUBLE PRECISION,   -- Black-Scholes PUT at this node
+    -- The CALL at the same node, same F/K/T/r/sigma. Needed by the metrics
+    -- stage for risk-reversal structure prices; parity downstream would need
+    -- r, which is not stored on the row.
+    call_price    DOUBLE PRECISION,
     theta         DOUBLE PRECISION,
     vega          DOUBLE PRECISION,
     gamma         DOUBLE PRECISION,
@@ -112,6 +116,7 @@ ALTER TABLE equity_surface_diagnostics
 
 -- Same migration for the live-capture columns. Adding to a partitioned parent
 -- cascades to every existing child partition.
+ALTER TABLE equity_surface ADD COLUMN IF NOT EXISTS call_price DOUBLE PRECISION;
 ALTER TABLE equity_surface ADD COLUMN IF NOT EXISTS captured_at TIMESTAMP;
 ALTER TABLE equity_surface ADD COLUMN IF NOT EXISTS source TEXT;
 ALTER TABLE equity_atm     ADD COLUMN IF NOT EXISTS captured_at TIMESTAMP;

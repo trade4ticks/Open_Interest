@@ -604,7 +604,8 @@ def bs_put_forward(F: float, K: float, T: float, sigma: float,
     Theta can be positive for deep-ITM puts — that is correct, not a bug: the
     discounting term dominates when the option is nearly all intrinsic.
     """
-    none = {"price": None, "theta": None, "vega": None, "gamma": None}
+    none = {"price": None, "call_price": None, "theta": None,
+            "vega": None, "gamma": None}
     if not all(np.isfinite([F, K, T, sigma, r])) or sigma <= 0 or T <= 0:
         return none
     sqrtT = math.sqrt(T)
@@ -614,12 +615,18 @@ def bs_put_forward(F: float, K: float, T: float, sigma: float,
     npd1 = float(norm.pdf(d1))
 
     price = disc * (K * float(norm.cdf(-d2)) - F * float(norm.cdf(-d1)))
+    # The call at the SAME node. Every surface row is priced as a put, but the
+    # risk-reversal structure price needs the call leg, and recovering it
+    # downstream via put-call parity would need r — which is not stored on the
+    # surface row. Cheaper and less error-prone to emit both here.
+    call_price = disc * (F * float(norm.cdf(d1)) - K * float(norm.cdf(d2)))
     vega = disc * F * npd1 * sqrtT / 100.0          # per 1% IV
     gamma = disc * npd1 / (F * sigma * sqrtT)       # forward gamma, d2V/dF2
     theta = (-disc * F * npd1 * sigma / (2.0 * sqrtT)
              + r * disc * K * float(norm.cdf(-d2))
              - r * disc * F * float(norm.cdf(-d1))) / 365.0
-    return {"price": price, "theta": theta, "vega": vega, "gamma": gamma}
+    return {"price": price, "call_price": call_price, "theta": theta,
+            "vega": vega, "gamma": gamma}
 
 
 # --- Orchestration for one (ticker, snapshot) -------------------------------
@@ -675,7 +682,8 @@ def build_snapshot(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
                 "put_delta": node["put_delta"], "iv": node["iv"],
                 "strike": node["strike"], "forward": smile.F,
                 "log_moneyness": node["k"],
-                "price": g["price"], "theta": g["theta"],
+                "price": g["price"], "call_price": g["call_price"],
+                "theta": g["theta"],
                 "vega": g["vega"], "gamma": g["gamma"],
                 "dte_actual": smile.dte_actual,
                 "extrapolated": bool(node["extrapolated"]),
