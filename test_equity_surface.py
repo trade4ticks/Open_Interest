@@ -620,6 +620,91 @@ ok_rate = filter_quotes(clean_chain(make_chain(LADDER, F=100.0, T=T30, r=0.045,
 check("a plausible 4.5% rate still uses parity",
       forward_and_rate(ok_rate, T30)[2], FORWARD_PCP)
 
+# ---------------------------------------------------------------------------
+print("\n=== 20. IWM: the case that motivated raising the ratio to 0.40 ===")
+import lib.surface_fit as _sf
+
+
+def fit_with_reach(expiry, dte_actual, target_reach, sigma=0.25, n=15):
+    """A fit with an EXACT domain_reach.
+
+    Total variance is flat across the domain, so spline(0) is exactly
+    sigma^2*T and reach = |k_min| / sqrt(w_atm) comes out at the target to
+    machine precision. That matters here: the whole point is a boundary a few
+    percent wide, so an approximate reach would not test what it claims to.
+    """
+    T = dte_actual / 365.0
+    w_atm = sigma ** 2 * T
+    k_lo = -target_reach * math.sqrt(w_atm)
+    ks = np.linspace(k_lo, 0.3 * abs(k_lo), n)
+    spline, kmin, kmax, rmse = fit_smile(
+        pd.DataFrame({"k": ks, "w": np.full(n, w_atm),
+                      "w_noise": np.full(n, 1e-8)}))
+    f = SmileFit(ticker="IWM", trade_date=date(2026, 6, 1), snapshot="1545",
+                 expiry=expiry, T=T, F=100.0, r=0.05, forward_method="pcp",
+                 n_strikes_raw=n * 2, n_strikes_clean=n * 2,
+                 k_min=kmin, k_max=kmax, rmse=rmse, spline=spline)
+    f.domain_reach = _domain_reach(f)
+    return f
+
+
+# IWM 2026-06-01 1545, observed reaches. The 1.35 is the same newly-listed
+# 2026-06-15 expiry that was caught on QQQ at ratio 0.098 — but IWM's other
+# expiries are narrower, so the SAME defect presents at ratio ~0.33 here and
+# slipped through the 0.30 cutoff.
+IWM_REACHES = [2.73, 3.10, 3.29, 3.80, 3.75, 3.83, 4.00, 3.76, 4.62, 1.35, 5.40]
+DEGENERATE = 1.35
+iwm = [fit_with_reach(date(2026, 6, 8) + pd.Timedelta(days=3 * i).to_pytimedelta(),
+                      8 + 3 * i, r)
+       for i, r in enumerate(IWM_REACHES)]
+achieved = [f.domain_reach for f in iwm]
+check("reaches reproduced exactly",
+      [round(a, 4) for a in achieved], [round(r, 4) for r in IWM_REACHES])
+med = float(np.median(achieved))
+print(f"         median reach {med:.3f}, degenerate {DEGENERATE}, "
+      f"ratio {DEGENERATE / med:.3f}")
+
+# The boundary this change is about.
+orig_ratio = _sf.NARROW_DOMAIN_RATIO
+try:
+    _sf.NARROW_DOMAIN_RATIO = 0.30
+    kept_030 = select_bracketing_fits(iwm)
+    flagged_030 = [f.domain_reach for f in iwm if f.excluded_from_bracketing]
+
+    _sf.NARROW_DOMAIN_RATIO = 0.40
+    kept_040 = select_bracketing_fits(iwm)
+    flagged_040 = [f.domain_reach for f in iwm if f.excluded_from_bracketing]
+finally:
+    _sf.NARROW_DOMAIN_RATIO = orig_ratio
+
+check("at 0.30 the degenerate fit SURVIVES (the observed bug)",
+      len(kept_030), len(IWM_REACHES))
+check("at 0.30 nothing is flagged", flagged_030, [])
+check("0.30 cutoff sits below the degenerate reach",
+      0.30 * med < DEGENERATE, True)
+
+check("at 0.40 the degenerate fit is excluded",
+      len(kept_040), len(IWM_REACHES) - 1)
+check("and it is the 1.35 one", [round(x, 4) for x in flagged_040],
+      [DEGENERATE])
+check("0.40 cutoff sits above the degenerate reach",
+      0.40 * med > DEGENERATE, True)
+
+# The raise must not start catching legitimate fits: the next-lowest reach has
+# to stay clear of the new cutoff, or the wider setting would be trading one
+# problem for another.
+next_lowest = sorted(achieved)[1]
+check("next-lowest reach is 2.726-ish", round(next_lowest, 2), 2.73)
+check("next-lowest is well clear of the 0.40 cutoff",
+      next_lowest > 0.40 * med * 1.5, True)
+check("exactly one fit trips at 0.40 — no cluster, guard not engaged",
+      sum(1 for a in achieved if a < 0.40 * med), 1)
+
+# And the shipped default is the raised one.
+check("shipped NARROW_DOMAIN_RATIO is 0.40", NARROW_DOMAIN_RATIO, 0.40)
+check("IWM's degenerate fit is excluded under the shipped default",
+      len(select_bracketing_fits(iwm)), len(IWM_REACHES) - 1)
+
 print("\n" + "=" * 60)
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}"
       + (f"   ({len(SKIP)} skipped)" if SKIP else ""))

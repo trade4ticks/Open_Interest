@@ -109,7 +109,21 @@ CALENDAR_TOL = 1e-6
 # node to save a 10-delta one that never existed. Relative separates them:
 # QQQ's outlier is ~1/10th of its neighbours' reach, while T's fits are all
 # similarly narrow so none is an outlier.
-NARROW_DOMAIN_RATIO = 0.30
+#
+# RAISED FROM 0.30 TO 0.40 on observed data. The same newly-listed 2026-06-15
+# expiry sits at very different ratios across tickers, because the ratio
+# depends on how wide the ticker's OTHER expiries are:
+#
+#     QQQ   reach 0.53 vs median 6.75   ratio 0.098   caught at 0.30
+#     IWM   reach 1.345 vs median ~4.2  ratio 0.32    SURVIVED 0.30
+#
+# IWM's degenerate fit cleared the 0.30 cutoff (~1.25) and went on to clip the
+# DTE-14 blend exactly as QQQ's did. At 0.40 the cutoff is ~1.66 and both are
+# excluded, while IWM's next-lowest reach — 2.726 — is well clear of it, so
+# the wider setting does not start catching legitimate fits. T's counter-example
+# at ~1.2 sigma against a ~1.2 median is likewise unaffected: it is the RATIO
+# that matters, and a uniformly narrow chain has no outlier at any ratio.
+NARROW_DOMAIN_RATIO = 0.40
 
 # If more than this fraction of a snapshot's fits trip the rule, the median is
 # being dragged by a cluster of narrow fits rather than one outlier — the whole

@@ -102,6 +102,23 @@ save a 10-delta one that never existed. Relative separates them: QQQ's outlier
 is a tenth of its neighbours' reach; T's fits are all similarly narrow so none
 is an outlier.
 
+### Why the ratio is 0.40 and not 0.30
+
+`NARROW_DOMAIN_RATIO` was raised after IWM showed the *same* newly-listed
+2026-06-15 expiry presenting at a very different ratio, because the ratio
+depends on how wide the ticker's **other** expiries are:
+
+| ticker | degenerate reach | median reach | ratio | caught at 0.30? |
+|---|---|---|---|---|
+| QQQ | 0.53 | 6.75 | 0.098 | yes |
+| IWM | 1.345 | ~4.2 | 0.32 | **no** |
+
+IWM's fit cleared the 0.30 cutoff (~1.25) and clipped the DTE-14 blend exactly
+as QQQ's did. At 0.40 the cutoff is ~1.66 and both are excluded, while IWM's
+next-lowest reach — 2.726 — stays well clear, so the wider setting does not
+begin catching legitimate fits. T's uniformly-narrow counter-example is
+unaffected at any ratio: it has no outlier to find.
+
 Two guards abandon the filter entirely rather than break bracketing: if fewer
 than 2 fits would survive, or if more than a third trip the rule (which means
 the whole chain is thin, not one expiry degenerate).
