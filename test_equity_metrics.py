@@ -207,9 +207,19 @@ frac = (2.00 - 1.80) / (2.80 - 1.80)
 close("zc_short_delta_30d", st["zc_short_delta_30d"], 15 + frac * 5)
 k_short = 84.0 + frac * (87.0 - 84.0)
 close("zc_width_sigma_30d", st["zc_width_sigma_30d"],
-      math.log(k_short / SPOT) / (0.28 * SQRT30))
-check("zc_width_sigma is negative (short strike below spot)",
-      st["zc_width_sigma_30d"] < 0, True)
+      math.log(SPOT / k_short) / (0.28 * SQRT30))
+check("zc_width_sigma is POSITIVE", st["zc_width_sigma_30d"] > 0, True)
+# The sign exists to make the column sortable: a scanner ordering DESC on
+# "width" must get the widest first. Negating it would rank narrowest-first.
+wide = C._zc_sigma(70.0, SPOT, 0.28, 30)
+narrow = C._zc_sigma(95.0, SPOT, 0.28, 30)
+check("a further-out short strike scores HIGHER", wide > narrow, True)
+check("  (both positive, so DESC ranks widest first)",
+      wide > 0 and narrow > 0, True)
+close("magnitude is unchanged, only the sign", wide,
+      -math.log(70.0 / SPOT) / (0.28 * SQRT30))
+check("a strike at spot is 0 sigma wide", C._zc_sigma(SPOT, SPOT, 0.28, 30),
+      0.0)
 check("zero-cost sits further out than delta-neutral on this skew",
       st["zc_short_delta_30d"] > 12.5, True)
 

@@ -432,17 +432,23 @@ def _zero_cost_short(nd: dict, p25) -> tuple:
 
 
 def _zc_sigma(k_short, spot, atm_iv, dte) -> float | None:
-    """ln(K_short / spot) / (atm_iv * sqrt(dte/365)).
+    """ln(spot / K_short) / (atm_iv * sqrt(dte/365)).
 
-    NEGATIVE by construction: the short strike is below spot. Sigma rather than
-    percent so a 12-vol utility and an 80-vol biotech are on one scale.
+    POSITIVE by construction, and increasing as the short strike moves further
+    out. The sign is chosen so the column sorts the way a scanner reads it:
+    ORDER BY zc_width_sigma DESC puts the widest structures first. Taking
+    ln(K_short/spot) instead would be the same magnitude negated, which sorts
+    narrowest-first and reads backwards.
+
+    Sigma rather than percent so a 12-vol utility and an 80-vol biotech are on
+    one scale.
     """
     if None in (k_short, spot, atm_iv) or k_short <= 0 or spot <= 0:
         return None
     denom = atm_iv * math.sqrt(dte / DAYS_PER_YEAR)
     if denom < 1e-12:
         return None
-    return _f(math.log(k_short / spot) / denom)
+    return _f(math.log(spot / k_short) / denom)
 
 
 # --- Realized vol -----------------------------------------------------------
