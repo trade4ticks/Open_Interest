@@ -133,6 +133,15 @@ def expected_cost(ticker: str, source: str, days: list) -> int:
     return total
 
 
+def _grid_instant(day, snapshot: str):
+    """The exact instant a grid label denotes: '1345' on `day` -> 13:45:00."""
+    from datetime import datetime, time as _t
+    try:
+        return datetime.combine(day, _t(int(snapshot[:2]), int(snapshot[2:4])))
+    except (ValueError, IndexError):
+        return None
+
+
 def fit_ticker(args) -> dict:
     """One ticker's fits, computed in a WORKER PROCESS. No database.
 
@@ -179,6 +188,15 @@ def fit_ticker(args) -> dict:
                         f"{ticker} {day} {snap}: build FAILED — "
                         f"{type(exc).__name__}: {exc}")
                     continue
+                # Stamp the exact counterpart of what fetch_live_surface
+                # writes. A live row sits in grid slot '1345' with
+                # source='live' and an approximate captured_at; this upserts
+                # the SAME key with the grid instant and source='exact', so
+                # the tables converge with no migration and no correction step.
+                exact_at = _grid_instant(day, snap)
+                for r in res["surface"] + res["atm"]:
+                    r["captured_at"] = exact_at
+                    r["source"] = "exact"
                 out["units"].append({
                     "day": day, "snapshot": snap,
                     "surface": res["surface"], "atm": res["atm"],

@@ -24,12 +24,12 @@ log = logging.getLogger(__name__)
 SURFACE_COLS = [
     "ticker", "trade_date", "snapshot", "dte", "put_delta", "iv", "strike",
     "forward", "log_moneyness", "price", "theta", "vega", "gamma",
-    "dte_actual", "extrapolated",
+    "dte_actual", "extrapolated", "captured_at", "source",
 ]
 ATM_COLS = [
     "ticker", "trade_date", "snapshot", "dte", "atm_put_delta", "atm_strike",
     "atm_iv", "atm_forward", "total_var", "underlying_price", "price",
-    "theta", "vega", "gamma", "dte_actual",
+    "theta", "vega", "gamma", "dte_actual", "captured_at", "source",
 ]
 DIAG_COLS = [
     "ticker", "trade_date", "snapshot", "expiry", "dte_actual",

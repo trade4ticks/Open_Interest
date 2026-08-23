@@ -1346,6 +1346,48 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
     return out
 
 
+def fetch_first_order_snapshot(symbol: str,
+                               timeout: int = _DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """The WHOLE current chain for one ticker, in a single request.
+
+        /v3/option/snapshot/greeks/first_order  with  expiration=*
+
+    THE WILDCARD WORKS HERE. It is rejected by the HISTORY variant, which is
+    why fetch_chain_intraday.py enumerates expirations and issues one call per
+    (session, expiration). Probed and verified on the snapshot variant:
+
+        SPY   13,410 rows   32 expirations   0.95s
+        AAPL   3,348 rows   23 expirations   0.20s
+
+    16-37x faster than the per-expiration path, and it returns all 17 fields
+    including delta, vega, implied_vol and underlying_price — the four that
+    clean_chain and build_snapshot read.
+
+    THIS IS "NOW", NOT A MOMENT. A snapshot cannot retrieve a past instant, so
+    it can serve the live path and nothing else; historical work still goes
+    through the history endpoint. Coverage is complete for live use — a probe
+    run after the close showed one expiration missing, and it was the one that
+    had expired at that session's close.
+
+    Returns the vendor frame unprojected. Empty DataFrame on NoDataError.
+    """
+    params = {"symbol": symbol.upper(), "expiration": "*"}
+    label = f"snap_first_order {symbol} exp=*"
+    fmt = response_format()
+    try:
+        data = _get_with_retry(
+            "/v3/option/snapshot/greeks/first_order", params, timeout, label,
+            fmt=fmt,
+        )
+    except NoDataError:
+        return pd.DataFrame()
+
+    t_parse = time.monotonic()
+    out = _parse_csv_frame(data) if fmt == "csv" else _parse_frame(data)
+    _add_timing(parse_seconds=time.monotonic() - t_parse)
+    return out
+
+
 def fetch_first_order_window(symbol: str, expiration: date, trade_date: date,
                              start_time: str, end_time: str,
                              interval: str = "5m",

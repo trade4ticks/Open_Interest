@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS equity_surface (
     -- dropped: a gap breaks rolling percentiles downstream, and the metrics
     -- layer can decide what to do with a flagged value.
     extrapolated  BOOLEAN          NOT NULL DEFAULT FALSE,
+    -- The instant the chain was actually captured. `snapshot` is the 5-minute
+    -- GRID BUCKET the capture belongs to and stays part of the key, so a live
+    -- row at 13:47:30 occupies slot '1345' and a later exact rebuild upserts
+    -- over it. captured_at is the truth; snapshot is the join key.
+    captured_at   TIMESTAMP,
+    -- 'live'  — captured intraday from the snapshot endpoint, approximate time
+    -- 'exact' — rebuilt from the historical 5-minute record, on the grid
+    source        TEXT,
     UNIQUE (ticker, trade_date, snapshot, dte, put_delta)
 ) PARTITION BY RANGE (trade_date);
 
@@ -56,6 +64,8 @@ CREATE TABLE IF NOT EXISTS equity_atm (
     vega             DOUBLE PRECISION,
     gamma            DOUBLE PRECISION,
     dte_actual       DOUBLE PRECISION,
+    captured_at      TIMESTAMP,
+    source           TEXT,
     UNIQUE (ticker, trade_date, snapshot, dte)
 ) PARTITION BY RANGE (trade_date);
 
@@ -99,6 +109,18 @@ ALTER TABLE equity_surface_diagnostics
     ADD COLUMN IF NOT EXISTS domain_reach DOUBLE PRECISION;
 ALTER TABLE equity_surface_diagnostics
     ADD COLUMN IF NOT EXISTS excluded_from_bracketing BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Same migration for the live-capture columns. Adding to a partitioned parent
+-- cascades to every existing child partition.
+ALTER TABLE equity_surface ADD COLUMN IF NOT EXISTS captured_at TIMESTAMP;
+ALTER TABLE equity_surface ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE equity_atm     ADD COLUMN IF NOT EXISTS captured_at TIMESTAMP;
+ALTER TABLE equity_atm     ADD COLUMN IF NOT EXISTS source TEXT;
+
+-- The dashboard reads "most recent slot for this ticker", never a fixed one:
+-- a skipped cycle leaves a grid slot empty by design.
+CREATE INDEX IF NOT EXISTS ix_equity_surface_latest
+    ON equity_surface (ticker, trade_date, snapshot DESC);
 
 CREATE INDEX IF NOT EXISTS ix_equity_surface_diag_date
     ON equity_surface_diagnostics (trade_date, snapshot);
