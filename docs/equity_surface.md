@@ -60,6 +60,63 @@ below it — `FALLBACK_MAX_T_GAP` caps how far apart they may get, and
 `dte_actual` makes the remaining gap visible so the metrics layer can apply its
 own tolerance.
 
+## Degenerate expiries are excluded from bracketing
+
+A newly-listed expiry fits fine but over a tiny log-moneyness range. Because
+`InterpolatedSmile` takes the **intersection** of its two endpoints' domains,
+one narrow expiry destroys the wing of a tenor whose other endpoint is
+excellent. Observed simultaneously on QQQ, SPY, GLD and IWM at 2026-06-01 1545,
+all failing at exactly DTE 14 and clean at 5/7/10/21/30 — the same newly-listed
+06-15 expiry in each:
+
+| expiry | dte_actual | n_strikes_clean | k_min | k_max |
+|---|---|---|---|---|
+| 2026-06-12 | 11.01 | 388 | −0.293 | 0.097 |
+| 2026-06-15 | 14.01 | **52** | **−0.026** | 0.008 |
+| 2026-06-18 | 17.01 | 468 | −0.399 | 0.126 |
+
+The 14 DTE target bracketed 06-12/06-15, clipping a −0.293 domain to −0.026, so
+a 10-delta put (~5% OTM) landed outside and was written `extrapolated=True`.
+06-12 and 06-18 bracket 14 days perfectly well. Because new dailies list
+continuously, whichever tenor sits beside the newest listing breaks — **a hole
+that wanders through the grid** rather than a stable missing value.
+
+`select_bracketing_fits` drops fits whose put-side domain is anomalously narrow
+*relative to the other fits at the same snapshot*:
+
+```
+domain_reach = |k_min| / sqrt(w_atm)          # sqrt(w) = sigma*sqrt(T)
+excluded     = reach < NARROW_DOMAIN_RATIO * median(reach)
+```
+
+`reach` is how many sigma below the forward the domain extends — directly
+interpretable, since a 25-delta put sits near 0.67 sigma and a 10-delta near
+1.28. Raw `k_min` is not comparable across expiries; a 928-day expiry spans far
+more log-moneyness than an 8-day one at equal quality.
+
+**The rule is relative, and that is load-bearing.** QQQ's degenerate fit reaches
+~0.5 sigma, but T's perfectly legitimate 11 DTE fit reaches ~1.0 — it genuinely
+has no 10-delta wing while its 25-delta node is real and useful. Any absolute
+cutoff catching the first discards the second, trading a good 25-delta node to
+save a 10-delta one that never existed. Relative separates them: QQQ's outlier
+is a tenth of its neighbours' reach; T's fits are all similarly narrow so none
+is an outlier.
+
+Two guards abandon the filter entirely rather than break bracketing: if fewer
+than 2 fits would survive, or if more than a third trip the rule (which means
+the whole chain is thin, not one expiry degenerate).
+
+**Exclusion is for bracketing only.** The fit is still computed, still written
+to diagnostics, and still participates in the calendar-arbitrage check — which
+deliberately runs over every usable fit, since a degenerate expiry can still
+violate it. The near-expiry fallback uses the filtered list too, so a
+degenerate nearest expiry cannot serve a 0DTE row.
+
+`equity_surface_diagnostics.domain_reach` and `.excluded_from_bracketing` record
+the metric and whether the rule fired, so `NARROW_DOMAIN_RATIO` can be tuned
+from observed data and confirmed to be firing on newly-listed expiries rather
+than legitimately thin chains.
+
 ## Conventions
 
 - **T uses 16:00 ET**, not 16:15. Equity options settle at the close; 16:15 is
@@ -93,6 +150,34 @@ below the full tenor set is normal, not an error.
 
 0DTE behaves unlike every other tenor: `T` changes minute to minute, gamma is
 very large, and the smile is unstable near the close. Expected.
+
+## Implied-rate bounds
+
+`R_MIN, R_MAX = 0.0, 0.10` (was `-0.05, 0.20`). Outside them
+`solve_forward_rate` raises and the caller falls back to spot-plus-carry.
+
+The old bounds were far too wide to catch a bad regression. Observed on real
+data, all passing the old validation:
+
+```
+AAPL 2026-06-01 0945:   +12.5%,  -4.7%,  -2.5%,  +0.16%
+T    2026-06-01 1545:   +14.9%,  +10.3%,  -2.8%
+```
+
+The true rate is near 4-5% and roughly flat across tenors; none of those
+resembles it. The cause is **structural, not a coding error**: put-call parity
+assumes European exercise and equity options are American, so early-exercise
+premium turns the parity equality into an inequality and biases the regression.
+This does not arise on European index options, which is why the inherited
+bounds were adequate there.
+
+Impact is bounded. `r` does not enter implied vol (vendor-supplied) or
+`k = ln(K/F)` (which uses `F` only). It appears solely in the discount factor
+for price, theta, vega and gamma — negligible at short tenors, ~10% at
+multi-year ones. Tightening routes these fits to the spot fallback instead of
+accepting an implausible rate, so **expect the `spot_fallback` share in
+diagnostics to rise**. That is the intended effect and `forward_method` already
+records it.
 
 ## Thresholds
 

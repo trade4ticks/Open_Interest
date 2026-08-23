@@ -25,13 +25,16 @@ import pandas as pd
 from scipy.stats import norm
 
 from lib.clean_chain import clean_chain
-from lib.surface_config import FALLBACK_MAX_T_GAP, TARGET_DTES
+from lib.surface_config import (
+    FALLBACK_MAX_T_GAP, NARROW_DOMAIN_RATIO, TARGET_DTES,
+)
 from lib.surface_fit import (
     FORWARD_PCP, FORWARD_SPOT_FALLBACK, ParityError, atm_node,
     bs_put_forward, build_smile_points, build_snapshot, check_butterfly,
     check_calendar, fit_expiry, fit_smile, forward_and_rate,
     interpolate_tenor, near_expiry_fallback, put_delta_from_k,
-    solve_delta_node, solve_forward_rate, time_to_expiry,
+    select_bracketing_fits, solve_delta_node, solve_forward_rate,
+    time_to_expiry,
 )
 
 PASS, FAIL, SKIP = [], [], []
@@ -438,6 +441,185 @@ except Exception as exc:                                      # noqa: BLE001
           f"({type(exc).__name__})")
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\n=== 16. degenerate expiries are excluded from bracketing ===")
+from lib.surface_fit import SmileFit, _domain_reach
+
+
+def synth_fit(expiry, dte_actual, k_lo, k_hi, sigma=0.25, n=15):
+    """A fit with an EXPLICIT domain, so the QQQ geometry can be reproduced
+    exactly rather than coaxed out of a synthetic chain."""
+    T = dte_actual / 365.0
+    ks = np.linspace(k_lo, k_hi, n)
+    w = (sigma ** 2) * T * (1 - 0.3 * ks)          # mild put skew
+    spline, kmin, kmax, rmse = fit_smile(
+        pd.DataFrame({"k": ks, "w": w, "w_noise": np.full(n, 1e-8)}))
+    f = SmileFit(ticker="QQQ", trade_date=date(2026, 6, 1), snapshot="1545",
+                 expiry=expiry, T=T, F=100.0, r=0.05, forward_method="pcp",
+                 n_strikes_raw=n * 2, n_strikes_clean=n * 2,
+                 k_min=kmin, k_max=kmax, rmse=rmse, spline=spline)
+    f.domain_reach = _domain_reach(f)
+    return f
+
+
+# The observed QQQ 2026-06-01 1545 geometry, verbatim.
+q_11 = synth_fit(date(2026, 6, 12), 11.01, -0.293, 0.097)
+q_14 = synth_fit(date(2026, 6, 15), 14.01, -0.026, 0.008)   # newly listed
+q_17 = synth_fit(date(2026, 6, 18), 17.01, -0.399, 0.126)
+trio = [q_11, q_14, q_17]
+print(f"         reaches: 11d={q_11.domain_reach:.2f}  "
+      f"14d={q_14.domain_reach:.2f}  17d={q_17.domain_reach:.2f} sigma")
+check("domain_reach is finite and positive on a normal fit",
+      bool(np.isfinite(q_11.domain_reach) and q_11.domain_reach > 0), True)
+check("the narrow fit is below the relative threshold",
+      q_14.domain_reach < NARROW_DOMAIN_RATIO * float(np.median(
+          [f.domain_reach for f in trio])), True)
+
+kept = select_bracketing_fits(trio)
+check("degenerate fit removed from the candidate pool",
+      sorted(f.expiry for f in kept),
+      [date(2026, 6, 12), date(2026, 6, 18)])
+check("it is flagged excluded_from_bracketing",
+      q_14.excluded_from_bracketing, True)
+check("the wide fits are not flagged",
+      (q_11.excluded_from_bracketing, q_17.excluded_from_bracketing),
+      (False, False))
+
+# Unfiltered, 14 DTE brackets 11d/14d and the blend inherits the narrow domain.
+# Filtered, 11d/17d bracket the same target just as well.
+bad = interpolate_tenor(trio, 14)
+good = interpolate_tenor(kept, 14)
+check("unfiltered blend endpoints are 11d and 14d",
+      (round(bad._lo.T * 365, 2), round(bad._hi.T * 365, 2)), (11.01, 14.01))
+check("filtered blend endpoints are 11d and 17d",
+      (round(good._lo.T * 365, 2), round(good._hi.T * 365, 2)), (11.01, 17.01))
+check("unfiltered blend is clipped to the narrow domain",
+      round(bad.k_min, 3), round(q_14.k_min, 3))
+check("filtered blend keeps the wide domain",
+      round(good.k_min, 3), round(max(q_11.k_min, q_17.k_min), 3))
+check("filtered domain is an order of magnitude wider",
+      good.k_min < bad.k_min - 0.2, True)
+n10_bad = solve_delta_node(bad, 10)
+n10_good = solve_delta_node(good, 10)
+check("10-delta WAS extrapolated before the fix",
+      bool(n10_bad and n10_bad["extrapolated"]), True)
+check("10-delta is NOT extrapolated after it",
+      bool(n10_good and n10_good["extrapolated"]), False)
+check("both solve to the same 10-delta node (only the flag differs)",
+      round(n10_bad["k"], 6), round(n10_good["k"], 6), tol=1e-3)
+
+# End to end through build_snapshot, on real chains this time. sigma 0.75 at
+# 11 DTE is what makes the wide ladder carry premium out to k ~ -0.29.
+WIDE = [float(x) for x in range(70, 136, 5)]
+NARROW = [97.5, 98.0, 98.5, 99.0, 99.5, 100.0, 100.5, 101.0]
+qqq_df = pd.concat([
+    clean_chain(make_chain(WIDE, F=100.0, T=11 / 365, r=0.05, sigma=0.75,
+                           expiration=date(2026, 6, 12), snapshot="1545",
+                           ts="2026-06-01T15:45:00", skew=-0.35)),
+    clean_chain(make_chain(NARROW, F=100.0, T=14 / 365, r=0.05, sigma=0.75,
+                           expiration=date(2026, 6, 15), snapshot="1545",
+                           ts="2026-06-01T15:45:00", skew=-0.35)),
+    clean_chain(make_chain(WIDE, F=100.0, T=17 / 365, r=0.05, sigma=0.75,
+                           expiration=date(2026, 6, 18), snapshot="1545",
+                           ts="2026-06-01T15:45:00", skew=-0.35))],
+    ignore_index=True)
+qqq = build_snapshot(qqq_df, "QQQ", date(2026, 6, 1), "1545")
+dg = {d["expiry"]: d for d in qqq["diagnostics"]}
+check("every expiry still reaches diagnostics", len(qqq["diagnostics"]), 3)
+check("the narrow one is flagged there",
+      dg[date(2026, 6, 15)]["excluded_from_bracketing"], True)
+check("with a populated domain_reach",
+      bool(np.isfinite(dg[date(2026, 6, 15)]["domain_reach"])), True)
+check("and is NOT marked skipped", dg[date(2026, 6, 15)]["skipped"], False)
+check("the wide ones are not flagged",
+      (dg[date(2026, 6, 12)]["excluded_from_bracketing"],
+       dg[date(2026, 6, 18)]["excluded_from_bracketing"]), (False, False))
+row14 = [r for r in qqq["surface"] if r["dte"] == 14 and r["put_delta"] == 10]
+check("a 14 DTE 10-delta row is emitted", len(row14), 1)
+check("and it is not extrapolated", bool(row14[0]["extrapolated"]), False)
+
+# ---------------------------------------------------------------------------
+print("\n=== 17. the T counter-example: uniformly narrow, no outlier ===")
+# T's 11 DTE fit genuinely has no 10-delta wing but a real, useful 25-delta
+# node. Any ABSOLUTE threshold catching QQQ's outlier at ~0.5 sigma would also
+# discard these at ~1.0 sigma, trading a good 25-delta node for a 10-delta one
+# that never existed. Relative keeps them.
+t_a = synth_fit(date(2026, 6, 12), 11.01, -0.052, 0.040)
+t_b = synth_fit(date(2026, 6, 18), 17.01, -0.065, 0.050)
+t_c = synth_fit(date(2026, 7, 1), 30.01, -0.086, 0.066)
+t_trio = [t_a, t_b, t_c]
+print(f"         reaches: {t_a.domain_reach:.2f}  {t_b.domain_reach:.2f}  "
+      f"{t_c.domain_reach:.2f} sigma")
+check("all three reach around 1 sigma (a real 25-delta, no 10-delta)",
+      all(0.7 < f.domain_reach < 1.6 for f in t_trio), True)
+check("no fit excluded when all are similarly narrow",
+      len(select_bracketing_fits(t_trio)), 3)
+check("none flagged",
+      [f.excluded_from_bracketing for f in t_trio], [False, False, False])
+check("the narrowest still clears the relative threshold",
+      min(f.domain_reach for f in t_trio)
+      >= NARROW_DOMAIN_RATIO * float(np.median(
+          [f.domain_reach for f in t_trio])), True)
+# The same fits under an absolute cutoff that would catch QQQ's 0.5 sigma:
+check("an absolute 1.5-sigma cutoff would wrongly discard all three",
+      sum(1 for f in t_trio if f.domain_reach < 1.5), 3)
+
+# ---------------------------------------------------------------------------
+print("\n=== 18. guards abandon the filter rather than break bracketing ===")
+pair = [synth_fit(date(2026, 6, 12), 11.01, -0.293, 0.097),
+        synth_fit(date(2026, 6, 15), 14.01, -0.026, 0.008)]
+check("filter skipped when it would leave fewer than 2",
+      len(select_bracketing_fits(pair)), 2)
+check("and nothing is flagged",
+      [f.excluded_from_bracketing for f in pair], [False, False])
+
+many = [synth_fit(date(2026, 6, 12), 11.01, -0.293, 0.097),
+        synth_fit(date(2026, 6, 15), 14.01, -0.026, 0.008),
+        synth_fit(date(2026, 6, 16), 15.01, -0.027, 0.008),
+        synth_fit(date(2026, 6, 18), 17.01, -0.399, 0.126)]
+check("filter skipped when more than a third trip the rule",
+      len(select_bracketing_fits(many)), 4)
+check("and nothing is flagged",
+      [f.excluded_from_bracketing for f in many], [False] * 4)
+
+one_bad = [synth_fit(date(2026, 6, 12), 11.01, -0.293, 0.097),
+           synth_fit(date(2026, 6, 15), 14.01, -0.026, 0.008),
+           synth_fit(date(2026, 6, 18), 17.01, -0.399, 0.126),
+           synth_fit(date(2026, 6, 25), 24.01, -0.420, 0.140)]
+check("one of four IS filtered (inside the cap)",
+      len(select_bracketing_fits(one_bad)), 3)
+
+# A single usable fit: nothing to compare against, nothing excluded.
+check("a lone fit is never excluded",
+      len(select_bracketing_fits([synth_fit(date(2026, 6, 15), 14.01,
+                                            -0.026, 0.008)])), 1)
+
+# ---------------------------------------------------------------------------
+print("\n=== 19. tightened implied-rate bounds ===")
+from lib.surface_config import R_MAX, R_MIN
+check("R_MIN", R_MIN, 0.0)
+check("R_MAX", R_MAX, 0.10)
+check("R_DEFAULT is inside the new bounds", R_MIN <= 0.05 <= R_MAX, True)
+# 14.9% is an observed AAPL/T value that passed the old (-0.05, 0.20) bounds.
+hot = filter_quotes(clean_chain(make_chain(LADDER, F=100.0, T=T30, r=0.149,
+                                           sigma=0.28)))
+try:
+    solve_forward_rate(hot, T30)
+    check("implausible 14.9% rate rejected", False, True)
+except ParityError as exc:
+    check("implausible 14.9% rate rejected", "outside" in str(exc), True)
+check("and it routes to the spot fallback",
+      forward_and_rate(hot, T30)[2], FORWARD_SPOT_FALLBACK)
+# -2.8% was also observed and also passed the old bounds.
+cold = filter_quotes(clean_chain(make_chain(LADDER, F=100.0, T=T30, r=-0.028,
+                                            sigma=0.28)))
+check("implausible -2.8% rate also routes to the fallback",
+      forward_and_rate(cold, T30)[2], FORWARD_SPOT_FALLBACK)
+ok_rate = filter_quotes(clean_chain(make_chain(LADDER, F=100.0, T=T30, r=0.045,
+                                               sigma=0.28)))
+check("a plausible 4.5% rate still uses parity",
+      forward_and_rate(ok_rate, T30)[2], FORWARD_PCP)
+
 print("\n" + "=" * 60)
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}"
       + (f"   ({len(SKIP)} skipped)" if SKIP else ""))

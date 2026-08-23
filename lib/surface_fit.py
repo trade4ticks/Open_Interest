@@ -31,6 +31,7 @@ can be measured on real chains. No dividend model — just the record.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, time
@@ -45,10 +46,13 @@ from lib.surface_config import (
     ARB_CHECK_POINTS, BUTTERFLY_TOL, CALENDAR_TOL, DELTA_SOLVER_K_BOUNDS,
     DELTA_SOLVER_XTOL, FALLBACK_MAX_T_GAP, MAX_IV, MAX_SPREAD_RATIO, MIN_BID,
     MIN_IV, MIN_OPTION_PRICE, MIN_STRIKES_FOR_FIT, MINUTES_PER_YEAR,
+    NARROW_DOMAIN_MAX_EXCLUDED_FRAC, NARROW_DOMAIN_RATIO,
     NOISE_FLOOR, PCP_MONEYNESS_BAND, PM_EXPIRY_HOUR, PM_EXPIRY_MINUTE,
     R_DEFAULT, R_MAX, R_MIN, STEP2_FLAG_COLS, TARGET_DELTAS, TARGET_DTES,
     VEGA_FLOOR, W_FLOOR,
 )
+
+log = logging.getLogger(__name__)
 
 FORWARD_PCP = "pcp"
 FORWARD_SPOT_FALLBACK = "spot_fallback"
@@ -219,6 +223,16 @@ class SmileFit:
     k_max: float = float("nan")
     rmse: float = float("nan")
     spline: object = None
+    # Put-side domain reach in standard deviations: |k_min| / sqrt(w_atm).
+    # sqrt(w) is sigma*sqrt(T), so this is how many sigma below the forward the
+    # fitted domain extends — directly interpretable, since a 25-delta put sits
+    # near 0.67 sigma and a 10-delta near 1.28. Raw k_min is NOT comparable
+    # across expiries: a 928-day expiry spans far more log-moneyness than an
+    # 8-day one at the same quality.
+    domain_reach: float = float("nan")
+    # Set by select_bracketing_fits. Bracketing only — an excluded fit is still
+    # computed, still stored, still checked for calendar arbitrage.
+    excluded_from_bracketing: bool = False
     butterfly_arb_flag: bool = False
     calendar_arb_flag: bool = False
     skipped: bool = False
@@ -334,11 +348,82 @@ def fit_expiry(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
         return fit
 
     fit.spline, fit.k_min, fit.k_max, fit.rmse = spline, k_min, k_max, rmse
+    fit.domain_reach = _domain_reach(fit)
     try:
         fit.butterfly_arb_flag = check_butterfly(spline, k_min, k_max)
     except Exception as exc:                                  # noqa: BLE001
         fit.skip_reason = f"butterfly check failed: {type(exc).__name__}"
     return fit
+
+
+def _domain_reach(fit: SmileFit) -> float:
+    """|k_min| / sqrt(w_atm) — put-side domain reach in sigma."""
+    if fit.spline is None or not np.isfinite(fit.k_min):
+        return float("nan")
+    w_atm = float(fit.w(0.0))
+    if not np.isfinite(w_atm) or w_atm <= 0:
+        return float("nan")
+    return abs(fit.k_min) / math.sqrt(max(w_atm, W_FLOOR))
+
+
+def select_bracketing_fits(fits: list) -> list:
+    """Usable fits eligible as interpolation endpoints, degenerates removed.
+
+    A newly-listed expiry fits fine but over a tiny domain, and because the
+    blended domain is the INTERSECTION of its two endpoints, it destroys the
+    wing of a tenor whose other endpoint is excellent. Dropping it from the
+    candidate pool lets the sampler reach past it to two wide neighbours that
+    bracket the same target just as well.
+
+    The rule is relative to the snapshot's own median reach — see
+    NARROW_DOMAIN_RATIO for why an absolute threshold cannot work.
+
+    Sets excluded_from_bracketing on whatever it removes, and returns the
+    survivors. Exclusion is for BRACKETING ONLY: the fit is still computed,
+    still written to diagnostics, and still participates in the
+    calendar-arbitrage check, which runs over every usable fit.
+
+    Two guards, either of which abandons the filter entirely:
+      * fewer than 2 fits would survive — bracketing needs two, so a filter
+        that breaks it is worse than the narrow domain it was avoiding
+      * more than NARROW_DOMAIN_MAX_EXCLUDED_FRAC of fits trip the rule — that
+        means the median is being dragged by a cluster of narrow fits, i.e. the
+        whole chain is thin rather than one expiry being degenerate
+    """
+    for f in fits:
+        f.excluded_from_bracketing = False
+
+    usable = [f for f in fits if f.usable]
+    if len(usable) < 2:
+        return usable
+
+    reaches = [f.domain_reach for f in usable if np.isfinite(f.domain_reach)]
+    if len(reaches) < 2:
+        return usable
+    median_reach = float(np.median(reaches))
+    if not np.isfinite(median_reach) or median_reach <= 0:
+        return usable
+
+    threshold = NARROW_DOMAIN_RATIO * median_reach
+    # A non-finite reach is never grounds for exclusion: it means the metric
+    # could not be computed, not that the domain is narrow.
+    narrow = [f for f in usable
+              if np.isfinite(f.domain_reach) and f.domain_reach < threshold]
+    if not narrow:
+        return usable
+    if len(narrow) > len(usable) * NARROW_DOMAIN_MAX_EXCLUDED_FRAC:
+        log.debug("narrow-domain filter not applied: %d of %d fits tripped it",
+                  len(narrow), len(usable))
+        return usable
+
+    narrow_ids = {id(f) for f in narrow}
+    kept = [f for f in usable if id(f) not in narrow_ids]
+    if len(kept) < 2:
+        return usable
+
+    for f in narrow:
+        f.excluded_from_bracketing = True
+    return kept
 
 
 # --- Stage 3: sample --------------------------------------------------------
@@ -557,14 +642,20 @@ def build_snapshot(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
     for expiry, sub in df.groupby("expiration", sort=True):
         fits.append(fit_expiry(sub, ticker, trade_date, snapshot, expiry,
                                snapshot_dt))
+    # Calendar arbitrage is checked across EVERY usable fit — a degenerate
+    # expiry can still violate it, and excluding it here would hide that.
     check_calendar(fits)
+
+    # Bracketing endpoints only. The fallback uses the same filtered list, so a
+    # degenerate nearest expiry cannot serve a 0DTE row either.
+    candidates = select_bracketing_fits(fits)
 
     smiles = {}
     for dte in dtes:
-        s = interpolate_tenor(fits, dte)
+        s = interpolate_tenor(candidates, dte)
         if s is not None:
             smiles[dte] = s
-    fb = near_expiry_fallback(fits, dtes)
+    fb = near_expiry_fallback(candidates, dtes)
     # Only fills a bucket interpolation could not reach; never overrides one.
     if fb is not None and fb.dte not in smiles:
         smiles[fb.dte] = fb
@@ -609,6 +700,8 @@ def build_snapshot(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
         "forward_method": f.forward_method or None,
         "n_strikes_raw": f.n_strikes_raw, "n_strikes_clean": f.n_strikes_clean,
         "k_min": f.k_min, "k_max": f.k_max, "spline_rmse": f.rmse,
+        "domain_reach": f.domain_reach,
+        "excluded_from_bracketing": bool(f.excluded_from_bracketing),
         "calendar_arb_flag": bool(f.calendar_arb_flag),
         "butterfly_arb_flag": bool(f.butterfly_arb_flag),
         "skipped": bool(f.skipped), "skip_reason": f.skip_reason or None,

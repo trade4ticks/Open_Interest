@@ -80,8 +80,25 @@ CREATE TABLE IF NOT EXISTS equity_surface_diagnostics (
     butterfly_arb_flag BOOLEAN NOT NULL DEFAULT FALSE,
     skipped            BOOLEAN NOT NULL DEFAULT FALSE,
     skip_reason        TEXT,
+    -- Put-side domain reach in sigma: |k_min| / sqrt(w_atm). Raw k_min is not
+    -- comparable across expiries; this is, because sqrt(w) = sigma*sqrt(T).
+    -- A 25-delta put sits near 0.67 sigma, a 10-delta near 1.28.
+    domain_reach       DOUBLE PRECISION,
+    -- TRUE when the narrow-domain rule removed this fit from the interpolation
+    -- candidate pool. The fit was still computed and still calendar-checked;
+    -- it was only barred from being a bracketing endpoint, where its narrow
+    -- domain would have clipped the blend's wing.
+    excluded_from_bracketing BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (ticker, trade_date, snapshot, expiry)
 );
+
+-- Migration for tables created before these two columns existed. CREATE TABLE
+-- IF NOT EXISTS above is a no-op on an existing table, so the columns have to
+-- be added separately; both forms are idempotent.
+ALTER TABLE equity_surface_diagnostics
+    ADD COLUMN IF NOT EXISTS domain_reach DOUBLE PRECISION;
+ALTER TABLE equity_surface_diagnostics
+    ADD COLUMN IF NOT EXISTS excluded_from_bracketing BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS ix_equity_surface_diag_date
     ON equity_surface_diagnostics (trade_date, snapshot);
