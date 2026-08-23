@@ -12,9 +12,10 @@ require every node's call price back to machine precision.
 
 TWO THINGS THIS EXISTS TO PIN DOWN
 ----------------------------------
-1. THE FAR WING. At F=100, K=55, 12 vol, 7 DTE, d1 is ~36: n(d1) underflows to
-   exactly 0.0 and both CDFs saturate, so price, vega and gamma are all exactly
-   zero and the node carries NO recoverable rate — while its CALL is worth ~45.
+1. THE FAR WING. At F=100, K=55, 12 vol, 7 DTE, d1 is ~36: n(d1) and both CDF
+   tails collapse, so price, vega and gamma all come out around 1e-285 — not
+   literally zero, which is worse in one respect, because they still look like
+   numbers. The node carries NO recoverable rate, while its CALL is worth ~45.
    Row-by-row recovery would abandon precisely the rows whose call price is
    largest. The test asserts both halves: that the node really is barren, and
    that the smile still delivers its call price.
