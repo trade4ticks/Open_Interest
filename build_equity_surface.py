@@ -108,63 +108,174 @@ def load_day(ticker: str, source: str, day: date) -> pd.DataFrame:
 
 # --- Processing -------------------------------------------------------------
 
-def process_ticker_day(conn, ticker: str, source: str, day: date,
-                       skip_snapshots=None) -> dict:
-    """Every snapshot for one ticker-day. Returns written row counts."""
+def expected_cost(ticker: str, source: str, days: list) -> int:
+    """Cheap proxy for how long a ticker will take: bytes on disk.
+
+    Used to order work largest-first. Fit time tracks the number of quotes,
+    which tracks file size closely enough — SPY is ~3x T on both — and a
+    stat() costs nothing, whereas counting rows would mean reading every
+    file twice.
+
+    Falls back to 0 when nothing is on disk, which sorts those units last;
+    they return immediately anyway.
+    """
+    total = 0
+    seen = set()
+    for day in days:
+        for p in files_for(ticker, source, day):
+            if p in seen:            # snapshots keeps a whole year in one file
+                continue
+            seen.add(p)
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def fit_ticker(args) -> dict:
+    """One ticker's fits, computed in a WORKER PROCESS. No database.
+
+    The parent owns every write, for three reasons: partition creation would
+    otherwise race between workers, one connection is cheaper than N, and a
+    worker that dies cannot leave a half-written transaction behind.
+
+    Returns only the three row lists. `build_snapshot` also hands back its
+    SmileFit objects, each holding a scipy spline — pickling ~35 of those per
+    snapshot back to the parent would cost more than the fit did, and nothing
+    downstream of the write needs them.
+
+    Log records do not cross the process boundary, so messages are collected
+    and returned for the parent to emit into the run log. A worker logging to
+    its own stderr would be lost the moment the terminal scrolled.
+    """
+    ticker, source, days, skip_map = args
+    out = {"ticker": ticker, "units": [], "messages": [], "error": None}
+    try:
+        for day in days:
+            raw = load_day(ticker, source, day)
+            if raw.empty:
+                continue
+
+            # FILTER BEFORE CLEANING. clean_chain is the expensive part and it
+            # scales with rows, so cleaning 78 snapshots to use one is ~5x the
+            # cost of the fit it feeds. The skip set is known here, so the
+            # frame is narrowed first — this is what makes an intraday re-run
+            # cost one snapshot instead of a whole session.
+            skip = skip_map.get(day)
+            if skip:
+                keep = ~raw["snapshot"].astype("string").isin(skip)
+                raw = raw[keep.to_numpy(dtype=bool)]
+                if raw.empty:
+                    continue
+
+            cleaned = clean_chain(raw)
+            for snapshot, sub in cleaned.groupby("snapshot", sort=True):
+                snap = str(snapshot)
+                try:
+                    res = build_snapshot(sub, ticker, day, snap)
+                except Exception as exc:                      # noqa: BLE001
+                    out["messages"].append(
+                        f"{ticker} {day} {snap}: build FAILED — "
+                        f"{type(exc).__name__}: {exc}")
+                    continue
+                out["units"].append({
+                    "day": day, "snapshot": snap,
+                    "surface": res["surface"], "atm": res["atm"],
+                    "diagnostics": res["diagnostics"],
+                })
+    except Exception as exc:                                  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _write_unit(conn, ticker: str, unit: dict, totals: dict) -> None:
     from lib.surface_store import write_snapshot
+    try:
+        written = write_snapshot(conn, unit, unit["day"])
+    except Exception as exc:                                  # noqa: BLE001
+        conn.rollback()
+        log.error("  %s %s %s: WRITE FAILED — %s: %s", ticker, unit["day"],
+                  unit["snapshot"], type(exc).__name__, exc)
+        log.debug("  traceback", exc_info=True)
+        return
+    for k in ("surface", "atm", "diagnostics"):
+        totals[k] += written[k]
+    totals["snapshots"] += 1
 
-    raw = load_day(ticker, source, day)
-    totals = {"surface": 0, "atm": 0, "diagnostics": 0, "snapshots": 0}
-    if raw.empty:
-        return totals
 
-    # THE clean_chain CALL. Everything below reads columns it adds.
-    cleaned = clean_chain(raw)
+def _drain(conn, got: dict, totals: dict) -> None:
+    """Log a worker's messages and write its rows, in the parent."""
+    for m in got.get("messages", []):
+        log.warning("  %s", m)
+    if got.get("error"):
+        log.error("  FAIL %s: %s", got["ticker"], got["error"])
+    for unit in got.get("units", []):
+        _write_unit(conn, got["ticker"], unit, totals)
 
-    for snapshot, sub in cleaned.groupby("snapshot", sort=True):
-        snap = str(snapshot)
-        if skip_snapshots and snap in skip_snapshots:
-            continue
-        try:
-            result = build_snapshot(sub, ticker, day, snap)
-            written = write_snapshot(conn, result, day)
-        except Exception as exc:                              # noqa: BLE001
-            conn.rollback()
-            log.error("  %s %s %s: FAILED — %s: %s", ticker, day, snap,
-                      type(exc).__name__, exc)
-            log.debug("  traceback", exc_info=True)
-            continue
-        for k in ("surface", "atm", "diagnostics"):
-            totals[k] += written[k]
-        totals["snapshots"] += 1
-    return totals
+
+def default_workers() -> int:
+    import os
+    return max(1, (os.cpu_count() or 2) - 1)
 
 
 def run_days(conn, tickers: list, source: str, days: list,
-             intraday_resume: bool = False) -> dict:
+             intraday_resume: bool = False, workers: int = 1) -> dict:
+    """Fit every (ticker, day) and write the results.
+
+    Tickers are independent and the fit is CPU-bound, so the work is spread
+    across processes — threads would not help, the smile fit holds the GIL.
+    The unit is a TICKER rather than a (ticker, day) pair so that a multi-day
+    batch reads each ticker's file once per day inside one worker instead of
+    scattering the same file across several.
+
+    Units are dispatched largest-first. ProcessPoolExecutor queues FIFO, so
+    submitting the heaviest work first is longest-processing-time scheduling:
+    with SPY ~3x T, naive ordering leaves workers idle at the tail waiting for
+    one straggler to finish.
+    """
     from lib.surface_store import completed_snapshots
 
     grand = {"surface": 0, "atm": 0, "diagnostics": 0, "snapshots": 0}
-    with tqdm(total=len(tickers) * len(days), unit="tk-day", ncols=90,
-              desc="surface") as bar:
-        for day in days:
-            for tk in tickers:
-                skip = None
-                if intraday_resume:
-                    # Compare what diagnostics already holds against what is on
-                    # disk, so a re-run mid-session only does the new bars.
-                    skip = set(completed_snapshots(conn, tk, day))
+
+    # Skip sets are computed HERE, in the parent, because they need the
+    # database and the workers deliberately have no connection.
+    skip_by_ticker = {}
+    if intraday_resume:
+        for tk in tickers:
+            skip_by_ticker[tk] = {d: set(completed_snapshots(conn, tk, d))
+                                  for d in days}
+
+    work = [(tk, source, days, skip_by_ticker.get(tk, {})) for tk in tickers]
+    work.sort(key=lambda a: expected_cost(a[0], a[1], a[2]), reverse=True)
+    if work:
+        heaviest = work[0][0]
+        log.info("dispatch order: heaviest first (%s ... %s)",
+                 heaviest, work[-1][0])
+
+    if workers <= 1:
+        with tqdm(total=len(work), unit="tk", ncols=90, desc="surface") as bar:
+            for args in work:
+                _drain(conn, fit_ticker(args), grand)
+                bar.update(1)
+        return grand
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fit_ticker, a): a[0] for a in work}
+        with tqdm(total=len(futures), unit="tk", ncols=90,
+                  desc=f"surface x{workers}") as bar:
+            for fut in as_completed(futures):
+                tk = futures[fut]
                 try:
-                    got = process_ticker_day(conn, tk, source, day, skip)
+                    got = fut.result()
                 except Exception as exc:                      # noqa: BLE001
-                    conn.rollback()
-                    log.error("  FAIL %s %s: %s: %s", tk, day,
+                    log.error("  FAIL %s: worker died — %s: %s", tk,
                               type(exc).__name__, exc)
                     log.debug("  traceback", exc_info=True)
                     bar.update(1)
                     continue
-                for k in grand:
-                    grand[k] += got[k]
+                _drain(conn, got, grand)
                 bar.update(1)
     return grand
 
@@ -186,6 +297,11 @@ def main() -> int:
     ap.add_argument("--source", choices=[SOURCE_SNAPSHOTS, SOURCE_INTRADAY],
                     default=SOURCE_SNAPSHOTS,
                     help="which chain store to read (default snapshots)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="worker processes for the fit (default cpu_count()-1). "
+                         "1 runs in-process, which is the one to use when "
+                         "debugging: a traceback from a worker arrives as a "
+                         "pickled string, not a live frame.")
     args = ap.parse_args()
 
     log_file = setup_file_logging("build_equity_surface")
@@ -234,9 +350,15 @@ def main() -> int:
               f"source={args.source}")
         print(f"{days[0]} .. {days[-1]}\n")
 
+        workers = args.workers if args.workers is not None else default_workers()
+        workers = max(1, min(workers, len(tickers)))
+        print(f"workers: {workers}"
+              f"{' (serial)' if workers == 1 else ''}\n")
+
         t0 = time.monotonic()
         totals = run_days(conn, tickers, args.source, days,
-                          intraday_resume=(args.command == "intraday"))
+                          intraday_resume=(args.command == "intraday"),
+                          workers=workers)
 
     print(f"\n{totals['snapshots']:,} snapshot(s) processed in "
           f"{time.monotonic() - t0:.0f}s")

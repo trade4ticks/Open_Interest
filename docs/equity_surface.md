@@ -25,7 +25,55 @@ python build_equity_surface.py batch --start 20260601 --end 20260630
 python build_equity_surface.py batch --start 20260601 --end 20260630 --tickers AAPL,MSFT
 python build_equity_surface.py incremental
 python build_equity_surface.py intraday --source intraday
+python build_equity_surface.py intraday --source intraday --workers 8
 ```
+
+## Parallelism
+
+The fit is CPU-bound (~2.1s/snapshot) and tickers are independent, so work is
+spread across **processes** — threads would not help, since the smile fit holds
+the GIL. `--workers` defaults to `cpu_count() - 1`; `--workers 1` runs
+in-process, which is what to use when debugging, because a traceback from a
+worker arrives as a pickled string rather than a live frame.
+
+Three things make this behave:
+
+**The parent owns every write.** Workers have no database connection at all.
+Partition creation would otherwise race between them, one connection is cheaper
+than N, and a worker that dies cannot leave a half-written transaction behind.
+Workers return only the three row lists — `build_snapshot` also hands back its
+`SmileFit` objects, and pickling ~35 scipy splines per snapshot back to the
+parent would cost more than the fit did.
+
+**Log records do not cross the process boundary**, so workers collect messages
+and return them for the parent to emit into the run log. A worker logging to
+its own stderr would vanish the moment the terminal scrolled.
+
+**Work is dispatched heaviest-first.** `ProcessPoolExecutor` queues FIFO, so
+submitting the largest units first is longest-processing-time scheduling. With
+SPY roughly 3× T, naive ordering leaves workers idle at the tail waiting on one
+straggler. Cost is proxied by bytes on disk — a `stat()` is free, whereas
+counting rows would mean reading every file twice, and file size tracks quote
+count closely enough for an ordering decision.
+
+The unit of work is a **ticker**, not a (ticker, day) pair, so a multi-day batch
+keeps one ticker's days inside one worker instead of scattering the same file
+across several.
+
+## Filtering before cleaning
+
+`clean_chain` scales with rows and is the dominant fixed cost — cleaning all 78
+intraday snapshots to use one was 1.83s of a 2.22s overhead. The pending-snapshot
+set is known before cleaning, so the frame is narrowed **first**.
+
+This is why the skip set is computed in the parent (it needs the database) and
+passed down to workers. It also speeds up any partial re-run, not just intraday:
+a batch resuming mid-day now cleans only the snapshots it still owes.
+
+Measured on a synthetic six-snapshot store: **5.92s → 1.20s (4.9×)** when five
+of six snapshots are already complete. Note that a filter applied *after*
+cleaning would produce identical rows and still be the bug, which is why the
+test asserts on elapsed time rather than output.
 
 Every frame read goes through `clean_chain()` **before anything else** — that
 module supplies `mid_price`, `spread`, `moneyness`, `gamma`, `dte` and the
