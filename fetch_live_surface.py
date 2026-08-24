@@ -133,26 +133,82 @@ def grid_bucket(ts: datetime) -> str:
 
 # --- Lock -------------------------------------------------------------------
 
-def acquire_lock(path: Path):
-    """Refuse to start if a previous cycle is still running.
+def under_flock(path: Path) -> bool:
+    """True when an inherited descriptor already refers to `path`.
 
-    Belt and braces with the cron's flock: a cycle that overruns 5 minutes
-    would otherwise double the connection draw against a shared pool. Returns
-    the handle to keep open, or None if the platform has no flock (Windows dev
-    box) — the VPS is Linux, where this is the real guard.
+    That is the signature of having been launched by flock(1): it opens the
+    lock file, takes the lock on THAT open file description, then execs us with
+    the descriptor still open and still held for our whole lifetime.
+
+    Detecting it matters because flock(2) locks are per-open-file-description,
+    not per-process. A second open() of the same path inside this process is a
+    DIFFERENT description, so locking it conflicts with the one our own parent
+    holds — and fails every time, from the very first run.
     """
+    try:
+        target = path.resolve()
+        for fd in Path("/proc/self/fd").iterdir():
+            if int(fd.name) <= 2:
+                continue
+            try:
+                if fd.resolve() == target:
+                    return True
+            except OSError:
+                continue
+    except Exception:                                         # noqa: BLE001
+        pass                       # no /proc (Windows dev box) — assume not
+    return False
+
+
+def acquire_lock(path: Path):
+    """Take an in-process lock. Only for runs NOT wrapped in flock(1).
+
+    Returns the handle to keep open, False if another holder has it, or None
+    when locking is unavailable or unnecessary.
+
+    THE CRON'S flock(1) IS AUTHORITATIVE. This is opt-in via --lock and exists
+    only for a manual run outside cron. Two reasons flock(1) is the better
+    layer, not merely the incumbent:
+
+      * it covers the ENTIRE process lifetime, including interpreter startup
+        and the pandas/scipy/pyarrow imports. Those take a second or more, and
+        an in-process lock cannot protect that window — two cron firings could
+        both get past exec and into imports before either one locked.
+      * it is external to the process, so no exception path inside can drop it.
+
+    Running both is what caused every cycle of 2026-08-24 to be skipped: this
+    function's open() created a second file description on the same path, and
+    locking it conflicted with the one flock(1) already held on our behalf.
+    """
+    if under_flock(path):
+        log.info("already under flock(1) (%s) — skipping the in-process lock; "
+                 "the cron wrapper is the authoritative guard", path)
+        return None
     try:
         import fcntl
     except ImportError:
         log.debug("no fcntl on this platform; relying on the cron's flock")
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path, "w")
+    # "a", not "w": a failed acquisition must not truncate the file or touch
+    # its mtime. Under the old "w" every skipped attempt rewrote the lock file,
+    # which is why it read 0 bytes with an mtime tracking the last SKIP rather
+    # than the last successful run — forensics that pointed away from the real
+    # cause.
+    fh = open(path, "a")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        fh.close()
+        fh.close()                 # releases nothing we hold; just tidies up
         return False
+    # Only now is it ours to write. A held lock should say who holds it.
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()) + chr(10))
+        fh.flush()
+    except OSError:
+        pass
     return fh
 
 
@@ -386,8 +442,19 @@ def main() -> int:
                          "so this captures stale quotes — trade_date is taken "
                          "from the vendor stamp so they are at least filed "
                          "under the right session.")
+    # Default OFF. The cron wraps this in flock(1), which is the authoritative
+    # guard; taking a second lock inside the process conflicts with it and
+    # skips every cycle. A bare manual run therefore just runs, which is what
+    # you want at 5-minute resolution when a missed cycle is unrecoverable.
+    ap.add_argument("--lock", action="store_true",
+                    help=("take an in-process lock. NOT needed under the cron, "
+                          "which already wraps the command in flock(1). Use "
+                          "only for a manual run that must not overlap "
+                          "another."))
     ap.add_argument("--no-lock", action="store_true",
-                    help="skip the lock file (for a manual one-off)")
+                    help=argparse.SUPPRESS)   # deprecated no-op; kept so an
+                                              # existing manual command or
+                                              # cron entry does not break
     args = ap.parse_args()
 
     log_file = setup_file_logging("fetch_live_surface")
@@ -398,7 +465,10 @@ def main() -> int:
         return 0
 
     lock = None
-    if not args.no_lock:
+    if args.no_lock:
+        log.info("--no-lock is now the default and has no effect; the "
+                 "in-process lock is opt-in via --lock")
+    if args.lock and not args.no_lock:
         lock = acquire_lock(LOCK_PATH)
         if lock is False:
             log.warning("previous cycle still running (%s held) — skipping. "
