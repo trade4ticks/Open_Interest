@@ -73,6 +73,78 @@ PCP_MONEYNESS_BAND = 0.15
 R_MIN, R_MAX = 0.0, 0.10
 R_DEFAULT = 0.05
 
+# --- Fix switches -----------------------------------------------------------
+# Three fixes land together because each changes the fitted surface and all
+# three need one re-surface. They are switchable INDIVIDUALLY so a change in
+# output can be attributed to a specific one: run the sample with all on, then
+# flip one off and diff. Remove the switches once the re-surface has validated
+# them; until then a regression can be bisected without a rebuild.
+
+# Fix 1. A target tenor within DIRECT_EXPIRY_TOL_DAYS of a fitted expiry uses
+# that smile DIRECTLY instead of blending.
+#
+# compute_T measures calendar minutes to the 16:00 settlement, so from an 09:45
+# snapshot every expiry carries a +0.26 day fraction and from 15:45 a +0.01
+# one. A target of 21 is therefore BELOW the real 21-day expiry's 21.26, which
+# makes that expiry the UPPER bracket and reaches downward for a shorter one.
+# The blend weight is not the problem (alpha ~0.96, so the right expiry
+# dominates the value) — the DOMAIN is: InterpolatedSmile intersects k_min/
+# k_max, so a wide fit gets clipped to whatever the shorter one covers. Worst
+# case the shorter one is 0DTE and the target produces no rows at all.
+#
+# Tolerance 0.30 days:
+#   * must exceed 0.2604 (= 6h15m/24), the drift at the 09:45 snapshot, or the
+#     fix does not fire on the snapshot that needs it most
+#   * must stay well under the ~0.74 minimum distance to the NEXT listed
+#     expiry, which for a daily-expiry name like SPY is one calendar day away
+#     and reads >= 1.01 - 0.26 = 0.74 from the target
+# 0.30 sits with 15% headroom above the drift and 2.5x clearance below the
+# nearest neighbour, so it cannot swallow an adjacent expiry.
+DIRECT_EXPIRY_MATCH = True
+DIRECT_EXPIRY_TOL_DAYS = 0.30
+
+# Fix 2. Compute F CBOE-style from the ATM pair with r exogenous, instead of
+# solving both from the parity regression and discarding F when r fails bounds.
+#
+# On American options early-exercise premium inflates the ITM leg and tilts the
+# regression steeper than -disc, so B = -slope > disc and r = -ln(B)/T is
+# biased low — through R_MIN, rejecting the whole fit. Measured on synthetic
+# American chains with zero noise and true r = 4.5%, the bias tracks VOLATILITY
+# rather than dividend yield: -30.7% at 12 vol / 7 DTE against +1.2% at 95 vol.
+# Low vol is worse because MIN_OPTION_PRICE bounds the usable strikes in
+# dollars, so a low-vol chain reaching +/-6% of spot is +/-3.5 sigma and its ITM
+# legs sit deep in early-exercise territory.
+#
+# But F survives what r does not: intercept and slope errors partly cancel in
+# F = A/B, while r amplifies B's error by 1/T. The rejected regression's F was
+# MORE accurate than the fallback's (-0.01% vs +0.03% at 7 DTE, -0.27% vs
+# +0.42% at 90). So the bounds test discards a better forward to protect a rate
+# that only scales the discount factor, while F sets the entire log-moneyness
+# grid.
+CBOE_FORWARD = True
+
+# Fix 3. Fixed knots instead of a knot per point.
+#
+# s = len(noise) targets ~1 sigma per-point residual and restrains curvature not
+# at all, so w'' scales as wiggle/dk^2 and DENSER chains flag more butterfly
+# arbitrage from identical noise. Simulated on one true smile with per-point
+# noise held constant, varying only n: 2% -> 20% at 12 vol / 7 DTE going from
+# 25 to 219 strikes. SPY is worst on every axis at once and observed 12/33.
+# The flag currently ranks the best chains worst, so it cannot be used as a
+# scanner quality filter.
+#
+# Knots on a fixed grid bound w'' by construction and make the flag rate
+# independent of density. 12 knots is the middle of the 10-15 range: enough for
+# a smile plus one wing kink, few enough that noise cannot be tracked.
+FIXED_KNOT_SPLINE = True
+SPLINE_TARGET_KNOTS = 12
+# Below this many interior knots the fit is too coarse to be worth forcing;
+# fall back to the smoothing spline rather than fit a near-parabola.
+SPLINE_MIN_KNOTS = 4
+# Schoenberg-Whitney needs at least one point between consecutive knots; 3
+# gives margin so a knot interval is never determined by a single quote.
+SPLINE_MIN_PTS_PER_KNOT = 3
+
 # --- Fit --------------------------------------------------------------------
 # Inherited, and barely above the cubic spline's minimum of 4. Likely too
 # permissive for thin single-name chains; left unchanged pending observed data.

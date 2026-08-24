@@ -38,13 +38,16 @@ from datetime import datetime, time
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import UnivariateSpline
+from scipy.interpolate import LSQUnivariateSpline, UnivariateSpline
 from scipy.optimize import brentq
 from scipy.stats import linregress, norm
 
 from lib.surface_config import (
-    ARB_CHECK_POINTS, BUTTERFLY_TOL, CALENDAR_TOL, DELTA_SOLVER_K_BOUNDS,
+    ARB_CHECK_POINTS, BUTTERFLY_TOL, CALENDAR_TOL, CBOE_FORWARD,
+    DELTA_SOLVER_K_BOUNDS, DIRECT_EXPIRY_MATCH, DIRECT_EXPIRY_TOL_DAYS,
+    FIXED_KNOT_SPLINE,
     DELTA_SOLVER_XTOL, FALLBACK_MAX_T_GAP, MAX_IV, MAX_SPREAD_RATIO, MIN_BID,
+    SPLINE_MIN_KNOTS, SPLINE_MIN_PTS_PER_KNOT, SPLINE_TARGET_KNOTS,
     MIN_IV, MIN_OPTION_PRICE, MIN_STRIKES_FOR_FIT, MINUTES_PER_YEAR,
     NARROW_DOMAIN_MAX_EXCLUDED_FRAC, NARROW_DOMAIN_RATIO,
     NOISE_FLOOR, PCP_MONEYNESS_BAND, PM_EXPIRY_HOUR, PM_EXPIRY_MINUTE,
@@ -56,6 +59,8 @@ log = logging.getLogger(__name__)
 
 FORWARD_PCP = "pcp"
 FORWARD_SPOT_FALLBACK = "spot_fallback"
+# CBOE construction: F from the ATM pair with r exogenous (fix 2).
+FORWARD_CBOE = "cboe_atm"
 
 
 class ParityError(RuntimeError):
@@ -99,8 +104,8 @@ def filter_quotes(df: pd.DataFrame) -> pd.DataFrame:
     return df[mask.to_numpy(dtype=bool)]
 
 
-def solve_forward_rate(clean: pd.DataFrame, T: float) -> tuple:
-    """(F, r) from put-call parity. Raises ParityError if unusable.
+def _parity_regression(clean: pd.DataFrame, T: float) -> tuple:
+    """(F, r) from the parity regression, NO bounds test. Raises ParityError.
 
         C_mid - P_mid = e^(-rT)(F - K)      fitted as y = A - B*K
         A = e^(-rT) * F,  B = e^(-rT)  ->  r = -ln(B)/T,  F = A/B
@@ -144,26 +149,104 @@ def solve_forward_rate(clean: pd.DataFrame, T: float) -> tuple:
     if T <= 0:
         raise ParityError("T <= 0")
     r = -math.log(B) / T
+    return F, r
+
+
+def solve_forward_rate(clean: pd.DataFrame, T: float) -> tuple:
+    """_parity_regression plus the R_MIN/R_MAX bounds test.
+
+    Retained for CBOE_FORWARD = False, so the previous behaviour can be run
+    for attribution. The bounds are what made a biased r cost the forward.
+    """
+    F, r = _parity_regression(clean, T)
     if not np.isfinite(r) or not (R_MIN <= r <= R_MAX):
         raise ParityError(f"rate r={r!r} outside [{R_MIN}, {R_MAX}]")
     return F, r
 
 
+def solved_rate_raw(clean: pd.DataFrame, T: float) -> float:
+    """The parity regression's r, WITHOUT the bounds test. NaN if unsolvable.
+
+    Recorded in diagnostics even when rejected. Its absence is why the
+    American-exercise bias took a synthetic experiment to diagnose: every
+    rejected fit reported only `spot_fallback`, so the distribution of the
+    rejected rates — the thing that shows the bias is structural and tracks
+    volatility — was never visible.
+    """
+    try:
+        _, r = _parity_regression(clean, T)
+        return float(r)
+    except (ParityError, ValueError):
+        return float("nan")
+
+
+def cboe_forward(clean: pd.DataFrame, T: float, r: float) -> float:
+    """F = K0 + e^(rT)(C(K0) - P(K0)), K0 = argmin|C - P|. Raises ParityError.
+
+    The CBOE construction, and the reason it survives American exercise where
+    the regression does not: it uses ONE strike pair rather than a slope
+    through many, and it picks the pair where |C - P| is smallest — which is
+    the pair closest to the forward, where both legs are nearest ATM and the
+    early-exercise premium on each is smallest and most nearly equal. The
+    regression's problem is precisely that it fits a slope through strikes
+    whose ITM legs carry increasing exercise premium; removing the slope
+    removes the bias.
+
+    r enters only through e^(rT) applied to a small difference, so a wrong r
+    barely moves F: at 30 DTE a 1 percentage-point error in r scales a
+    (C - P) of a few dollars by 0.08%, i.e. cents on the forward.
+    """
+    calls = clean[clean["option_type"].astype("string").str.upper() == "C"]
+    puts = clean[clean["option_type"].astype("string").str.upper() == "P"]
+    if calls.empty or puts.empty:
+        raise ParityError("no calls or no puts")
+
+    pairs = calls[["strike", "mid_price"]].merge(
+        puts[["strike", "mid_price"]], on="strike", suffixes=("_c", "_p"))
+    pairs = pairs[(pairs["mid_price_c"] >= MIN_OPTION_PRICE)
+                  & (pairs["mid_price_p"] >= MIN_OPTION_PRICE)]
+    if pairs.empty:
+        raise ParityError("no matched pair above MIN_OPTION_PRICE")
+
+    diff = pairs["mid_price_c"] - pairs["mid_price_p"]
+    i = diff.abs().idxmin()
+    K0 = float(pairs.loc[i, "strike"])
+    F = K0 + math.exp(r * T) * float(diff.loc[i])
+    if not np.isfinite(F) or F <= 0:
+        raise ParityError(f"CBOE forward F={F!r} not positive")
+    return F
+
+
 def forward_and_rate(clean: pd.DataFrame, T: float) -> tuple:
-    """(F, r, method). Falls back to spot with a default carry on failure.
+    """(F, r, method, r_solved_raw). Falls back to spot on failure.
 
     The fallback ignores dividends, so on a dividend-paying name the forward is
     overstated by roughly the dividend inside the tenor. `method` is what makes
     that measurable rather than invisible.
+
+    With CBOE_FORWARD the rate is exogenous (R_DEFAULT) and F comes from the
+    ATM pair, so a rate that would have failed R_MIN/R_MAX no longer costs the
+    forward. r_solved_raw carries what the regression WOULD have said, so the
+    bias remains measurable after the fix removes its consequences.
     """
-    try:
-        F, r = solve_forward_rate(clean, T)
-        return F, r, FORWARD_PCP
-    except (ParityError, ValueError):
-        S = float(pd.to_numeric(clean["underlying_price"],
-                                errors="coerce").median())
-        r = R_DEFAULT
-        return S * math.exp(r * T), r, FORWARD_SPOT_FALLBACK
+    r_raw = solved_rate_raw(clean, T)
+
+    if CBOE_FORWARD:
+        try:
+            F = cboe_forward(clean, T, R_DEFAULT)
+            return F, R_DEFAULT, FORWARD_CBOE, r_raw
+        except (ParityError, ValueError):
+            pass
+    else:
+        try:
+            F, r = solve_forward_rate(clean, T)
+            return F, r, FORWARD_PCP, r_raw
+        except (ParityError, ValueError):
+            pass
+
+    S = float(pd.to_numeric(clean["underlying_price"],
+                            errors="coerce").median())
+    return S * math.exp(R_DEFAULT * T), R_DEFAULT, FORWARD_SPOT_FALLBACK, r_raw
 
 
 def build_smile_points(clean: pd.DataFrame, F: float, T: float) -> pd.DataFrame:
@@ -217,6 +300,10 @@ class SmileFit:
     F: float = float("nan")
     r: float = float("nan")
     forward_method: str = ""
+    # What the parity regression's rate WOULD have been, recorded even when it
+    # was rejected or unused. The American-exercise bias is only visible in the
+    # distribution of these; without it every failure reads 'spot_fallback'.
+    r_solved_raw: float = float("nan")
     n_strikes_raw: int = 0
     n_strikes_clean: int = 0
     k_min: float = float("nan")
@@ -262,11 +349,72 @@ def fit_smile(points: pd.DataFrame) -> tuple:
     k = points["k"].to_numpy(dtype=float)
     w = points["w"].to_numpy(dtype=float)
     noise = points["w_noise"].to_numpy(dtype=float)
-    spline = UnivariateSpline(k, w, w=1.0 / noise, s=float(len(noise)),
-                              k=3, ext=3)
+
+    spline = None
+    if FIXED_KNOT_SPLINE:
+        spline = _fit_fixed_knot(k, w, noise)
+    if spline is None:
+        spline = UnivariateSpline(k, w, w=1.0 / noise, s=float(len(noise)),
+                                  k=3, ext=3)
+
     resid = spline(k) - w
     rmse = float(np.sqrt(np.mean(resid ** 2)))
     return spline, float(k[0]), float(k[-1]), rmse
+
+
+def _fit_fixed_knot(k, w, noise):
+    """Least-squares cubic spline on a fixed knot grid, or None if infeasible.
+
+    The number of knots — not the data density — sets how much curvature the
+    fit can express, which is the whole point: with a knot per point, w''
+    scales as wiggle/dk^2 and a denser chain manufactures butterfly-arbitrage
+    flags from identical noise.
+
+    Knots are uniform in k across the fitted domain, then thinned so every
+    interval keeps at least SPLINE_MIN_PTS_PER_KNOT quotes. That thinning is
+    what satisfies Schoenberg-Whitney (LSQUnivariateSpline raises without it)
+    and it degrades gracefully: a sparse chain simply gets fewer knots rather
+    than an exception. Below SPLINE_MIN_KNOTS the fit would be little more
+    than a parabola, so the caller falls back to the smoothing spline — a
+    coarse honest fit beats a forced one.
+    """
+    n = len(k)
+    if n < MIN_STRIKES_FOR_FIT:
+        return None
+
+    for n_knots in range(SPLINE_TARGET_KNOTS, SPLINE_MIN_KNOTS - 1, -1):
+        # Interior knots only — the boundary knots are implied by the data
+        # range, and LSQUnivariateSpline requires t[0] > k[0], t[-1] < k[-1].
+        grid = np.linspace(k[0], k[-1], n_knots + 2)[1:-1]
+        keep = _thin_knots(k, grid)
+        if len(keep) < SPLINE_MIN_KNOTS:
+            continue
+        try:
+            return LSQUnivariateSpline(k, w, keep, w=1.0 / noise, k=3, ext=3)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _thin_knots(k, grid):
+    """Drop knots that would leave an interval with too few quotes.
+
+    Walks the candidate grid in order, keeping a knot only when at least
+    SPLINE_MIN_PTS_PER_KNOT points lie between it and the previously kept one,
+    and requiring the same of the final interval to the right-hand boundary.
+    """
+    keep = []
+    lo = k[0]
+    for t in grid:
+        if t <= k[0] or t >= k[-1]:
+            continue
+        if np.count_nonzero((k > lo) & (k <= t)) < SPLINE_MIN_PTS_PER_KNOT:
+            continue
+        keep.append(float(t))
+        lo = t
+    while keep and np.count_nonzero(k > keep[-1]) < SPLINE_MIN_PTS_PER_KNOT:
+        keep.pop()
+    return np.asarray(keep, dtype=float)
 
 
 def check_butterfly(spline, k_min: float, k_max: float) -> bool:
@@ -330,8 +478,9 @@ def fit_expiry(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
                            f"need {MIN_STRIKES_FOR_FIT}")
         return fit
 
-    F, r, method = forward_and_rate(clean, T)
+    F, r, method, r_raw = forward_and_rate(clean, T)
     fit.F, fit.r, fit.forward_method = F, r, method
+    fit.r_solved_raw = r_raw
 
     points = build_smile_points(clean, F, T)
     if len(points) < MIN_STRIKES_FOR_FIT:
@@ -457,6 +606,38 @@ def interpolate_tenor(fits: list, dte: int) -> InterpolatedSmile | None:
     if not usable:
         return None
     T_target = dte / 365.0
+
+    # A target within tolerance of a fitted expiry uses that smile DIRECTLY.
+    #
+    # This runs BEFORE bracketing, not as a fallback after it, because the
+    # bracketing test succeeds in exactly the case that needs intercepting:
+    # compute_T's 16:00 settlement gives every expiry a +0.26 day fraction at
+    # 09:45, so a target of 21 is below the real 21-day expiry's 21.26 and
+    # takes it as the UPPER bracket, reaching down to something shorter. The
+    # weight is nearly all on the right expiry (alpha ~0.96) so the VALUE is
+    # about right — but k_min/k_max are intersected, so a wide fit is clipped
+    # to whatever the shorter one covers, and when the shorter one is 0DTE the
+    # target can produce no rows at all.
+    #
+    # Ties cannot arise in practice: two expiries within 0.30 days of one
+    # target would have to be under 0.6 days apart, and listed expiries are at
+    # least a calendar day apart. Resolved deterministically anyway — nearest
+    # wins, and on an exact tie the LONGER expiry, since the shorter one is
+    # closer to settlement and more likely degenerate.
+    if DIRECT_EXPIRY_MATCH:
+        direct = min(
+            (f for f in usable
+             if abs(f.dte_actual - dte) <= DIRECT_EXPIRY_TOL_DAYS),
+            key=lambda f: (abs(f.dte_actual - dte), -f.T), default=None)
+        if direct is not None:
+            # dte_actual is the fit's OWN tenor, not the target label — the
+            # row says which smile it came from rather than restating the
+            # bucket it was filed under.
+            return InterpolatedSmile(
+                dte=dte, T=direct.T, F=direct.F, r=direct.r,
+                k_min=direct.k_min, k_max=direct.k_max,
+                dte_actual=direct.dte_actual,
+                _lo=direct, _hi=None, _alpha=0.0)
 
     lo = hi = None
     for i in range(len(usable) - 1):
@@ -706,6 +887,9 @@ def build_snapshot(df: pd.DataFrame, ticker: str, trade_date, snapshot: str,
         "expiry": f.expiry, "dte_actual": f.dte_actual if f.T > 0 else None,
         "forward_price": f.F, "risk_free_rate": f.r,
         "forward_method": f.forward_method or None,
+        # NaN is not valid JSON/SQL NULL for psycopg's float path; normalise.
+        "r_solved_raw": (float(f.r_solved_raw)
+                         if f.r_solved_raw == f.r_solved_raw else None),
         "n_strikes_raw": f.n_strikes_raw, "n_strikes_clean": f.n_strikes_clean,
         "k_min": f.k_min, "k_max": f.k_max, "spline_rmse": f.rmse,
         "domain_reach": f.domain_reach,

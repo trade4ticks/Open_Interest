@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS equity_surface_diagnostics (
     -- dividend-paying name it overstates the forward by roughly the dividend
     -- inside the tenor. This column is how its frequency gets measured.
     forward_method     TEXT,
+    -- What the put-call parity regression's rate WOULD have been, recorded
+    -- even when rejected or unused. On American options early-exercise premium
+    -- tilts the regression and biases r downward through R_MIN, and the
+    -- distribution of these rejected rates is the only place that bias is
+    -- visible -- every rejection otherwise reads only 'spot_fallback'.
+    r_solved_raw       DOUBLE PRECISION,
     n_strikes_raw      INTEGER,
     n_strikes_clean    INTEGER,
     k_min              DOUBLE PRECISION,
@@ -164,3 +170,8 @@ EXCEPTION WHEN duplicate_table OR invalid_object_definition THEN
     NULL;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Added with the three surface fixes. Idempotent, so an existing deployment
+-- picks up the column without a rebuild.
+ALTER TABLE equity_surface_diagnostics
+    ADD COLUMN IF NOT EXISTS r_solved_raw DOUBLE PRECISION;

@@ -34,7 +34,8 @@ ATM_COLS = [
 ]
 DIAG_COLS = [
     "ticker", "trade_date", "snapshot", "expiry", "dte_actual",
-    "forward_price", "risk_free_rate", "forward_method", "n_strikes_raw",
+    "forward_price", "risk_free_rate", "forward_method", "r_solved_raw",
+    "n_strikes_raw",
     "n_strikes_clean", "k_min", "k_max", "spline_rmse", "calendar_arb_flag",
     "butterfly_arb_flag", "skipped", "skip_reason",
     "domain_reach", "excluded_from_bracketing",
