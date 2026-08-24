@@ -75,7 +75,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from lib.chain_fetch_common import log_path, setup_file_logging
+from lib.chain_fetch_common import (close_file_logging, log_path,
+                                    setup_file_logging)
 from lib.market_hours import ET, get_trading_days, session_bounds
 
 logging.basicConfig(
@@ -101,11 +102,31 @@ DEFAULT_WORKERS = 5
 # ~20MB is 2.4GB against a box that has OOM-killed at 3.2GB.
 DEFAULT_MAX_INFLIGHT = 12
 
+# Progress cadence. Frequent enough that a stall names the ticker it stopped
+# near, sparse enough not to write 121 lines every five minutes.
+PROGRESS_EVERY = 20
+
 SOURCE_LIVE = "live"
 LOCK_PATH = Path(os.environ.get("LIVE_SURFACE_LOCK", "/tmp/live_surface.lock"))
 
 
 # --- Window -----------------------------------------------------------------
+
+def flush_log() -> None:
+    """Push buffered log records to disk mid-cycle.
+
+    The run log was completely empty after six minutes of the deadlocked run,
+    so the failure left no evidence and needed py-spy to find. Handlers are
+    flushed explicitly rather than trusted to line-buffer, because a stall that
+    produces no output is the one case where the log matters most.
+    """
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:                                     # noqa: BLE001
+            pass
+    close_file_logging()
+
 
 def market_window(now_et: datetime | None = None) -> tuple:
     """(open_now, reason). Session close comes from the exchange calendar, so
@@ -333,86 +354,122 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
             slots.release()
             raise
 
-    with ProcessPoolExecutor(max_workers=workers) as fitpool, \
-         ThreadPoolExecutor(max_workers=connections) as fetchpool:
-        fetch_futs = {fetchpool.submit(fetch_guarded, tk): tk for tk in tickers}
-        fit_futs = {}
+    # ONE loop over both kinds of future, not two sequential as_completed
+    # passes. The permit a fetch takes is released when its FIT completes, so
+    # draining fits in a second loop that only starts after every fetch has
+    # been consumed is a guaranteed deadlock: fetch number max_inflight + 1
+    # blocks in slots.acquire() waiting for a release that the not-yet-running
+    # second loop is the only thing able to perform. It stalled at ticker 12-14
+    # with the default of 12, and any run shorter than the bound completed
+    # fine, which is why 3- and 8-ticker tests never showed it.
+    #
+    # Interleaving means a fit result drains, and its permit frees, while
+    # fetches are still queued.
+    with ProcessPoolExecutor(max_workers=workers) as fitpool,          ThreadPoolExecutor(max_workers=connections) as fetchpool:
+        pending = {fetchpool.submit(fetch_guarded, tk): ("fetch", tk)
+                   for tk in tickers}
+        n_fetched = n_fitted = 0
+        n_total = len(tickers)
 
-        for fut in as_completed(fetch_futs):
-            tk = fetch_futs[fut]
-            try:
-                tk, raw, captured_at, secs = fut.result()
-            except Exception as exc:                          # noqa: BLE001
-                log.warning("  %s: fetch FAILED — %s: %s", tk,
-                            type(exc).__name__, exc)
-                totals["failed"].append(f"{tk} (fetch)")
-                continue
-            if raw is None or raw.empty:
-                log.warning("  %s: empty chain", tk)
-                totals["failed"].append(f"{tk} (empty)")
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                kind, tk = pending.pop(fut)
+
+                if kind == "fetch":
+                    n_fetched += 1
+                    try:
+                        tk, raw, captured_at, secs = fut.result()
+                    except Exception as exc:                  # noqa: BLE001
+                        # fetch_guarded released its own permit before
+                        # re-raising, so the parent must NOT release here —
+                        # doing so would over-count the semaphore and let the
+                        # resident-frame bound drift upward over a run.
+                        log.warning("  %s: fetch FAILED — %s: %s", tk,
+                                    type(exc).__name__, exc)
+                        totals["failed"].append(f"{tk} (fetch)")
+                        continue
+                    if raw is None or raw.empty:
+                        log.warning("  %s: empty chain", tk)
+                        totals["failed"].append(f"{tk} (empty)")
+                        slots.release()
+                        continue
+
+                    # trade_date from the VENDOR's own quote stamp, not the
+                    # wall clock. Outside the session the snapshot endpoint
+                    # returns the previous close, and stamping that with
+                    # today's date would file stale quotes under a session that
+                    # has not happened.
+                    vend = pd.to_datetime(raw["timestamp"],
+                                          errors="coerce").max()
+                    trade_date = (vend.date() if pd.notna(vend)
+                                  else captured_at.date())
+                    if trade_date != captured_at.date():
+                        log.warning("  %s: STALE — vendor stamp is %s but "
+                                    "today is %s. Quotes are from a previous "
+                                    "session; the bucket label is wall-clock "
+                                    "and will not match.",
+                                    tk, trade_date, captured_at.date())
+                    snapshot = grid_bucket(captured_at)
+                    totals["captures"].append((tk, captured_at, secs,
+                                               trade_date))
+
+                    f = fitpool.submit(fit_one,
+                                       (tk, raw, trade_date, snapshot,
+                                        captured_at, persist))
+                    pending[f] = ("fit", tk)
+                    del raw    # drop the parent's reference; pickle is queued
+                    continue
+
+                # --- fit completion: this is where the permit comes back ----
+                n_fitted += 1
                 slots.release()
-                continue
+                try:
+                    got = fut.result()
+                except Exception as exc:                      # noqa: BLE001
+                    log.error("  %s: worker died — %s: %s", tk,
+                              type(exc).__name__, exc)
+                    totals["failed"].append(f"{tk} (worker)")
+                    continue
 
-            # trade_date from the VENDOR's own quote stamp, not the wall clock.
-            # Outside the session the snapshot endpoint returns the previous
-            # close, and stamping that with today's date would file stale
-            # quotes under a session that has not happened.
-            vend = pd.to_datetime(raw["timestamp"], errors="coerce").max()
-            trade_date = (vend.date() if pd.notna(vend) else captured_at.date())
-            if trade_date != captured_at.date():
-                # The endpoint served a previous session. Filing it under the
-                # vendor's date keeps it honest, but the grid bucket comes from
-                # the wall clock, so the pair only agrees during a live
-                # session. Loud, because in normal operation it cannot happen.
-                log.warning("  %s: STALE — vendor stamp is %s but today is %s. "
-                            "Quotes are from a previous session; the bucket "
-                            "label is wall-clock and will not match.",
-                            tk, trade_date, captured_at.date())
-            snapshot = grid_bucket(captured_at)
-            totals["captures"].append((tk, captured_at, secs, trade_date))
+                # Archive accounting BEFORE the fit check: a cycle whose fit
+                # failed may still have persisted its raw frame, and that copy
+                # is exactly what a later re-fit needs.
+                totals["persist_bytes"] += got.get("persist_bytes", 0)
+                totals["persist_secs"] += got.get("persist_secs", 0.0)
+                if got.get("persist_error"):
+                    # Logged, never fatal — Postgres is the primary output.
+                    log.warning("  %s: parquet archive FAILED — %s", tk,
+                                got["persist_error"])
+                    totals["persist_failed"].append(tk)
 
-            f = fitpool.submit(fit_one,
-                               (tk, raw, trade_date, snapshot, captured_at,
-                                persist))
-            fit_futs[f] = tk
-            del raw          # drop the parent's reference; the pickle is queued
+                if got["error"]:
+                    log.warning("  %s: %s", tk, got["error"])
+                    totals["failed"].append(f"{tk} (fit)")
+                    continue
+                try:
+                    written = write_snapshot(conn, got, got["trade_date"])
+                except Exception as exc:                      # noqa: BLE001
+                    conn.rollback()
+                    log.error("  %s: WRITE FAILED — %s: %s", tk,
+                              type(exc).__name__, exc)
+                    totals["failed"].append(f"{tk} (write)")
+                    continue
+                for k in ("surface", "atm", "diagnostics"):
+                    totals[k] += written[k]
+                totals["tickers"] += 1
 
-        for fut in as_completed(fit_futs):
-            tk = fit_futs[fut]
-            slots.release()
-            try:
-                got = fut.result()
-            except Exception as exc:                          # noqa: BLE001
-                log.error("  %s: worker died — %s: %s", tk,
-                          type(exc).__name__, exc)
-                totals["failed"].append(f"{tk} (worker)")
-                continue
-            # Archive accounting BEFORE the fit check: a cycle whose fit
-            # failed may still have persisted its raw frame, and that copy is
-            # exactly what a later re-fit needs.
-            totals["persist_bytes"] += got.get("persist_bytes", 0)
-            totals["persist_secs"] += got.get("persist_secs", 0.0)
-            if got.get("persist_error"):
-                # Logged, never fatal — Postgres is the primary output.
-                log.warning("  %s: parquet archive FAILED — %s", tk,
-                            got["persist_error"])
-                totals["persist_failed"].append(tk)
-
-            if got["error"]:
-                log.warning("  %s: %s", tk, got["error"])
-                totals["failed"].append(f"{tk} (fit)")
-                continue
-            try:
-                written = write_snapshot(conn, got, got["trade_date"])
-            except Exception as exc:                          # noqa: BLE001
-                conn.rollback()
-                log.error("  %s: WRITE FAILED — %s: %s", tk,
-                          type(exc).__name__, exc)
-                totals["failed"].append(f"{tk} (write)")
-                continue
-            for k in ("surface", "atm", "diagnostics"):
-                totals[k] += written[k]
-            totals["tickers"] += 1
+            # Progress, flushed as it happens. The log was empty after six
+            # minutes of the deadlocked run because the parent logged nothing
+            # until its result loop — which never ran — so a hang produced no
+            # evidence at all and needed py-spy to see. A periodic line means
+            # the next stall shows where it stopped and how far it got.
+            if n_fetched and (n_fetched % PROGRESS_EVERY == 0
+                              or not pending):
+                log.info("  progress: fetched %d/%d, fitted %d/%d, "
+                         "%d future(s) outstanding",
+                         n_fetched, n_total, n_fitted, n_total, len(pending))
+                flush_log()
     return totals
 
 
