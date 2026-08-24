@@ -58,6 +58,18 @@ _default_chain_intraday_dir = CHAIN_EOD_DIR.parent / "chain_intraday"
 CHAIN_INTRADAY_DIR          = Path(os.environ.get("CHAIN_INTRADAY_DIR",
                                                   str(_default_chain_intraday_dir))).resolve()
 
+# --- Parquet store for live 5-minute chain captures --------------------------
+# A THIRD explicit entry, not derived from the two above. chain_live holds
+# near-identical content to chain_intraday (78 live captures accumulate the
+# same 78 bars per contract-day) but is written by a different process, in a
+# different file shape, and is incomplete by nature. Deriving its root from
+# either sibling would invite them to share a tree, which is the one thing a
+# future reader must never have to disambiguate. Set CHAIN_LIVE_DIR in .env;
+# the fallback only keeps local development from crashing.
+_default_chain_live_dir = CHAIN_INTRADAY_DIR.parent / "chain_live"
+CHAIN_LIVE_DIR          = Path(os.environ.get("CHAIN_LIVE_DIR",
+                                              str(_default_chain_live_dir))).resolve()
+
 # --- Parquet store for 1-minute equity bars (Polygon/Massive) ---------------
 # Same sibling-of-chain_eod derivation as the two stores above, for the same
 # reason: PROJECT_ROOT is not where bulk data lives on the VPS.

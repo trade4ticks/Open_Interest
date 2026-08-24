@@ -3,7 +3,15 @@ fetch_live_surface.py — live intraday surface, every 5 minutes.
 
 Captures the current chain for every ticker, fits the surface and writes to
 Postgres so a dashboard can read current skew across the universe during the
-session. Writes NOTHING to disk: fetch, clean, fit, write, discard.
+session.
+
+The raw frame is ALSO archived to parquet (lib/chain_live_store.py), one file
+per capture cycle, written pre-clean_chain. Not for the dashboard — for
+re-fits. Three fixes to the fit are queued and each needs re-surfacing;
+refetching a 5-minute session per-expiration is ~4,100 requests against a 2-3
+connection budget, hours per ticker-day. Without the archive a fit change
+simply cannot be applied to live-captured data. Postgres remains the primary
+output: an archive failure is logged and the cycle continues.
 
     /v3/option/snapshot/greeks/first_order  with  expiration=*
 
@@ -15,9 +23,10 @@ backfill path.
 --- Why this is a separate script -----------------------------------------
 
 fetch_chain_intraday finalizes one parquet per ticker-session and nothing can
-read that file while it runs, so it cannot serve a live path. Going through
-disk is what creates finalization, partial-session semantics and the
-fetcher/reader handoff. None of that exists here because nothing is written.
+read that file while it runs, so it cannot serve a live path. This script
+writes one COMPLETE file per cycle instead, into a separate store — so a
+capture is readable the moment it lands, and the two writers never share a
+directory. See lib/chain_live_store.py for why that separation matters.
 
 --- Why fetching happens in the PARENT ------------------------------------
 
@@ -193,10 +202,11 @@ def fit_one(args) -> dict:
     from lib.clean_chain import clean_chain
     from lib.surface_fit import build_snapshot
 
-    ticker, raw, trade_date, snapshot, captured_at = args
+    ticker, raw, trade_date, snapshot, captured_at, persist = args
     out = {"ticker": ticker, "snapshot": snapshot, "captured_at": captured_at,
            "trade_date": trade_date, "surface": [], "atm": [],
-           "diagnostics": [], "error": None, "n_rows": 0, "n_exp": 0}
+           "diagnostics": [], "error": None, "n_rows": 0, "n_exp": 0,
+           "persist_error": None, "persist_bytes": 0, "persist_secs": 0.0}
     try:
         df = project(raw, ticker, trade_date, snapshot)
         if df.empty:
@@ -204,6 +214,25 @@ def fit_one(args) -> dict:
             return out
         out["n_rows"] = len(df)
         out["n_exp"] = int(df["expiration"].nunique())
+
+        # Persist BEFORE clean_chain. Everything clean_chain adds is derived
+        # from these columns, so archiving pre-clean keeps a change to the
+        # cleaning rules replayable; archiving post-clean would freeze one
+        # version of those rules into the store.
+        #
+        # The Postgres rows are the primary output, so a parquet failure is
+        # recorded and returned for the parent to log — never raised. Losing
+        # an archive copy must not cost a surface.
+        if persist:
+            import time as _time
+            try:
+                from lib.chain_live_store import write_cycle
+                _t0 = _time.perf_counter()
+                _, nbytes = write_cycle(ticker, trade_date, snapshot, df)
+                out["persist_secs"] = _time.perf_counter() - _t0
+                out["persist_bytes"] = nbytes
+            except Exception as exc:                          # noqa: BLE001
+                out["persist_error"] = f"{type(exc).__name__}: {exc}"
         res = build_snapshot(clean_chain(df), ticker, trade_date, snapshot)
         for key in ("surface", "atm", "diagnostics"):
             rows = res[key]
@@ -220,14 +249,15 @@ def fit_one(args) -> dict:
 # --- Cycle ------------------------------------------------------------------
 
 def run_cycle(conn, tickers: list, connections: int, workers: int,
-              max_inflight: int) -> dict:
+              max_inflight: int, persist: bool = True) -> dict:
     """One capture pass over the universe."""
     from lib.surface_store import write_snapshot
     from lib.thetadata import fetch_first_order_snapshot, set_max_connections
 
     set_max_connections(connections)
     totals = {"tickers": 0, "surface": 0, "atm": 0, "diagnostics": 0,
-              "failed": [], "captures": []}
+              "failed": [], "captures": [],
+              "persist_bytes": 0, "persist_secs": 0.0, "persist_failed": []}
 
     def fetch(tk: str):
         t0 = time.monotonic()
@@ -286,7 +316,8 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
             totals["captures"].append((tk, captured_at, secs, trade_date))
 
             f = fitpool.submit(fit_one,
-                               (tk, raw, trade_date, snapshot, captured_at))
+                               (tk, raw, trade_date, snapshot, captured_at,
+                                persist))
             fit_futs[f] = tk
             del raw          # drop the parent's reference; the pickle is queued
 
@@ -300,6 +331,17 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
                           type(exc).__name__, exc)
                 totals["failed"].append(f"{tk} (worker)")
                 continue
+            # Archive accounting BEFORE the fit check: a cycle whose fit
+            # failed may still have persisted its raw frame, and that copy is
+            # exactly what a later re-fit needs.
+            totals["persist_bytes"] += got.get("persist_bytes", 0)
+            totals["persist_secs"] += got.get("persist_secs", 0.0)
+            if got.get("persist_error"):
+                # Logged, never fatal — Postgres is the primary output.
+                log.warning("  %s: parquet archive FAILED — %s", tk,
+                            got["persist_error"])
+                totals["persist_failed"].append(tk)
+
             if got["error"]:
                 log.warning("  %s: %s", tk, got["error"])
                 totals["failed"].append(f"{tk} (fit)")
@@ -334,6 +376,10 @@ def main() -> int:
                          f"core count because Postgres shares the cores)")
     ap.add_argument("--max-inflight", type=int, default=DEFAULT_MAX_INFLIGHT,
                     help="raw frames resident at once (memory bound)")
+    ap.add_argument("--no-persist", action="store_true",
+                    help=("skip the parquet archive. The Postgres rows are "
+                          "unaffected; only the ability to re-fit this cycle "
+                          "later is given up."))
     ap.add_argument("--force", action="store_true",
                     help="run outside the market window. The snapshot endpoint "
                          "returns the PREVIOUS CLOSE when the market is shut, "
@@ -380,13 +426,24 @@ def main() -> int:
     t0 = time.monotonic()
     with get_connection() as conn:
         totals = run_cycle(conn, tickers, args.connections, workers,
-                           args.max_inflight)
+                           args.max_inflight, persist=not args.no_persist)
     wall = time.monotonic() - t0
 
     caps = totals["captures"]
     print(f"\n{totals['tickers']}/{len(tickers)} ticker(s) in {wall:.0f}s")
     print(f"  equity_surface  {totals['surface']:>8,} rows")
     print(f"  equity_atm      {totals['atm']:>8,} rows")
+    if not args.no_persist:
+        mb = totals["persist_bytes"] / 1e6
+        # persist_secs is summed ACROSS worker processes, so it overlaps the
+        # fit rather than adding to the cycle. Reported as the serial total
+        # with the per-cycle share the parent actually waited for.
+        print(f"  parquet archive {mb:>8.1f} MB  "
+              f"({totals['persist_secs']:.1f}s across {workers} worker(s) "
+              f"~= {totals['persist_secs'] / max(workers, 1):.1f}s of wall)")
+        if totals["persist_failed"]:
+            print(f"  archive FAILED  {len(totals['persist_failed'])} ticker(s): "
+                  f"{', '.join(totals['persist_failed'][:8])}")
     if caps:
         stamps = sorted(c[1] for c in caps)
         spread = (stamps[-1] - stamps[0]).total_seconds()

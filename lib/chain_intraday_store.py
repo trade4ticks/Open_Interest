@@ -106,6 +106,10 @@ _SCHEMA = pa.schema([
 
 COLUMNS = [f.name for f in _SCHEMA]
 
+# Public alias. lib/chain_live_store.py holds the same 20 columns and imports
+# this rather than redeclaring them, so the two stores cannot drift apart.
+SCHEMA = _SCHEMA
+
 _FLOAT_COLS = [
     "strike", "bid", "ask", "delta", "theta", "vega", "rho", "epsilon",
     "lambda", "implied_vol", "iv_error", "underlying_price",
