@@ -41,6 +41,12 @@ CHAIN_EOD_DIR      = Path(os.environ.get("CHAIN_EOD_DIR", str(_default_chain_dir
 # defaults above are never what production actually uses.  Deriving from
 # CHAIN_EOD_DIR.parent means this store follows chain_eod wherever .env puts
 # it and cannot drift into the project tree if the .env entry is missing.
+#
+# The sibling derivation is now only the FALLBACK: production sets
+# CHAIN_SNAPSHOTS_DIR and CHAIN_INTRADAY_DIR explicitly, both on the dedicated
+# chain volume, so neither is a sibling of chain_eod any more.  Treat the
+# resolved value as the only source of truth — the fetchers print it in
+# preflight — and do not infer a location from these defaults.
 _default_chain_snap_dir = CHAIN_EOD_DIR.parent / "chain_snapshots"
 CHAIN_SNAPSHOTS_DIR     = Path(os.environ.get("CHAIN_SNAPSHOTS_DIR",
                                               str(_default_chain_snap_dir))).resolve()

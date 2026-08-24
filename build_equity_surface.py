@@ -13,9 +13,10 @@ that module adds mid_price, spread, moneyness, gamma, dte and the flag_*
 columns this stage filters on. clean_chain does no file I/O, so reading the
 parquet is this script's job.
 
-Sources:
-    snapshots (default)  /data/chain_snapshots/<TICKER>/<YYYY>.parquet
-    intraday             /mnt/trading_volume_3/chain_intraday/<TICKER>/<YYYYMMDD>.parquet
+Sources (roots resolve from config.py, set in .env — do not assume a literal
+path here, both stores have already moved once):
+    snapshots (default)  {CHAIN_SNAPSHOTS_DIR}/<TICKER>/<YYYY>.parquet
+    intraday             {CHAIN_INTRADAY_DIR}/<TICKER>/<YYYYMMDD>.parquet
 
 Both share one 20-column schema, so there is no per-store branching beyond
 locating the files. A single file holds many expirations AND many snapshots,

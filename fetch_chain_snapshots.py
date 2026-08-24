@@ -7,8 +7,11 @@ first-order greek set, implied_vol, iv_error, and the underlying price at the
 snapshot instant.  09:45 and 15:45 are used deliberately in place of 09:30 and
 16:00, which are unreliable.
 
-Writes to data/chain_snapshots/{ticker}/{year}.parquet — a sibling of
-data/chain_eod/, created automatically on first write.
+Writes to {CHAIN_SNAPSHOTS_DIR}/{ticker}/{year}.parquet, created automatically
+on first write.  The root resolves in config.py from CHAIN_SNAPSHOTS_DIR in
+.env; it falls back to a sibling of CHAIN_EOD_DIR only when that is unset, so
+do not read a literal path from here — production sets it explicitly and the
+store has already moved once.  The run prints the resolved path in preflight.
 
 SCOPE: fetch-and-store only.  This script does not repoint any metric
 calculation and is not wired into cron.  Those are separate deliberate steps,
