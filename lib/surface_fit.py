@@ -47,7 +47,8 @@ from lib.surface_config import (
     DELTA_SOLVER_K_BOUNDS, DIRECT_EXPIRY_MATCH, DIRECT_EXPIRY_TOL_DAYS,
     FIXED_KNOT_SPLINE,
     DELTA_SOLVER_XTOL, FALLBACK_MAX_T_GAP, MAX_IV, MAX_SPREAD_RATIO, MIN_BID,
-    SPLINE_MIN_KNOTS, SPLINE_MIN_PTS_PER_KNOT, SPLINE_TARGET_KNOTS,
+    SPLINE_MIN_KNOTS, SPLINE_MIN_PTS_PER_KNOT, SPLINE_POINTS_PER_KNOT,
+    SPLINE_TARGET_KNOTS,
     MIN_IV, MIN_OPTION_PRICE, MIN_STRIKES_FOR_FIT, MINUTES_PER_YEAR,
     NARROW_DOMAIN_MAX_EXCLUDED_FRAC, NARROW_DOMAIN_RATIO,
     NOISE_FLOOR, PCP_MONEYNESS_BAND, PM_EXPIRY_HOUR, PM_EXPIRY_MINUTE,
@@ -382,7 +383,17 @@ def _fit_fixed_knot(k, w, noise):
     if n < MIN_STRIKES_FOR_FIT:
         return None
 
-    for n_knots in range(SPLINE_TARGET_KNOTS, SPLINE_MIN_KNOTS - 1, -1):
+    # Knot count scales with POINT COUNT, capped at the target. A fixed count
+    # over a sparse expiry leaves ~2 points per interval, and a least-squares
+    # spline has no smoothing penalty to hold that together — it very nearly
+    # interpolates and wiggles, which Durrleman then rejects. Returning None
+    # routes those to the smoothing spline, whose s = n penalty is exactly what
+    # a sparse chain needs.
+    n_start = min(SPLINE_TARGET_KNOTS, n // SPLINE_POINTS_PER_KNOT)
+    if n_start < SPLINE_MIN_KNOTS:
+        return None
+
+    for n_knots in range(n_start, SPLINE_MIN_KNOTS - 1, -1):
         # Interior knots only — the boundary knots are implied by the data
         # range, and LSQUnivariateSpline requires t[0] > k[0], t[-1] < k[-1].
         grid = np.linspace(k[0], k[-1], n_knots + 2)[1:-1]

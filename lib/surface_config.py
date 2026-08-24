@@ -136,8 +136,36 @@ CBOE_FORWARD = True
 # Knots on a fixed grid bound w'' by construction and make the flag rate
 # independent of density. 12 knots is the middle of the 10-15 range: enough for
 # a smile plus one wing kink, few enough that noise cannot be tracked.
-FIXED_KNOT_SPLINE = True
+# DEFAULT OFF. The first real-chain verification made this WORSE, not better:
+# SPY 12/33 -> 21/33 butterfly flags, ADBE 1/21 -> 14/21, AAPL unchanged. The
+# cause is not too few knots, which was the initial reading — it is too many
+# knots RELATIVE TO POINT COUNT on sparse expiries. A fixed 12 knots over a
+# 24-point LEAP leaves ~2 points per interval, so a least-squares spline with
+# no smoothing penalty very nearly interpolates and wiggles; the smoothing
+# spline's s = n penalty is what had been holding those together. ADBE and SPY
+# carry many long-dated sparse expiries, AAPL fewer, which is exactly the
+# observed ordering.
+#
+# Scaling the knot count to n and falling back to the smoothing spline when
+# there is not enough data fixes it in simulation across five regimes:
+#
+#     case                  smoothing   ppk=10   knots
+#     12v   7DTE n=120           0%       0%      12
+#     25v  21DTE n=80            2%       0%       8
+#     30v  90DTE n=45            9%       0%       4
+#     30v 500DTE n=24            5%       5%   fallback
+#     35v 700DTE n=16            5%       5%   fallback
+#
+# Better where dense, never worse where sparse. But that is SIMULATION, on a
+# synthetic dense-ATM/sparse-wing ladder, and the first synthetic for this fix
+# was already shown to have no signal against real chains. Stays off until
+# `verify_surface_fixes.py --sweep-knots` has been run on real ADBE and SPY.
+FIXED_KNOT_SPLINE = False
 SPLINE_TARGET_KNOTS = 12
+# Minimum quotes per knot. The knot count is min(TARGET, n // this), so density
+# sets how much curvature the fit may express and sparse expiries route to the
+# smoothing spline instead of being force-fitted.
+SPLINE_POINTS_PER_KNOT = 10
 # Below this many interior knots the fit is too coarse to be worth forcing;
 # fall back to the smoothing spline rather than fit a near-parabola.
 SPLINE_MIN_KNOTS = 4
