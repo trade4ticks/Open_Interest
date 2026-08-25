@@ -22,9 +22,40 @@ lookahead into vrp_30d — the exact bias that makes a variance-premium backtest
 look excellent and live trading not. This mirrors the knowledge-at-time rule
 the daily_features data dictionary states for the OI block.
 
-The IV-history windows (vov, spotvol) are snapshot-aligned instead: they pull
-the SAME snapshot value on prior trading days, which is knowable by
-construction and keeps like compared with like.
+WHICH COLUMNS ARE DAILY, AND WHY THEY ALL CARRY FORWARD
+-------------------------------------------------------
+Three of the families here are functions of a DAILY history window and the
+trade_date, with no dependence on which 5-minute bucket the row is stamped
+with. They therefore take ONE value per session and repeat across every bucket
+in it. That is correct, not a defect: a 21-day rolling statistic is a property
+of the ticker, and storing NULL at 12:15 would assert "unknown" for something
+that is known and unchanged since the last close.
+
+    _realized   log_ret_*, rv_*, rv_park_*, rv_gk_*, vrp_*, vrp_ratio_*,
+                downside_semivol_1m      — daily OHLC, closes through T-1
+    _spot_vol   vov_30d_1m, spotvol_beta_*, spotvol_r2_*
+                                         — the daily BASELINE ATM IV series
+    _calendar   day_of_week, days_to_monthly_opex, days_to_earnings
+                                         — pure functions of trade_date
+
+_spot_vol was the odd one out until 2026-08-25: it read history at the ROW'S
+OWN snapshot, so the regression could only ever fill at a bucket with months of
+its own history. Every spot-vol column was NULL at every intraday bucket —
+121/121 tickers at 1545 on 2026-08-24, 0/121 everywhere else — while rv_* beside
+it carried forward correctly and vrp_* worked intraday because of it. The three
+families now share one rule.
+
+The two daily families have DIFFERENT as-of dates, which is why neither carries
+a marker column recording one:
+
+    OHLC        closes through T-1 at every bucket, 1545 included — T's close
+                has not happened even at 15:45.
+    baseline IV through T at the baseline bucket (that row IS T's daily
+                observation), through T-1 at every other bucket (T's daily
+                observation has not happened yet at 12:15).
+
+Both are derivable from trade_date and snapshot by the rules above. See the
+catalog description of any spotvol column.
 
 ONE DELIBERATE DEPARTURE FROM THE SPEC, FLAGGED
 -----------------------------------------------
@@ -35,10 +66,16 @@ relationship the metric exists to measure ("a 1% drop lifts ATM IV by 1.8
 points") is not what gets estimated, and it is also unknowable at an intraday
 snapshot without lookahead.
 
-So the regressor here is the snapshot-aligned underlying return from
-equity_atm.underlying_price: same snapshot, same pair of days, same instant as
-the IV it is paired with. `log_ret_d` is still stored exactly as specified, as
-its own column. Change this back only with the misalignment in mind.
+So the regressor here is the underlying return from
+equity_atm.underlying_price on the SAME baseline series as the IV it is paired
+with: same bucket, same pair of days, same instant. `log_ret_d` is still stored
+exactly as specified, as its own column. Change this back only with the
+misalignment in mind.
+
+(Before 2026-08-25 "same bucket" meant the row's own snapshot; it now means the
+baseline bucket for every row. The pairing property that matters — return and
+IV change read at the same instant — is unchanged, and it is why the regressor
+cannot simply be swapped for the OHLC close-to-close return.)
 """
 from __future__ import annotations
 
@@ -48,7 +85,8 @@ from datetime import date, timedelta
 
 from lib.earnings_store import days_to_earnings
 from lib.metrics_config import (
-    CONVEX_TRIPLES, DAYS_PER_YEAR, DELTA_COORD, DELTA_LABELS, DELTA_NODE,
+    BASELINE_SNAPSHOT, CONVEX_TRIPLES, DAYS_PER_YEAR, DELTA_COORD,
+    DELTA_LABELS, DELTA_NODE,
     MIN_LOG_STRIKE_GAP, RATIO_LONG_NODE, RET_WINDOWS, RR_NODES, RV_WINDOWS,
     SKEW_PAIRS, SPOTVOL_WINDOWS, TENORS, TERM_PAIRS, TERM_SLOPE_DELTAS,
     TRADING_DAYS_PER_YEAR, VOV_WINDOW, WING_NODE,
@@ -153,7 +191,7 @@ def _interp_node(nodes: dict, target: float, field: str):
 # Loading
 # =============================================================================
 class HistoryCache:
-    """Per-ticker OHLC and snapshot-aligned IV history, loaded once.
+    """Per-ticker OHLC, daily-baseline IV and earnings history, loaded once.
 
     A backfill over a year of dates would otherwise re-issue the same 252-row
     lookback query per date. Full history per ticker is a few thousand rows;
@@ -195,20 +233,39 @@ class HistoryCache:
                      "l": _f(r[3]), "c": _f(r[4])} for r in cur.fetchall()]
         return self._ohlc[ticker]
 
-    def iv_history(self, ticker: str, snapshot: str) -> list:
-        """30d ATM IV and the underlying, at the same snapshot, by date."""
-        key = (ticker, snapshot)
-        if key not in self._iv:
+    def daily_iv_history(self, ticker: str) -> list:
+        """30d ATM IV and the underlying at the DAILY BASELINE bucket, by date.
+
+        Deliberately not parameterised by snapshot. It used to be, and that made
+        every spot-vol column NULL at every intraday bucket: the regression
+        needs ~21 paired observations at the SAME snapshot, and only the
+        long-running buckets have that history — the 5-minute grid has days.
+        Observed 2026-08-24: 121/121 tickers populated at 1545, 0/121
+        everywhere else.
+
+        The premise was wrong rather than the query. A 21-day rolling
+        regression is a property of the ticker, not an observation of this
+        5-minute bucket; its value at 12:15 is the value from the most recent
+        daily close, and a NULL there asserts "unknown" for something that is
+        known and unchanged. rv_{t}d has always behaved this way — one value per
+        session, off daily closes — which is why vrp_{t}d works intraday and
+        this did not.
+
+        Taking the parameter away rather than passing BASELINE_SNAPSHOT at the
+        call site is the point: the bug was a plausible-looking argument, so the
+        fix is to make it unavailable.
+        """
+        if ticker not in self._iv:
             with self.conn.cursor() as cur:
                 cur.execute(
                     "SELECT trade_date, atm_iv, underlying_price "
                     "FROM equity_atm "
                     "WHERE ticker = %s AND snapshot = %s AND dte = 30 "
-                    "ORDER BY trade_date", (ticker, snapshot))
-                self._iv[key] = [
+                    "ORDER BY trade_date", (ticker, BASELINE_SNAPSHOT))
+                self._iv[ticker] = [
                     {"d": r[0], "iv": _f(r[1]), "s": _f(r[2])}
                     for r in cur.fetchall()]
-        return self._iv[key]
+        return self._iv[ticker]
 
     def invalidate(self, ticker: str | None = None) -> None:
         """Drop cached history. The live path calls this after writing a new
@@ -218,8 +275,7 @@ class HistoryCache:
             self._iv.clear()
             return
         self._ohlc.pop(ticker, None)
-        for k in [k for k in self._iv if k[0] == ticker]:
-            self._iv.pop(k, None)
+        self._iv.pop(ticker, None)
 
 
 def _load_snapshot(conn, ticker, trade_date, snapshot) -> dict:
@@ -570,19 +626,40 @@ def _garman_klass(bars: list):
     return _f(math.sqrt(mean) * _SQRT_252) if mean >= 0 else None
 
 
-def _spot_vol(iv_hist: list, trade_date) -> dict:
-    """vov and the spot-vol regression, both snapshot-aligned.
+def _spot_vol(iv_hist: list, trade_date, snapshot: str) -> dict:
+    """vov and the spot-vol regression, off the DAILY BASELINE series.
 
-    History is inclusive of trade_date — the snapshot's own row is already in
-    equity_atm by the time this stage runs, and excluding it would make every
-    reading a day stale.
+    Both are 21/63-day rolling statistics of a daily series, so they take one
+    value per session and carry across every bucket in it — the same shape as
+    rv_{t}d, which is computed from daily closes and is identical at 09:45 and
+    at 15:45. See HistoryCache.daily_iv_history for why they used to be
+    snapshot-aligned and why that was wrong.
+
+    THE CUTOFF IS THE WHOLE AS-OF ARGUMENT, so it is spelled out:
+
+      at the baseline bucket   history is INCLUSIVE of trade_date. This row IS
+                               the daily observation for T; excluding it would
+                               make the close-of-day reading a day stale.
+      at any other bucket      history STOPS AT T-1. At 12:15 the day's
+                               baseline observation has not happened, so the
+                               most recent completed one is T-1's.
+
+    The second half is not merely a nicety. On a live cycle T's baseline row
+    does not exist yet, so an inclusive filter would happen to be correct; but
+    on a REBUILD every bucket of T already exists, and an inclusive filter would
+    hand a 09:45 row the 15:45 value from six hours in its future. Backfilled
+    and live rows would then disagree on the same key, and the backfilled ones
+    would look better. That is the lookahead the module docstring is about.
     """
     row = {"vov_30d_1m": None}
     for lbl, _n in SPOTVOL_WINDOWS:
         row[f"spotvol_beta_{lbl}"] = None
         row[f"spotvol_r2_{lbl}"] = None
 
-    hist = [h for h in iv_hist if h["d"] <= trade_date]
+    if snapshot == BASELINE_SNAPSHOT:
+        hist = [h for h in iv_hist if h["d"] <= trade_date]
+    else:
+        hist = [h for h in iv_hist if h["d"] < trade_date]
     d_iv, d_spot = [], []
     for prev, cur in zip(hist[:-1], hist[1:]):
         gap = (cur["d"] - prev["d"]).days
@@ -689,7 +766,8 @@ def compute_metrics(conn, ticker: str, trade_date, snapshot: str,
     row.update(_term(iv))
     row.update(_structure(snap, iv, level.get("spot")))
     row.update(_realized(cache.ohlc(ticker), trade_date, iv))
-    row.update(_spot_vol(cache.iv_history(ticker, snapshot), trade_date))
+    row.update(_spot_vol(cache.daily_iv_history(ticker), trade_date,
+                         snapshot))
     row.update(_quality(snap, extrap))
     row.update(_calendar(trade_date, cache.earnings(ticker)))
     return row

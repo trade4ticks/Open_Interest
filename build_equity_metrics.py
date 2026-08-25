@@ -79,9 +79,11 @@ def run_for_snapshot(conn, ticker: str, trade_date, snapshot: str,
     that has 120 good ones.
 
     A caller that holds a HistoryCache across cycles must invalidate(ticker)
-    after each write — the cache holds the snapshot-aligned IV series, and the
-    row just written is part of the next lookback. Passing None (the default)
-    builds a fresh cache and is always correct.
+    after each write — the cache holds the daily-baseline IV series, and a row
+    just written AT THE BASELINE BUCKET is part of the next lookback. Writes at
+    any other bucket no longer affect it, since spot-vol stopped reading the
+    row's own snapshot; invalidating on every write is still the safe default.
+    Passing None (the default) builds a fresh cache and is always correct.
     """
     row = compute_metrics(conn, ticker, trade_date, snapshot, cache=cache)
     if row is None:

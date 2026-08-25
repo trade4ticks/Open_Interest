@@ -390,26 +390,52 @@ for _lbl, _n, _tenor in RV_WINDOWS:
              f"{_tenor} calendar days -> {_n} trading days",
              tenor=_tenor, wing="atm"))
 
+# --- Spot-vol: DAILY quantities, repeated across the session ----------------
+# Every column below is a rolling statistic of the DAILY baseline ATM IV series.
+# It takes one value per session and is identical at every 5-minute bucket in
+# it — the same shape as rv_{t}d, and for the same reason: a 21-day rolling
+# regression is a property of the ticker, not an observation of this bucket.
+#
+# Until 2026-08-25 they were computed from the ROW'S OWN snapshot's history,
+# which meant the regression could only fill at a bucket that already had months
+# of itself. Every one of these was NULL at every intraday bucket.
+_DAILY_ASOF = (
+    "DAILY QUANTITY, CARRIED ACROSS THE SESSION: computed from the "
+    f"{BASELINE_SNAPSHOT} daily series, so it is identical at every snapshot on "
+    "a given trade_date rather than NULL away from the close. The as-of date is "
+    f"trade_date at {BASELINE_SNAPSHOT} — that row IS the day's daily "
+    "observation — and the PRIOR trading day at every other bucket, where the "
+    "day's observation has not happened yet. No column records this; it is a "
+    "rule over (trade_date, snapshot), and the OHLC-derived families carry the "
+    "same property with a different cutoff (closes through T-1 at every "
+    "bucket).")
+
 _add(Col("vov_30d_1m", "spot_vol",
          "DOUBLE PRECISION", "vol_decimal",
          "Vol of vol: annualised stdev of the daily change in 30d ATM IV over "
-         "21 trading days, snapshot-aligned.",
-         "stdev(diff(iv_30d_atm), ddof=1) over 21td * sqrt(252)",
+         f"21 trading days. {_DAILY_ASOF}",
+         "stdev(diff(iv_30d_atm at the daily baseline), ddof=1) over 21td "
+         "* sqrt(252)",
          tenor=30, wing="atm"))
 
 for _lbl, _n in SPOTVOL_WINDOWS:
     _add(Col(f"spotvol_beta_{_lbl}", "spot_vol", "DOUBLE PRECISION",
              "vol_per_log_return",
              f"Rolling OLS beta of the change in 30d ATM IV on the underlying "
-             f"log return, {_n}td, snapshot-aligned. Beta rather than "
-             f"correlation because it has magnitude: -1.8 says a 1% drop "
-             f"lifts ATM IV by 1.8 vol points, which is what sizes a short-vega "
-             f"position. A correlation of -0.7 does not.",
-             f"OLS slope of d(iv_30d_atm) on d(ln underlying_price) over {_n}td",
+             f"log return, {_n}td. Beta rather than correlation because it has "
+             f"magnitude: -1.8 says a 1% drop lifts ATM IV by 1.8 vol points, "
+             f"which is what sizes a short-vega position. A correlation of "
+             f"-0.7 does not. Both sides of the regression are read at the "
+             f"SAME instant on the same daily series — that pairing is the "
+             f"point, and is why the regressor is the baseline underlying "
+             f"return rather than log_ret_d, which is a day out of step. "
+             f"{_DAILY_ASOF}",
+             f"OLS slope of d(iv_30d_atm) on d(ln underlying_price) over "
+             f"{_n}td, both at the {BASELINE_SNAPSHOT} daily baseline",
              tenor=30, wing="atm"))
     _add(Col(f"spotvol_r2_{_lbl}", "spot_vol", "DOUBLE PRECISION", "ratio",
              f"R-squared of the {_lbl} spot-vol regression. A low-R2 beta is "
-             f"not a beta — read them together or not at all.",
+             f"not a beta — read them together or not at all. {_DAILY_ASOF}",
              "R^2 of the same regression", tenor=30, wing="atm"))
 
 _add(Col("downside_semivol_1m", "realized_vol", "DOUBLE PRECISION",

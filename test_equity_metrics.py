@@ -377,7 +377,7 @@ check("  at every tenor, not just the short one", z["vrp_ratio_21d"], None)
 check("no down days -> downside_semivol NULL", z["downside_semivol_1m"], None)
 
 
-print("\n=== 8. spot-vol regression, snapshot-aligned ===")
+print("\n=== 8. spot-vol regression, off the daily baseline ===")
 # iv moves at exactly -2x the underlying log return, so beta = -2, R2 = 1.
 pattern = [0.01, -0.02, 0.015, -0.005]
 ivh, s, ivv = [], 100.0, 0.30
@@ -387,7 +387,7 @@ for i in range(30):
     r = pattern[i % 4]
     s *= math.exp(r)
     ivv += -2.0 * r
-sv = C._spot_vol(ivh, ivh[-1]["d"])
+sv = C._spot_vol(ivh, ivh[-1]["d"], M.BASELINE_SNAPSHOT)
 close("spotvol_beta_1m recovers the planted -2.0", sv["spotvol_beta_1m"], -2.0,
       tol=1e-6)
 close("spotvol_r2_1m = 1 on an exact relation", sv["spotvol_r2_1m"], 1.0,
@@ -397,15 +397,33 @@ d_iv = [-2.0 * pattern[i % 4] for i in range(29)]
 mm = sum(d_iv[-21:]) / 21
 close("vov_30d_1m = stdev(d iv, 21) * sqrt(252)", sv["vov_30d_1m"],
       math.sqrt(sum((x - mm) ** 2 for x in d_iv[-21:]) / 20) * math.sqrt(252))
-short = C._spot_vol(ivh[:4], ivh[3]["d"])
+short = C._spot_vol(ivh[:4], ivh[3]["d"], M.BASELINE_SNAPSHOT)
 check("too little history -> beta NULL", short["spotvol_beta_1m"], None)
 check("  and vov NULL", short["vov_30d_1m"], None)
 # A hole in the snapshot history is not a one-day move.
 gapped = ivh[:10] + [{"d": ivh[9]["d"] + timedelta(days=40),
                       "iv": 9.9, "s": 500.0}] + ivh[10:]
-gv = C._spot_vol(gapped, gapped[-1]["d"])
+gv = C._spot_vol(gapped, gapped[-1]["d"], M.BASELINE_SNAPSHOT)
 check("a 40-day gap does not enter the regression as a daily move",
       abs(gv["spotvol_beta_1m"] - (-2.0)) < 1e-6, True)
+
+# THE AS-OF RULE. At the baseline bucket the row being computed IS the day's
+# daily observation and belongs inside its own window; at any other bucket that
+# observation has not happened yet, so the window stops at T-1. Without the
+# second half a REBUILD would hand a 09:45 row the 15:45 value from six hours
+# in its future, and backfilled rows would beat live ones on the same key.
+spiked = ivh + [{"d": ivh[-1]["d"] + timedelta(days=1), "iv": 9.9, "s": 500.0}]
+TDx = spiked[-1]["d"]
+at_close = C._spot_vol(spiked, TDx, M.BASELINE_SNAPSHOT)
+at_noon = C._spot_vol(spiked, TDx, "1215")
+check("the baseline bucket INCLUDES its own day's observation",
+      abs(at_close["spotvol_beta_1m"] - (-2.0)) > 1e-6, True)
+close("an intraday bucket stops at T-1, so it is unmoved by it",
+      at_noon["spotvol_beta_1m"], -2.0, tol=1e-6)
+check("  which is the same value the previous close carried",
+      abs(at_noon["spotvol_beta_1m"]
+          - C._spot_vol(ivh, ivh[-1]["d"], M.BASELINE_SNAPSHOT)
+          ["spotvol_beta_1m"]) < 1e-12, True)
 
 
 print("\n=== 9. quality ===")
@@ -528,8 +546,17 @@ class FakeCursor:
             self._rows = self.data["diag"]
         elif "underlying_ohlc" in sql:
             self._rows = self.data["ohlc"]
+        elif "earnings_calendar" in sql:
+            self._rows = [(d,) for d in self.data.get("earnings", [])]
         elif "dte = 30" in sql:
-            self._rows = self.data["ivhist"]
+            # Honours the snapshot argument on purpose. If compute ever goes
+            # back to asking for the row's own bucket, the thin history planted
+            # under a non-baseline key makes every spot-vol column NULL and
+            # section 12b fails — which is exactly how the bug reached
+            # production unnoticed.
+            snap = params[1] if params and len(params) > 1 else None
+            hist = self.data["ivhist"]
+            self._rows = hist if isinstance(hist, list) else hist.get(snap, [])
         elif "FROM equity_surface " in sql:
             self._rows = self.data["surface"]
         elif "FROM equity_atm" in sql:
@@ -592,6 +619,95 @@ check("every 60d column is NULL on a fixture that has only 30d",
 close("spot", row["spot"], 100.0)
 close("iv_30d_10p", row["iv_30d_10p"], 0.40)
 close("rr_30d_25", row["rr_30d_25"], 0.26 - 0.32)
+
+
+# =============================================================================
+print("\n=== 12b. daily-derived columns carry across the session ===")
+# A 21-day rolling statistic is a property of the ticker, not of a 5-minute
+# bucket. Every column below must hold the SAME value at 09:45 and at 15:45,
+# and must not go NULL away from the close.
+#
+# The IV history here is planted ONLY under the baseline bucket, with a stub
+# under 1215. That is what makes this a regression test rather than a
+# tautology: computing spot-vol from the row's own snapshot — as it did until
+# 2026-08-25 — sees two rows at 1215 and returns NULL for all five columns.
+
+ivdates = [date(2026, 5, 1) + timedelta(days=i) for i in range(40)]
+daily = {
+    "1545": [(d, 0.28 + 0.004 * ((i % 5) - 2), 100.0 + 0.6 * ((i % 7) - 3))
+             for i, d in enumerate(ivdates)],
+    # What an intraday bucket actually has: days of history, not months.
+    "1215": [(ivdates[-2], 0.281, 100.2), (ivdates[-1], 0.279, 99.8)],
+}
+ddata = {**data, "ivhist": daily,
+         "earnings": [date(2026, 6, 3), date(2026, 9, 2)]}
+
+TD = date(2026, 6, 15)
+close_row = C.compute_metrics(FakeConn(ddata), "SPY", TD, "1545")
+mid_row = C.compute_metrics(FakeConn(ddata), "SPY", TD, "1215")
+
+DAILY_FAMILIES = ("realized_vol", "vrp", "spot_vol", "calendar")
+daily_cols = [c.name for c in M.BASE_COLUMNS if c.family in DAILY_FAMILIES]
+check(f"{len(daily_cols)} columns claim to be daily-derived",
+      len(daily_cols) > 40, True)
+
+check("spotvol_beta_1m is populated at an INTRADAY bucket",
+      mid_row["spotvol_beta_1m"] is not None, True)
+check("  and spotvol_r2_1m", mid_row["spotvol_r2_1m"] is not None, True)
+check("  and vov_30d_1m", mid_row["vov_30d_1m"] is not None, True)
+check("  (it is a real regression, not a fabricated zero)",
+      abs(mid_row["spotvol_beta_1m"]) > 1e-9, True)
+
+check("days_to_earnings is populated at an INTRADAY bucket",
+      mid_row["days_to_earnings"], (date(2026, 9, 2) - TD).days)
+check("  and agrees with the close",
+      close_row["days_to_earnings"], mid_row["days_to_earnings"])
+
+check("rv_30d agrees across buckets (it always did)",
+      close_row["rv_30d"], mid_row["rv_30d"])
+check("vrp_30d agrees across buckets (and is a real number)",
+      close_row["vrp_30d"], mid_row["vrp_30d"])
+check("  (not two matching NULLs)", close_row["vrp_30d"] is not None, True)
+check("downside_semivol_1m agrees across buckets",
+      close_row["downside_semivol_1m"], mid_row["downside_semivol_1m"])
+check("log_ret_d agrees across buckets",
+      close_row["log_ret_d"], mid_row["log_ret_d"])
+
+# The one honest exception, and it is not carry-forward failing: the baseline
+# bucket's own row IS the day's daily observation, so it is inside its window
+# while 12:15 stops at T-1. Everything else in the family must match exactly.
+asof_sensitive = {"vov_30d_1m", "spotvol_beta_1m", "spotvol_beta_3m",
+                  "spotvol_r2_1m", "spotvol_r2_3m"}
+mismatch = [c for c in daily_cols
+            if c not in asof_sensitive and close_row[c] != mid_row[c]]
+check("every other daily column is IDENTICAL at 1215 and 1545", mismatch, [])
+check("no daily column is NULL intraday while set at the close",
+      [c for c in daily_cols
+       if close_row[c] is not None and mid_row[c] is None], [])
+
+# ...and the as-of rule itself. A wild value planted at trade_date's own close
+# must reach the 1545 row (that row IS the day's observation) and must NOT reach
+# 12:15 (where it has not happened yet). On a REBUILD every bucket of T already
+# exists, so without the second half a 09:45 row would be handed the 15:45 value
+# from six hours in its future.
+#
+# The plant sits one day after the last fixture observation, deliberately: at a
+# longer remove MAX_DIFF_GAP_DAYS drops the diff and the test would pass for the
+# wrong reason.
+TDX = ivdates[-1] + timedelta(days=1)
+spiked = {**daily, "1545": daily["1545"] + [(TDX, 0.99, 500.0)]}
+sdata = {**ddata, "ivhist": spiked}
+noon_x = C.compute_metrics(FakeConn(sdata), "SPY", TDX, "1215")
+close_x = C.compute_metrics(FakeConn(sdata), "SPY", TDX, "1545")
+plain_x = C.compute_metrics(FakeConn(ddata), "SPY", TDX, "1215")
+check("a value planted at trade_date's close does NOT reach the 1215 row",
+      noon_x["spotvol_beta_1m"], plain_x["spotvol_beta_1m"])
+check("  but it DOES reach the 1545 row — that row is the observation",
+      close_x["spotvol_beta_1m"] != noon_x["spotvol_beta_1m"], True)
+check("  and both are real values, so the difference is not None vs None",
+      noon_x["spotvol_beta_1m"] is not None
+      and close_x["spotvol_beta_1m"] is not None, True)
+
 
 
 print("\n=== 13. the registry itself ===")
