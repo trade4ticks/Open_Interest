@@ -20,12 +20,14 @@ rather than reimplemented.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 import re
 
 import psycopg2.extras
 
 from lib.metrics_config import (
     BASE_COLUMNS, BASE_NAMES, KEY_COLUMNS, Z_BASE_COLUMNS, Z_COLUMNS,
+    BASELINE_MIN_N, BASELINE_SNAPSHOT,
     Z_MIN_OBS, Z_NAMES, Z_WINDOWS, catalog_rows,
 )
 from lib.surface_store import _py
@@ -214,21 +216,29 @@ def write_zscores(conn, rows: list) -> int:
 _Z_BASES = [c.name for c in Z_BASE_COLUMNS]
 
 
-def zscore_row(window_by_col: dict, ticker, trade_date, snapshot) -> dict:
-    """Build one z row from {base_column: [oldest .. today]} slices.
+def zscore_row(window_by_col: dict, value_by_col: dict,
+               ticker, trade_date, snapshot) -> dict:
+    """One z row: each value measured against a window that EXCLUDES it.
 
-    Today's value is the last element and is INCLUDED in its own mean and
-    stdev — the question a rolling z answers is "how unusual is today against
-    the recent past", and the recent past ending yesterday is a different, less
-    stable question at a 63-day window.
+    `value_by_col` is the reading being scored, keyed by base column;
+    `window_by_col` is {(base, window): [prior baseline observations]}. They
+    are separate arguments because the value is no longer guaranteed to be an
+    element of its own window — a 10:15 reading is scored against 15:45
+    closes, and is not one of them.
+
+    Self-inclusion is gone. Today's value used to sit inside its own mean and
+    stdev, which biases sigma upward and shrinks every score toward zero; the
+    effect is largest at the 63-day window where one point is 1/21 of the
+    minimum sample. Excluding it makes the question unambiguous: how unusual is
+    this reading against the closes that preceded it.
     """
     out = {"ticker": ticker, "trade_date": trade_date, "snapshot": snapshot}
     for w in Z_WINDOWS:
-        need = Z_MIN_OBS[w]
+        need = max(Z_MIN_OBS[w], BASELINE_MIN_N)
         for base in _Z_BASES:
             series = window_by_col.get((base, w)) or []
             vals = [v for v in series if v is not None]
-            today = series[-1] if series else None
+            today = value_by_col.get(base)
             z = None
             if today is not None and len(vals) >= need:
                 m = sum(vals) / len(vals)
@@ -243,45 +253,84 @@ def zscore_row(window_by_col: dict, ticker, trade_date, snapshot) -> dict:
     return out
 
 
-def _load_metric_history(conn, ticker: str, snapshot: str, upto) -> list:
-    """Every (trade_date, values) for this ticker+snapshot up to `upto`.
+def _load_metric_history(conn, ticker: str, upto) -> list:
+    """Every (trade_date, values) for this ticker at the BASELINE bucket.
+
+    Not the scored row's own bucket. A 10:15 reading is measured against the
+    ticker's recent daily closes, which is the only baseline a 5-minute bucket
+    can have — the intraday grid began 2026-08-24, so its own history is one or
+    two observations, against which any value is its own maximum.
 
     Loaded whole rather than per-date: a backfill over a year would otherwise
-    re-issue the same 252-row lookback once per date. One ticker-snapshot
-    series is ~252 rows a year, so holding it is far cheaper than re-reading.
+    re-issue the same lookback once per date. It is also now loaded once per
+    TICKER rather than once per (ticker, snapshot), since one baseline series
+    serves every bucket of that ticker.
     """
     cols = ", ".join(_Z_BASES)
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT trade_date, {cols} FROM {METRICS_TABLE} "
             f"WHERE ticker = %s AND snapshot = %s AND trade_date <= %s "
-            f"ORDER BY trade_date", (ticker, snapshot, _py(upto)))
+            f"ORDER BY trade_date",
+            (ticker, BASELINE_SNAPSHOT, _py(upto)))
         return [(r[0], r[1:]) for r in cur.fetchall()]
 
 
-def zscore_rows(conn, ticker: str, snapshot: str, dates: list) -> list:
-    """Z rows for `dates`, all at one snapshot. Reads history once.
+def _load_scored_values(conn, ticker: str, snapshot: str, dates: list) -> dict:
+    """{trade_date: (values...)} for the rows being scored, at THEIR bucket.
 
-    Must run AFTER write_metrics for those dates — today's own value is part of
-    its window, and a missing base row yields no z row at all.
+    Separate from the baseline history because the two are now different
+    series: the value comes from the row's own snapshot, the window from the
+    baseline one.
+    """
+    cols = ", ".join(_Z_BASES)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT trade_date, {cols} FROM {METRICS_TABLE} "
+            f"WHERE ticker = %s AND snapshot = %s AND trade_date = ANY(%s)",
+            (ticker, snapshot, [_py(d) for d in dates]))
+        return {r[0]: r[1:] for r in cur.fetchall()}
+
+
+def zscore_rows(conn, ticker: str, snapshot: str, dates: list) -> list:
+    """Z rows for `dates` at one snapshot, scored against the daily baseline.
+
+    Must run AFTER write_metrics for those dates: the value being scored is
+    read back from equity_metrics, and a missing base row yields no z row.
+
+    The window is the ticker's BASELINE-bucket history STRICTLY BEFORE each
+    date. Strictly, for two reasons that happen to agree: it is what removing
+    self-inclusion means at the baseline bucket, and at an intraday bucket the
+    same day's close has not happened yet — including it would score a 10:15
+    reading against a 15:45 close from its own future.
     """
     if not dates:
         return []
-    hist = _load_metric_history(conn, ticker, snapshot, max(dates))
+    hist = _load_metric_history(conn, ticker, max(dates))
     if not hist:
         return []
-    pos = {d: i for i, (d, _) in enumerate(hist)}
+    values = _load_scored_values(conn, ticker, snapshot, dates)
+    if not values:
+        return []
+
+    hist_dates = [d for d, _ in hist]
     out = []
     for d in sorted(dates):
-        i = pos.get(d)
-        if i is None:
+        row_vals = values.get(d)
+        if row_vals is None:
             continue                       # no base row: nothing to score
+        # Index of the first baseline observation NOT before d, so the slice
+        # below ends strictly before the scored date.
+        end = bisect_left(hist_dates, d)
+        if end == 0:
+            continue                       # no prior baseline history at all
         windows = {}
         for w in Z_WINDOWS:
-            chunk = hist[max(0, i - w + 1): i + 1]
+            chunk = hist[max(0, end - w): end]
             for j, base in enumerate(_Z_BASES):
-                windows[(base, w)] = [row[j] for _, row in chunk]
-        out.append(zscore_row(windows, ticker, d, snapshot))
+                windows[(base, w)] = [r[j] for _, r in chunk]
+        vals_by_col = {base: row_vals[j] for j, base in enumerate(_Z_BASES)}
+        out.append(zscore_row(windows, vals_by_col, ticker, d, snapshot))
     return out
 
 

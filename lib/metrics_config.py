@@ -72,6 +72,24 @@ Z_WINDOWS = [63, 252]
 # third of the window present before emitting one.
 Z_MIN_OBS = {63: 21, 252: 63}
 
+# --- Z baseline -------------------------------------------------------------
+# THE SINGLE SOURCE. The dashboard imports these rather than re-declaring them;
+# two copies of a baseline definition is what produced divergent z estimators
+# in the first place.
+#
+# Every snapshot's z is scored against the ticker's daily series at THIS
+# bucket, never against its own bucket's history. At 1545 the two are the same
+# computation, so the daily close series is unaffected by the change of
+# definition. Away from 1545 they differ, and the own-bucket version is
+# unusable: the 5-minute grid began 2026-08-24, so a bucket like 1015 has one
+# or two observations of itself, against which any reading is its own maximum.
+BASELINE_SNAPSHOT = "1545"
+
+# Absolute floor on window observations, applied on top of the per-window
+# Z_MIN_OBS above. Fewer than this and a mean and a standard deviation are
+# noise wearing a measurement's clothes; NULL beats a confident number off n=3.
+BASELINE_MIN_N = 20
+
 TRADING_DAYS_PER_YEAR = 252
 DAYS_PER_YEAR = 365.0
 
@@ -387,12 +405,27 @@ def _z_col(base: Col, window: int) -> Col:
         family=base.family,
         sql_type="DOUBLE PRECISION",
         units="z_score",
-        description=(f"{base.name} as a z-score against its own trailing "
-                     f"{window} trading days at the SAME snapshot, inclusive "
-                     f"of today. Requires {Z_MIN_OBS[window]} non-null "
-                     f"observations."),
-        formula=(f"(x - mean(x over {window}td)) / stdev(x, ddof=1); NULL if "
-                 f"fewer than {Z_MIN_OBS[window]} observations or stdev ~ 0"),
+        description=(
+            f"{base.name} as a z-score against the ticker's trailing "
+            f"{window} trading days at the {BASELINE_SNAPSHOT} DAILY "
+            f"BASELINE — not against this row's own snapshot — and "
+            f"EXCLUDING the value being scored. Requires "
+            f"{max(Z_MIN_OBS[window], BASELINE_MIN_N)} non-null observations. "
+            f"TIME-OF-DAY BIAS: an intraday reading (say 10:15) is measured "
+            f"against {BASELINE_SNAPSHOT} closes, so it carries the mean "
+            f"bucket-vs-close drift of the session. That bias is uniform "
+            f"within a bucket, so it shifts the whole distribution rather "
+            f"than reordering tickers within it, and cross-sectional ranking "
+            f"is unaffected. At {BASELINE_SNAPSHOT} there is no bias: the "
+            f"baseline is that bucket's own series. FUTURE REFINEMENT: "
+            f"de-mean by bucket once each bucket has enough history of its "
+            f"own to estimate its drift, which removes the bias without "
+            f"reintroducing a second definition."),
+        formula=(f"(x_snapshot - mean(baseline over prior {window}td)) / "
+                 f"stdev(baseline, ddof=1), baseline = snapshot "
+                 f"{BASELINE_SNAPSHOT} strictly before this trade_date; NULL "
+                 f"if fewer than {max(Z_MIN_OBS[window], BASELINE_MIN_N)} "
+                 f"observations or stdev ~ 0"),
         tenor=base.tenor,
         wing=base.wing,
         form=f"z_{window}",

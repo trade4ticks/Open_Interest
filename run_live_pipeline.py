@@ -119,16 +119,14 @@ def main() -> int:
     ap.add_argument("--skip-metrics", action="store_true",
                     help="capture only; leaves equity_metrics without this "
                          "cycle")
-    # Default OFF. zscore_rows scores a bucket against ITS OWN history
-    # (_load_metric_history filters on snapshot), which is not what the
-    # dashboard does for intraday values — it scores them against the daily
-    # baseline in its API layer. Writing a differently-defined z would put two
-    # answers in the system for one question. See the notes in the handover.
-    ap.add_argument("--with-z", action="store_true",
-                    help="also write equity_metrics_z for live rows. OFF by "
-                         "default: the stored z would be scored against the "
-                         "bucket's own history, not the daily baseline the "
-                         "dashboard uses.")
+    # Default ON now. zscore_rows scores every bucket against the
+    # BASELINE_SNAPSHOT daily series, which IS the definition the dashboard
+    # wanted and had been deriving for itself — so the stored value is now the
+    # one to read, and there is no reason to withhold it from live rows.
+    ap.add_argument("--no-z", action="store_true",
+                    help="skip equity_metrics_z for live rows. The stored z is "
+                         "now scored against the daily baseline, so there is "
+                         "rarely a reason to.")
     args = ap.parse_args()
 
     # ONE log for both stages, so a stall is attributable without cross-
@@ -153,12 +151,12 @@ def main() -> int:
         print(f"\nLog: {log_path()}")
         return rc
 
-    m = run_metrics(written, with_z=args.with_z)
+    m = run_metrics(written, with_z=not args.no_z)
 
     print(f"\n=== pipeline ===")
     print(f"  capture   {len(written):>4} ticker(s)   {cap_secs:>6.0f}s")
     print(f"  metrics   {m['metrics']:>4} row(s)      {m['secs']:>6.0f}s"
-          + (f"   (+{m['z']} z)" if args.with_z else "   (z skipped)"))
+          + ("   (z skipped)" if args.no_z else f"   (+{m['z']} z)"))
     print(f"  total                       {time.monotonic() - t0:>6.0f}s")
     if m["no_surface"]:
         print(f"  no surface: {len(m['no_surface'])} ticker(s) — "
