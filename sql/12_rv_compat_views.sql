@@ -44,7 +44,11 @@ SELECT m.*,
        m.rv_park_90d    AS rv_park_3m,
        m.rv_gk_90d      AS rv_gk_3m,
        m.vrp_90d        AS vrp_3m,
-       m.vrp_ratio_90d  AS vrp_ratio_3m
+       m.vrp_ratio_90d  AS vrp_ratio_3m,
+       -- sql/13: log_ret / downside_semivol joined the tenor grid.
+       m.log_ret_7d              AS log_ret_1w,
+       m.log_ret_30d             AS log_ret_1m,
+       m.downside_semivol_30d    AS downside_semivol_1m
 FROM equity_metrics m;
 
 COMMENT ON VIEW equity_metrics_compat IS
@@ -85,7 +89,13 @@ SELECT z.*,
        z.vrp_90d_z_63        AS vrp_3m_z_63,
        z.vrp_90d_z_252       AS vrp_3m_z_252,
        z.vrp_ratio_90d_z_63  AS vrp_ratio_3m_z_63,
-       z.vrp_ratio_90d_z_252 AS vrp_ratio_3m_z_252
+       z.vrp_ratio_90d_z_252 AS vrp_ratio_3m_z_252,
+       z.log_ret_7d_z_63             AS log_ret_1w_z_63,
+       z.log_ret_7d_z_252            AS log_ret_1w_z_252,
+       z.log_ret_30d_z_63            AS log_ret_1m_z_63,
+       z.log_ret_30d_z_252           AS log_ret_1m_z_252,
+       z.downside_semivol_30d_z_63   AS downside_semivol_1m_z_63,
+       z.downside_semivol_30d_z_252  AS downside_semivol_1m_z_252
 FROM equity_metrics_z z;
 
 COMMENT ON VIEW equity_metrics_z_compat IS

@@ -556,7 +556,10 @@ def _realized(ohlc: list, trade_date, iv: dict) -> dict:
     bars = [b for b in ohlc if b["d"] < trade_date]
     closes = [b["c"] for b in bars]
 
-    for lbl, n in RET_WINDOWS:
+    # RET_WINDOWS carries the same (label, trading days, tenor) shape as
+    # RV_WINDOWS, off the same mapping, so log_ret_14d and rv_14d span the same
+    # ten sessions. log_ret_d is the one entry with tenor None.
+    for lbl, n, _tenor in RET_WINDOWS:
         val = None
         if len(closes) >= n + 1:
             c0, c1 = closes[-(n + 1)], closes[-1]
@@ -591,10 +594,22 @@ def _realized(ohlc: list, trade_date, iv: dict) -> dict:
         # NULL rather than inf when rv -> 0. _div already guards the divisor.
         row[f"vrp_ratio_{lbl}"] = _div(atm_iv, rv)
 
-    down = [r for r in rets[-21:] if r is not None and r < 0] \
-        if len(rets) >= 21 else []
-    sd = _stdev(down)
-    row["downside_semivol_1m"] = _f(sd * _SQRT_252) if sd is not None else None
+    # Down-day semivol on the SAME windows as rv, so rv_{t}d and
+    # downside_semivol_{t}d are a like-for-like pair and their ratio reads as
+    # "how much of this tenor's realized vol came from the downside".
+    #
+    # Note the sample is only the DOWN days inside the window — roughly half
+    # the observations — so this is materially noisier than rv at the same
+    # label, and at 7d it is a handful of returns. The window requirement is
+    # still n returns present, not n down days: demanding n down days would
+    # make a quiet uptrend produce NULL rather than a low number, which is the
+    # opposite of the reading wanted.
+    for lbl, n, tenor in RV_WINDOWS:
+        down = ([r for r in rets[-n:] if r is not None and r < 0]
+                if len(rets) >= n else [])
+        sd = _stdev(down)
+        row[f"downside_semivol_{lbl}"] = (_f(sd * _SQRT_252)
+                                          if sd is not None else None)
     return row
 
 

@@ -103,7 +103,16 @@ RV_WINDOWS = [(_tenor_label(_t), _trading_days(_t), _t) for _t in TENORS]
 # quietly means something else.
 assert [n for _, n, _ in RV_WINDOWS] == [5, 10, 15, 21, 42, 63], RV_WINDOWS
 
-RET_WINDOWS = [("d", 1), ("1w", 5), ("1m", 21)]
+# (label, trading-day window, matched calendar tenor). Derived from RV_WINDOWS
+# so the calendar->trading-day mapping has ONE definition: log_ret_14d and
+# rv_14d must span the same ten sessions or a VRP and a return read on the same
+# dashboard tenor would describe different horizons.
+#
+# log_ret_d stays as it is and carries tenor=None. A one-day return has no
+# tenor analogue — there is no 1-calendar-day option tenor to match it to, and
+# TENORS deliberately starts at 7 — so it is a fixed quantity that happens to
+# live in this family, not a gap in the grid.
+RET_WINDOWS = [("d", 1, None)] + [(_l, _n, _t) for _l, _n, _t in RV_WINDOWS]
 SPOTVOL_WINDOWS = [("1m", 21), ("3m", 63)]
 VOV_WINDOW = 21
 
@@ -304,10 +313,23 @@ for _t in TENORS:
 # the session's close does not exist; using it would put a full day of
 # lookahead into vrp, which is precisely the bias that makes a VRP backtest
 # look good and live trading not.
-for _lbl, _n in RET_WINDOWS:
+for _lbl, _n, _tenor in RET_WINDOWS:
+    _extra = ("" if _tenor is None else
+              f" Named for the {_tenor}-CALENDAR-day tenor it matches, not for "
+              f"its {_n}-session window — same mapping as rv_{_lbl}, so a "
+              f"return and a realized vol read at the same dashboard tenor "
+              f"span the same sessions.")
+    _one = (" A ONE-DAY return, with no tenor analogue: TENORS starts at 7 and "
+            "there is no 1-calendar-day option tenor to pair it with. It does "
+            "not retarget with the page tenor, by design."
+            if _tenor is None else "")
     _add(Col(f"log_ret_{_lbl}", "realized_vol", "DOUBLE PRECISION",
-             "log_return", f"{_n}-trading-day log return, closes through T-1.",
-             f"ln(close[T-1] / close[T-1-{_n}])"))
+             "log_return",
+             f"{_n}-trading-day log return, closes through T-1.{_extra}{_one}",
+             f"ln(close[T-1] / close[T-1-{_n}])"
+             + ("" if _tenor is None
+                else f"; {_tenor} calendar days -> {_n} trading days"),
+             tenor=_tenor))
 
 # THE NAME IS CALENDAR DAYS, THE WINDOW IS TRADING DAYS. rv_14d is a TEN
 # trading-day window, because the 14 matches the 14-CALENDAR-day tenor it is
@@ -438,16 +460,19 @@ for _lbl, _n in SPOTVOL_WINDOWS:
              f"not a beta — read them together or not at all. {_DAILY_ASOF}",
              "R^2 of the same regression", tenor=30, wing="atm"))
 
-_add(Col("downside_semivol_1m", "realized_vol", "DOUBLE PRECISION",
-         "vol_decimal",
-         "Annualised stdev of close-close log returns over DOWN days only, "
-         "21td window, closes through T-1. The '1m' here is the OLD label "
-         "convention and is NOT tenor-matched: it is the same 21-trading-day "
-         "window as rv_30d, but this metric has no tenor of its own and does "
-         "not retarget with the dashboard's tenor control. Kept unrenamed "
-         "because renaming it would break readers for no gain.",
-         "stdev(r for r in 21td returns if r < 0, ddof=1) * sqrt(252); "
-         "21td, equivalent to the 30d tenor window"))
+for _lbl, _n, _tenor in RV_WINDOWS:
+    _add(Col(f"downside_semivol_{_lbl}", "realized_vol", "DOUBLE PRECISION",
+             "vol_decimal",
+             f"Annualised stdev of close-close log returns over DOWN days "
+             f"only, {_n} TRADING days, closes through T-1. Same estimator "
+             f"shape and same window mapping as rv_{_lbl}, so the pair "
+             f"rv_{_lbl} / downside_semivol_{_lbl} is a like-for-like "
+             f"read on how much of the realized vol came from the downside. "
+             f"Named for the {_tenor}-CALENDAR-day tenor, not the "
+             f"{_n}-session window.",
+             f"stdev(r for r in {_n}td returns if r < 0, ddof=1) * sqrt(252); "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor))
 
 # --- Quality ----------------------------------------------------------------
 for _t in TENORS:

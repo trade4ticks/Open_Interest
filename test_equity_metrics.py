@@ -301,8 +301,16 @@ close("log_ret_d uses close[T-1]/close[T-2]", rvrow["log_ret_d"],
       math.log(104.0 / 101.5))
 check("  and NOT the planted close on T",
       abs(rvrow["log_ret_d"] - math.log(200.0 / 104.0)) > 0.1, True)
-close("log_ret_1w over 5 sessions", rvrow["log_ret_1w"],
+close("log_ret_7d over its 5 sessions", rvrow["log_ret_7d"],
       math.log(104.0 / 101.0))
+check("log_ret_d keeps its own label — no tenor analogue",
+      "log_ret_d" in M.BASE_NAMES and "log_ret_1d" not in M.BASE_NAMES, True)
+check("log_ret spans the tenor grid",
+      [n for n in M.BASE_NAMES if n.startswith("log_ret_")],
+      ["log_ret_d"] + [f"log_ret_{t}d" for t in M.TENORS])
+check("log_ret and rv share one window mapping",
+      [(l, n) for l, n, t in M.RET_WINDOWS if t is not None],
+      [(l, n) for l, n, _ in M.RV_WINDOWS])
 
 # The mapping is the thing most likely to be got wrong by a later edit, so it
 # is asserted against the documented table rather than against itself.
@@ -374,7 +382,12 @@ z = C._realized(flat, T, {(7, "atm"): 0.35, (14, "atm"): 0.32,
 check("rv -> 0 gives vrp_ratio NULL, not inf", z["vrp_ratio_7d"], None)
 check("  (rv really is zero)", z["rv_7d"], 0.0)
 check("  at every tenor, not just the short one", z["vrp_ratio_21d"], None)
-check("no down days -> downside_semivol NULL", z["downside_semivol_1m"], None)
+check("no down days -> downside_semivol NULL", z["downside_semivol_30d"], None)
+check("  at every tenor", [z[f"downside_semivol_{l}"]
+                           for l, _, _ in M.RV_WINDOWS], [None] * 6)
+check("downside_semivol spans the tenor grid",
+      [n for n in M.BASE_NAMES if n.startswith("downside_semivol_")],
+      [f"downside_semivol_{t}d" for t in M.TENORS])
 
 
 print("\n=== 8. spot-vol regression, off the daily baseline ===")
@@ -668,8 +681,8 @@ check("rv_30d agrees across buckets (it always did)",
 check("vrp_30d agrees across buckets (and is a real number)",
       close_row["vrp_30d"], mid_row["vrp_30d"])
 check("  (not two matching NULLs)", close_row["vrp_30d"] is not None, True)
-check("downside_semivol_1m agrees across buckets",
-      close_row["downside_semivol_1m"], mid_row["downside_semivol_1m"])
+check("downside_semivol_30d agrees across buckets",
+      close_row["downside_semivol_30d"], mid_row["downside_semivol_30d"])
 check("log_ret_d agrees across buckets",
       close_row["log_ret_d"], mid_row["log_ret_d"])
 
