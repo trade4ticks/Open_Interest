@@ -391,9 +391,18 @@ _add(Col("days_to_monthly_opex", "calendar", "SMALLINT", "days",
          "month's once this month's has passed; 0 on opex day itself.",
          "third_friday - trade_date"))
 _add(Col("days_to_earnings", "calendar", "SMALLINT", "days",
-         "Calendar days to the next earnings date. Always NULL — no earnings "
-         "source is wired up yet; the column exists so adding one is a "
-         "backfill, not a migration.", "NULL"))
+         "Calendar days to the next earnings date on or after trade_date, "
+         "from earnings_calendar (yfinance). 0 on the earnings date itself. "
+         "CALENDAR days, not trading days: the metric is a proximity flag and "
+         "the two differ only by intervening weekends, while trading days "
+         "would make every historical value depend on the exchange calendar "
+         "and shift on recompute. NULL means no known date at or after "
+         "trade_date — which covers BOTH a fund with no earnings and the gap "
+         "past the last confirmed date, since Yahoo publishes only the next "
+         "one. earnings_coverage.has_earnings is what distinguishes those. "
+         "The stored earnings_ts also carries before-open vs after-close, "
+         "which this metric does not yet use.",
+         "min(earnings_date >= trade_date) - trade_date"))
 
 
 # =============================================================================

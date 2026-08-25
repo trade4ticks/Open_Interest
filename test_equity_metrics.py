@@ -406,8 +406,21 @@ check("rolls to next month's opex once passed",
 check("December rolls the YEAR, not to month 13",
       C._calendar(date(2026, 12, 25))["days_to_monthly_opex"],
       (date(2027, 1, 15) - date(2026, 12, 25)).days)
-check("days_to_earnings is NULL (no source wired up)",
+check("days_to_earnings: no dates (a fund) is NULL, not 0",
       c1["days_to_earnings"], None)
+_earn = [date(2026, 4, 28), date(2026, 7, 28), date(2026, 10, 27)]
+check("days_to_earnings counts to the next date on or after trade_date",
+      C._calendar(date(2026, 6, 1), _earn)["days_to_earnings"],
+      (date(2026, 7, 28) - date(2026, 6, 1)).days)
+check("0 on the earnings date itself",
+      C._calendar(date(2026, 7, 28), _earn)["days_to_earnings"], 0)
+check("calendar days, not trading days (spans a weekend)",
+      C._calendar(date(2026, 7, 24), _earn)["days_to_earnings"], 4)
+check("past the last known date is NULL, not negative",
+      C._calendar(date(2026, 11, 1), _earn)["days_to_earnings"], None)
+check("a date before the first known one still counts forward",
+      C._calendar(date(2026, 1, 1), _earn)["days_to_earnings"],
+      (date(2026, 4, 28) - date(2026, 1, 1)).days)
 
 
 print("\n=== 11. z-scores ===")

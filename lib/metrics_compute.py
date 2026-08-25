@@ -46,6 +46,7 @@ import logging
 import math
 from datetime import date, timedelta
 
+from lib.earnings_store import days_to_earnings
 from lib.metrics_config import (
     CONVEX_TRIPLES, DAYS_PER_YEAR, DELTA_COORD, DELTA_LABELS, DELTA_NODE,
     MIN_LOG_STRIKE_GAP, RATIO_LONG_NODE, RET_WINDOWS, RR_NODES, RV_WINDOWS,
@@ -163,6 +164,24 @@ class HistoryCache:
         self.conn = conn
         self._ohlc: dict = {}
         self._iv: dict = {}
+        self._earnings: dict = {}
+
+    def earnings(self, ticker: str) -> list:
+        """Ascending earnings dates for one ticker; [] for a fund.
+
+        Cached for the same reason as the OHLC above: days_to_earnings is
+        evaluated once per (ticker, trade_date, snapshot), so a backfill over
+        158 days would re-read the same ~25 dates tens of thousands of times.
+        """
+        if ticker not in self._earnings:
+            from lib.earnings_store import load_dates
+            try:
+                self._earnings[ticker] = load_dates(self.conn, ticker)
+            except Exception:                                 # noqa: BLE001
+                # Table absent (pre-migration) or unreadable. NULL is the
+                # honest reading and must not take the whole metrics row down.
+                self._earnings[ticker] = []
+        return self._earnings[ticker]
 
     def ohlc(self, ticker: str) -> list:
         if ticker not in self._ohlc:
@@ -624,7 +643,7 @@ def third_friday(year: int, month: int) -> date:
     return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
 
 
-def _calendar(trade_date) -> dict:
+def _calendar(trade_date, earnings_dates: list | None = None) -> dict:
     tf = third_friday(trade_date.year, trade_date.month)
     if tf < trade_date:
         nxt = (trade_date.year + (trade_date.month == 12),
@@ -633,9 +652,10 @@ def _calendar(trade_date) -> dict:
     return {
         "day_of_week": trade_date.isoweekday(),
         "days_to_monthly_opex": (tf - trade_date).days,
-        # No earnings source is wired up. The column exists so adding one later
-        # is a backfill rather than a 600-column migration.
-        "days_to_earnings": None,
+        # NULL means "no known date at or after trade_date", which covers both
+        # a fund and the gap past the last confirmed date — Yahoo publishes
+        # only the next one. earnings_coverage is what tells those apart.
+        "days_to_earnings": days_to_earnings(earnings_dates or [], trade_date),
     }
 
 
@@ -665,5 +685,5 @@ def compute_metrics(conn, ticker: str, trade_date, snapshot: str,
     row.update(_realized(cache.ohlc(ticker), trade_date, iv))
     row.update(_spot_vol(cache.iv_history(ticker, snapshot), trade_date))
     row.update(_quality(snap, extrap))
-    row.update(_calendar(trade_date))
+    row.update(_calendar(trade_date, cache.earnings(ticker)))
     return row

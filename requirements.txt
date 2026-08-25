@@ -4,6 +4,10 @@ pandas>=2.2
 numpy>=1.26
 requests>=2.31
 yfinance>=0.2.40
+# Runtime dependency of yfinance's get_earnings_dates(): it parses the earnings
+# table via pandas.read_html, which needs lxml. yfinance does not pull it in,
+# so without this the earnings fetch fails at the first call on a clean venv.
+lxml>=5.0
 pandas-market-calendars>=4.4
 tqdm>=4.66
 pyarrow>=15

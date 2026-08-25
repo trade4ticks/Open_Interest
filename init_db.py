@@ -24,6 +24,7 @@ FILES   = [
     "07_trade_paths.sql",
     "08_equity_surface.sql",
     "09_equity_metrics.sql",
+    "10_earnings_calendar.sql",
 ]
 
 
