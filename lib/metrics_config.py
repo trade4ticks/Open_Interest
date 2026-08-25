@@ -205,12 +205,28 @@ for _t in TENORS:
              f"Cost of the far wing at {_t}d - what a broken-wing butterfly "
              f"pays to cap the ratio's tail. The BWB-vs-ratio decision.",
              "price(10p) - price(5p)", tenor=_t, wing="10p_5p"))
+    # The long leg's position. Stored rather than left to the dashboard: the
+    # tent panel needs a historical band on this marker and a "ghost tent" at
+    # the median long/short pair, and equity_metrics holds no strikes to
+    # assemble it from. Reading equity_surface for SHAPE the metrics table does
+    # not hold is fine; recomputing a scalar it does hold is what drew every
+    # tent marker wrong once already.
+    _add(Col(f"long_sigma_{_tl}", "structure", "DOUBLE PRECISION", "sigma",
+             f"How far out, in sigma, the 25-delta long put of the 1x2 sits, "
+             f"at {_t}d. POSITIVE and increasing with distance — same "
+             f"convention and sign as zc_width_sigma_{_tl}, so the two are "
+             f"directly comparable and their difference is the tent's width.",
+             "ln(spot / K_25p) / (atm_iv * sqrt(dte/365)); referenced to SPOT, "
+             "not the forward — equity_surface.log_moneyness is ln(K/forward) "
+             "and is NOT usable here",
+             tenor=_t, wing="25p"))
     _add(Col(f"zc_width_sigma_{_tl}", "structure", "DOUBLE PRECISION", "sigma",
              f"How far out, in sigma, the short strike of a 25-delta-long 1x2 "
              f"sits when the structure prices at zero, at {_t}d. POSITIVE and "
              f"increasing with distance, so ORDER BY ... DESC ranks the widest "
              f"structures first. Sigma rather than percent so it compares "
-             f"across a 12-vol name and an 80-vol name.",
+             f"across a 12-vol name and an 80-vol name. Pairs with "
+             f"long_sigma_{_tl} — the difference is the tent's width.",
              "solve price(short) = price(25p)/2, then "
              "ln(spot/K_short) / (atm_iv * sqrt(dte/365))",
              tenor=_t, wing="short"))

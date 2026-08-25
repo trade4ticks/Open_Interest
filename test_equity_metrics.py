@@ -211,15 +211,57 @@ close("zc_width_sigma_30d", st["zc_width_sigma_30d"],
 check("zc_width_sigma is POSITIVE", st["zc_width_sigma_30d"] > 0, True)
 # The sign exists to make the column sortable: a scanner ordering DESC on
 # "width" must get the widest first. Negating it would rank narrowest-first.
-wide = C._zc_sigma(70.0, SPOT, 0.28, 30)
-narrow = C._zc_sigma(95.0, SPOT, 0.28, 30)
+wide = C._sigma_from_spot(70.0, SPOT, 0.28, 30)
+narrow = C._sigma_from_spot(95.0, SPOT, 0.28, 30)
 check("a further-out short strike scores HIGHER", wide > narrow, True)
 check("  (both positive, so DESC ranks widest first)",
       wide > 0 and narrow > 0, True)
 close("magnitude is unchanged, only the sign", wide,
       -math.log(70.0 / SPOT) / (0.28 * SQRT30))
-check("a strike at spot is 0 sigma wide", C._zc_sigma(SPOT, SPOT, 0.28, 30),
-      0.0)
+check("a strike at spot is 0 sigma wide",
+      C._sigma_from_spot(SPOT, SPOT, 0.28, 30), 0.0)
+
+print("\n=== 5b. long_sigma: the tent's OTHER leg, same axis ===")
+close("long_sigma_30d = ln(spot / K_25p) / (atm_iv * sqrt(dte/365))",
+      st["long_sigma_30d"], math.log(SPOT / 90.0) / (0.28 * SQRT30))
+check("POSITIVE, same convention as zc_width_sigma",
+      st["long_sigma_30d"] > 0, True)
+check("the short leg sits FURTHER out than the long leg",
+      st["zc_width_sigma_30d"] > st["long_sigma_30d"], True)
+close("their difference is the tent's width",
+      st["zc_width_sigma_30d"] - st["long_sigma_30d"],
+      (math.log(SPOT / k_short) - math.log(SPOT / 90.0)) / (0.28 * SQRT30))
+
+# THE TRAP. equity_surface.log_moneyness is ln(K / forward), not ln(spot / K).
+# The fixture's forward (100.5) differs from spot (100.0) precisely so a
+# forward-referenced implementation cannot pass this.
+fwd_basis = math.log(100.5 / 90.0) / (0.28 * SQRT30)
+check("NOT the forward-referenced value",
+      abs(st["long_sigma_30d"] - fwd_basis) > 1e-6, True)
+check("  and the basis error would be material (~0.06 sigma here, against a "
+      "0.04 daily stdev)", abs(st["long_sigma_30d"] - fwd_basis) > 0.04, True)
+
+# Convention anchor. Under flat vol with F = spot, the 25-delta put sits at
+# k = v^2/2 - 0.6745v, so ln(spot/K)/v collapses to exactly 0.6745 - v/2.
+# A sign flip, a forward basis or a wrong delta would all miss this.
+_v = 0.25 * math.sqrt(30.0 / 365.0)
+_k25 = _v * _v / 2.0 - 0.6744897501960817 * _v
+close("flat-vol anchor: long_sigma == 0.6745 - v/2",
+      C._sigma_from_spot(SPOT * math.exp(_k25), SPOT, 0.25, 30),
+      0.6744897501960817 - _v / 2.0)
+check("  which lands near the catalog's 0.67 anchor, pulled slightly in",
+      0.60 < 0.6744897501960817 - _v / 2.0 < 0.68, True)
+
+# Missing wing node -> NULL, not a fabricated distance.
+_bare = {"nodes": {30: {50: {"iv": 0.28, "strike": 100.0, "price": 5.0,
+                             "call_price": None, "extrapolated": False}}},
+         "atm": {30: {"atm_iv": 0.28, "price": 5.0}}, "diag": []}
+check("no 25-delta node -> long_sigma NULL",
+      C._structure(_bare, {(30, "atm"): 0.28}, SPOT)["long_sigma_30d"], None)
+check("no spot -> long_sigma NULL",
+      C._structure(SNAP, IV, None)["long_sigma_30d"], None)
+check("no ATM IV -> long_sigma NULL",
+      C._structure(SNAP, {}, SPOT)["long_sigma_30d"], None)
 check("zero-cost sits further out than delta-neutral on this skew",
       st["zc_short_delta_30d"] > 12.5, True)
 
@@ -505,6 +547,21 @@ check("IV columns ARE z-scored",
       "iv_30d_25p_z_63" in set(M.Z_NAMES), True)
 check("structure prices ARE z-scored",
       "zc_width_sigma_30d_z_252" in set(M.Z_NAMES), True)
+check("long_sigma exists at every tenor",
+      [f"long_sigma_{t}d" in registry for t in M.TENORS], [True] * 6)
+check("long_sigma is z-scored at both windows",
+      {"long_sigma_30d_z_63", "long_sigma_30d_z_252"} <= set(M.Z_NAMES), True)
+# wing='25p' is what lets the dashboard's router resolve the extrapolation
+# marker to extrap_25p_{t}d with no further change.
+check("long_sigma carries wing='25p' so extrap marking routes",
+      {c.wing for c in M.BASE_COLUMNS if c.name.startswith("long_sigma_")},
+      {"25p"})
+check("  and the extrap column it routes to exists",
+      [f"extrap_25p_{t}d" in registry for t in M.TENORS], [True] * 6)
+check("long_sigma and zc_width_sigma share family, units and tenors",
+      [(c.family, c.units) for c in M.BASE_COLUMNS
+       if c.name in ("long_sigma_30d", "zc_width_sigma_30d")],
+      [("structure", "sigma")] * 2)
 check("excluded families are exactly the three intended",
       excluded, {"level_price", "quality", "calendar"})
 

@@ -388,9 +388,16 @@ def _structure(snap: dict, iv: dict, spot) -> dict:
         row[f"cost_at_delta_neutral_{tl}"] = (
             _f(2 * p_neutral - p25) if None not in (p_neutral, p25) else None)
 
+        # The long leg's position on the same axis as the short leg's. Every
+        # input is already in hand — no extra query — and storing it is what
+        # lets the panel band the marker and draw a median "ghost tent".
+        row[f"long_sigma_{tl}"] = _sigma_from_spot(
+            _interp_node(nd, RATIO_LONG_NODE, "strike"), spot,
+            iv.get((t, "atm")), t)
+
         d_short, k_short = _zero_cost_short(nd, p25)
         row[f"zc_short_delta_{tl}"] = d_short
-        row[f"zc_width_sigma_{tl}"] = _zc_sigma(
+        row[f"zc_width_sigma_{tl}"] = _sigma_from_spot(
             k_short, spot, iv.get((t, "atm")), t)
     return row
 
@@ -431,24 +438,36 @@ def _zero_cost_short(nd: dict, p25) -> tuple:
     return None, None
 
 
-def _zc_sigma(k_short, spot, atm_iv, dte) -> float | None:
-    """ln(spot / K_short) / (atm_iv * sqrt(dte/365)).
+def _sigma_from_spot(strike, spot, atm_iv, dte) -> float | None:
+    """ln(spot / strike) / (atm_iv * sqrt(dte/365)).
 
-    POSITIVE by construction, and increasing as the short strike moves further
-    out. The sign is chosen so the column sorts the way a scanner reads it:
-    ORDER BY zc_width_sigma DESC puts the widest structures first. Taking
-    ln(K_short/spot) instead would be the same magnitude negated, which sorts
-    narrowest-first and reads backwards.
+    Shared by BOTH legs of the 1x2 — long_sigma (the 25-delta long) and
+    zc_width_sigma (the zero-cost short) — deliberately. One formula, one
+    reference point, one sign convention, so the two markers on the tent panel
+    cannot drift apart from each other.
+
+    POSITIVE by construction and increasing as the strike moves further out.
+    The sign is chosen so the column sorts the way a scanner reads it:
+    ORDER BY ... DESC puts the widest first. Taking ln(strike/spot) instead
+    would be the same magnitude negated, sorting narrowest-first.
+
+    REFERENCED TO SPOT, NOT TO THE FORWARD. equity_surface.log_moneyness is
+    already stored and looks like the obvious input; it is ln(strike/forward)
+    and is the wrong basis. Measured across the universe the difference is
+    0.0353 sigma on average and 0.1083 at the extreme — against a long leg
+    whose entire daily standard deviation is 0.0397. Reusing it would inject an
+    error the size of the signal, and the two sigma families would disagree
+    silently, which is exactly how the tent drew every marker wrong once.
 
     Sigma rather than percent so a 12-vol utility and an 80-vol biotech are on
     one scale.
     """
-    if None in (k_short, spot, atm_iv) or k_short <= 0 or spot <= 0:
+    if None in (strike, spot, atm_iv) or strike <= 0 or spot <= 0:
         return None
     denom = atm_iv * math.sqrt(dte / DAYS_PER_YEAR)
     if denom < 1e-12:
         return None
-    return _f(math.log(spot / k_short) / denom)
+    return _f(math.log(spot / strike) / denom)
 
 
 # --- Realized vol -----------------------------------------------------------
