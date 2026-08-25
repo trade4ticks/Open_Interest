@@ -347,7 +347,8 @@ def zscore_rows(conn, ticker: str, snapshot: str, dates: list) -> list:
 # POST — views over metric columns. On a fresh database 09 creates only the key
 #        skeleton and every metric column arrives from the registry, so a view
 #        naming rv_7d cannot be created until the sync has added it.
-PRE_SYNC_SQL = ["11_rv_tenor_rename.sql", "13_ret_semivol_rename.sql"]
+PRE_SYNC_SQL = ["11_rv_tenor_rename.sql", "13_ret_semivol_rename.sql",
+                "14_spotvol_tenor_rename.sql"]
 POST_SYNC_SQL = ["12_rv_compat_views.sql"]
 
 

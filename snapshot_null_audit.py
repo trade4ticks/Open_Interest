@@ -147,13 +147,17 @@ def owner_map() -> dict:
     # return the same numbers, and the split reads as absent when it is merely
     # unexercised. A small LCG is deterministic without being periodic here.
     _s = 12345
-    ivh = []
+    ivh: dict = {t: [] for t in TENORS}
     for i in range(80):
         _s = (1103515245 * _s + 12345) % 2147483648
-        ivh.append({"d": d0 + timedelta(days=i),
-                    "iv": 0.30 + 0.02 * (_s % 1000) / 1000.0,
-                    "s": 100.0 + 2.0 * ((_s >> 10) % 1000) / 1000.0})
-    td = ivh[-1]["d"]
+        for _j, _t in enumerate(TENORS):
+            # A different response per tenor, so a probe that collapsed the
+            # grid onto one series would show up as identical columns.
+            ivh[_t].append({
+                "d": d0 + timedelta(days=i),
+                "iv": 0.30 + 0.02 * (1 + _j) * (_s % 1000) / 1000.0,
+                "s": 100.0 + 2.0 * ((_s >> 10) % 1000) / 1000.0})
+    td = ivh[TENORS[0]][-1]["d"]
 
     # _realized takes the snapshot's IV dict as well as the daily bars. Run it
     # against a SECOND set of IVs and diff: whatever moves is hybrid, the rest

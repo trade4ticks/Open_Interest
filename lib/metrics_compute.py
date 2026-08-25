@@ -32,9 +32,10 @@ of the ticker, and storing NULL at 12:15 would assert "unknown" for something
 that is known and unchanged since the last close.
 
     _realized   log_ret_*, rv_*, rv_park_*, rv_gk_*, vrp_*, vrp_ratio_*,
-                downside_semivol_1m      — daily OHLC, closes through T-1
-    _spot_vol   vov_30d_1m, spotvol_beta_*, spotvol_r2_*
-                                         — the daily BASELINE ATM IV series
+                downside_semivol_*       — daily OHLC, closes through T-1
+    _spot_vol   vov_{t}d_1m, spotvol_beta_{t}d_*, spotvol_r2_{t}d_*
+                                         — the daily BASELINE ATM IV series,
+                                           one regression per tenor
     _calendar   day_of_week, days_to_monthly_opex, days_to_earnings
                                          — pure functions of trade_date
 
@@ -59,7 +60,7 @@ catalog description of any spotvol column.
 
 ONE DELIBERATE DEPARTURE FROM THE SPEC, FLAGGED
 -----------------------------------------------
-spotvol_beta is specified as the OLS beta of d(iv_30d_atm) on `log_ret_d`.
+spotvol_beta is specified as the OLS beta of d(iv_{t}d_atm) on `log_ret_d`.
 Taken literally that regresses the IV change from T-1 to T against the OHLC
 return from T-2 to T-1 — the two are one day apart, so the contemporaneous
 relationship the metric exists to measure ("a 1% drop lifts ATM IV by 1.8
@@ -233,8 +234,15 @@ class HistoryCache:
                      "l": _f(r[3]), "c": _f(r[4])} for r in cur.fetchall()]
         return self._ohlc[ticker]
 
-    def daily_iv_history(self, ticker: str) -> list:
-        """30d ATM IV and the underlying at the DAILY BASELINE bucket, by date.
+    def daily_iv_history(self, ticker: str) -> dict:
+        """{tenor: [rows]} of ATM IV and the underlying at the DAILY BASELINE.
+
+        ALL SIX TENORS, not just 30d. The spot-vol family is estimated per
+        tenor because the response of ATM IV to spot is strongly term-
+        dependent: short-dated IV moves far more per unit spot move, so a beta
+        estimated on 30-day IV understates a 7 DTE position's vega P&L by a
+        factor of two or three. One query for the whole grid rather than six —
+        the rows are already in one table, keyed by dte.
 
         Deliberately not parameterised by snapshot. It used to be, and that made
         every spot-vol column NULL at every intraday bucket: the regression
@@ -256,15 +264,21 @@ class HistoryCache:
         fix is to make it unavailable.
         """
         if ticker not in self._iv:
+            out: dict = {t: [] for t in TENORS}
             with self.conn.cursor() as cur:
                 cur.execute(
-                    "SELECT trade_date, atm_iv, underlying_price "
+                    "SELECT trade_date, dte, atm_iv, underlying_price "
                     "FROM equity_atm "
-                    "WHERE ticker = %s AND snapshot = %s AND dte = 30 "
-                    "ORDER BY trade_date", (ticker, BASELINE_SNAPSHOT))
-                self._iv[ticker] = [
-                    {"d": r[0], "iv": _f(r[1]), "s": _f(r[2])}
-                    for r in cur.fetchall()]
+                    "WHERE ticker = %s AND snapshot = %s AND dte = ANY(%s) "
+                    "ORDER BY dte, trade_date",
+                    (ticker, BASELINE_SNAPSHOT, list(TENORS)))
+                for d, dte, iv, spot in cur.fetchall():
+                    # A dte outside the grid cannot happen given the filter,
+                    # but setdefault beats a KeyError if TENORS ever changes
+                    # under a cached plan.
+                    out.setdefault(int(dte), []).append(
+                        {"d": d, "iv": _f(iv), "s": _f(spot)})
+            self._iv[ticker] = out
         return self._iv[ticker]
 
     def invalidate(self, ticker: str | None = None) -> None:
@@ -641,11 +655,17 @@ def _garman_klass(bars: list):
     return _f(math.sqrt(mean) * _SQRT_252) if mean >= 0 else None
 
 
-def _spot_vol(iv_hist: list, trade_date, snapshot: str) -> dict:
-    """vov and the spot-vol regression, off the DAILY BASELINE series.
+def _spot_vol(iv_hist: dict, trade_date, snapshot: str) -> dict:
+    """vov and the spot-vol regression, PER TENOR, off the DAILY BASELINE.
 
-    Both are 21/63-day rolling statistics of a daily series, so they take one
-    value per session and carry across every bucket in it — the same shape as
+    `iv_hist` is {tenor: [rows]} from HistoryCache.daily_iv_history. Every
+    tenor gets its own regression, because the response of ATM IV to spot is
+    strongly term-dependent — beta_7d typically runs 2-3x beta_90d in
+    magnitude, so a single 30d estimate understates a 7 DTE position's vega
+    P&L by that factor.
+
+    Both statistics are 21/63-day rolling reads of a daily series, so they take
+    one value per session and carry across every bucket in it — the same shape as
     rv_{t}d, which is computed from daily closes and is identical at 09:45 and
     at 15:45. See HistoryCache.daily_iv_history for why they used to be
     snapshot-aligned and why that was wrong.
@@ -666,37 +686,49 @@ def _spot_vol(iv_hist: list, trade_date, snapshot: str) -> dict:
     and live rows would then disagree on the same key, and the backfilled ones
     would look better. That is the lookahead the module docstring is about.
     """
-    row = {"vov_30d_1m": None}
-    for lbl, _n in SPOTVOL_WINDOWS:
-        row[f"spotvol_beta_{lbl}"] = None
-        row[f"spotvol_r2_{lbl}"] = None
+    row = {}
+    for t in TENORS:
+        tl = f"{t}d"
+        row[f"vov_{tl}_1m"] = None
+        for lbl, _n in SPOTVOL_WINDOWS:
+            row[f"spotvol_beta_{tl}_{lbl}"] = None
+            row[f"spotvol_r2_{tl}_{lbl}"] = None
 
-    if snapshot == BASELINE_SNAPSHOT:
-        hist = [h for h in iv_hist if h["d"] <= trade_date]
-    else:
-        hist = [h for h in iv_hist if h["d"] < trade_date]
-    d_iv, d_spot = [], []
-    for prev, cur in zip(hist[:-1], hist[1:]):
-        gap = (cur["d"] - prev["d"]).days
-        if gap > MAX_DIFF_GAP_DAYS:
-            continue          # a hole in the history, not a daily move
-        if None in (prev["iv"], cur["iv"]):
-            continue
-        s0, s1 = prev["s"], cur["s"]
-        d_iv.append(cur["iv"] - prev["iv"])
-        d_spot.append(math.log(s1 / s0)
-                      if None not in (s0, s1) and s0 > 0 and s1 > 0 else None)
+    for t in TENORS:
+        tl = f"{t}d"
+        # Each tenor is paired against the spot move over ITS OWN pair of days.
+        # Tenors do not always have the same coverage — a thin expiry can drop
+        # out of the grid for a session — so building d_spot once from the 30d
+        # series and reusing it would silently misalign the others.
+        series = iv_hist.get(t) or []
+        if snapshot == BASELINE_SNAPSHOT:
+            hist = [h for h in series if h["d"] <= trade_date]
+        else:
+            hist = [h for h in series if h["d"] < trade_date]
 
-    if len(d_iv) >= VOV_WINDOW:
-        sd = _stdev(d_iv[-VOV_WINDOW:])
-        row["vov_30d_1m"] = _f(sd * _SQRT_252) if sd is not None else None
+        d_iv, d_spot = [], []
+        for prev, cur in zip(hist[:-1], hist[1:]):
+            gap = (cur["d"] - prev["d"]).days
+            if gap > MAX_DIFF_GAP_DAYS:
+                continue      # a hole in the history, not a daily move
+            if None in (prev["iv"], cur["iv"]):
+                continue
+            s0, s1 = prev["s"], cur["s"]
+            d_iv.append(cur["iv"] - prev["iv"])
+            d_spot.append(math.log(s1 / s0)
+                          if None not in (s0, s1) and s0 > 0 and s1 > 0
+                          else None)
 
-    for lbl, n in SPOTVOL_WINDOWS:
-        if len(d_iv) < max(5, n // 2):
-            continue
-        beta, r2 = _ols(d_spot[-n:], d_iv[-n:])
-        row[f"spotvol_beta_{lbl}"] = beta
-        row[f"spotvol_r2_{lbl}"] = r2
+        if len(d_iv) >= VOV_WINDOW:
+            sd = _stdev(d_iv[-VOV_WINDOW:])
+            row[f"vov_{tl}_1m"] = _f(sd * _SQRT_252) if sd is not None else None
+
+        for lbl, n in SPOTVOL_WINDOWS:
+            if len(d_iv) < max(5, n // 2):
+                continue
+            beta, r2 = _ols(d_spot[-n:], d_iv[-n:])
+            row[f"spotvol_beta_{tl}_{lbl}"] = beta
+            row[f"spotvol_r2_{tl}_{lbl}"] = r2
     return row
 
 

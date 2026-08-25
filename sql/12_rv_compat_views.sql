@@ -48,7 +48,12 @@ SELECT m.*,
        -- sql/13: log_ret / downside_semivol joined the tenor grid.
        m.log_ret_7d              AS log_ret_1w,
        m.log_ret_30d             AS log_ret_1m,
-       m.downside_semivol_30d    AS downside_semivol_1m
+       m.downside_semivol_30d    AS downside_semivol_1m,
+       -- sql/14: spot-vol exposed its tenor. vov_30d_1m is unchanged.
+       m.spotvol_beta_30d_1m     AS spotvol_beta_1m,
+       m.spotvol_r2_30d_1m       AS spotvol_r2_1m,
+       m.spotvol_beta_30d_3m     AS spotvol_beta_3m,
+       m.spotvol_r2_30d_3m       AS spotvol_r2_3m
 FROM equity_metrics m;
 
 COMMENT ON VIEW equity_metrics_compat IS
@@ -95,7 +100,15 @@ SELECT z.*,
        z.log_ret_30d_z_63            AS log_ret_1m_z_63,
        z.log_ret_30d_z_252           AS log_ret_1m_z_252,
        z.downside_semivol_30d_z_63   AS downside_semivol_1m_z_63,
-       z.downside_semivol_30d_z_252  AS downside_semivol_1m_z_252
+       z.downside_semivol_30d_z_252  AS downside_semivol_1m_z_252,
+       z.spotvol_beta_30d_1m_z_63    AS spotvol_beta_1m_z_63,
+       z.spotvol_beta_30d_1m_z_252   AS spotvol_beta_1m_z_252,
+       z.spotvol_r2_30d_1m_z_63      AS spotvol_r2_1m_z_63,
+       z.spotvol_r2_30d_1m_z_252     AS spotvol_r2_1m_z_252,
+       z.spotvol_beta_30d_3m_z_63    AS spotvol_beta_3m_z_63,
+       z.spotvol_beta_30d_3m_z_252   AS spotvol_beta_3m_z_252,
+       z.spotvol_r2_30d_3m_z_63      AS spotvol_r2_3m_z_63,
+       z.spotvol_r2_30d_3m_z_252     AS spotvol_r2_3m_z_252
 FROM equity_metrics_z z;
 
 COMMENT ON VIEW equity_metrics_z_compat IS

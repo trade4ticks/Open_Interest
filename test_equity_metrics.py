@@ -390,53 +390,99 @@ check("downside_semivol spans the tenor grid",
       [f"downside_semivol_{t}d" for t in M.TENORS])
 
 
-print("\n=== 8. spot-vol regression, off the daily baseline ===")
-# iv moves at exactly -2x the underlying log return, so beta = -2, R2 = 1.
+print("\n=== 8. spot-vol regression, PER TENOR, off the daily baseline ===")
+# iv moves at exactly RESP[t] x the underlying log return, so beta = RESP[t]
+# and R2 = 1. The response is planted DIFFERENTLY per tenor — steeper at the
+# short end, which is the real term structure this family exists to expose — so
+# a regression that quietly reused one tenor's IV for another cannot pass.
 pattern = [0.01, -0.02, 0.015, -0.005]
-ivh, s, ivv = [], 100.0, 0.30
+RESP = {7: -4.0, 14: -3.2, 21: -2.6, 30: -2.0, 60: -1.4, 90: -1.0}
 d0 = date(2026, 1, 5)
-for i in range(30):
-    ivh.append({"d": d0 + timedelta(days=i), "iv": ivv, "s": s})
-    r = pattern[i % 4]
-    s *= math.exp(r)
-    ivv += -2.0 * r
-sv = C._spot_vol(ivh, ivh[-1]["d"], M.BASELINE_SNAPSHOT)
-close("spotvol_beta_1m recovers the planted -2.0", sv["spotvol_beta_1m"], -2.0,
-      tol=1e-6)
-close("spotvol_r2_1m = 1 on an exact relation", sv["spotvol_r2_1m"], 1.0,
-      tol=1e-9)
+ivh = {}
+for _t, _resp in RESP.items():
+    # 70 sessions so BOTH estimation windows fill: the 3m window needs
+    # max(5, 63//2) = 31 diffs, and a 30-row fixture silently left every
+    # spotvol_*_3m NULL.
+    _rows, _sx, _ivv = [], 100.0, 0.30
+    for i in range(70):
+        _rows.append({"d": d0 + timedelta(days=i), "iv": _ivv, "s": _sx})
+        _r = pattern[i % 4]
+        _sx *= math.exp(_r)
+        _ivv += _resp * _r
+    ivh[_t] = _rows
+TDS = ivh[30][-1]["d"]
+sv = C._spot_vol(ivh, TDS, M.BASELINE_SNAPSHOT)
+
+for _t, _resp in RESP.items():
+    close(f"spotvol_beta_{_t}d_1m recovers the planted {_resp}",
+          sv[f"spotvol_beta_{_t}d_1m"], _resp, tol=1e-6)
+close("spotvol_r2_30d_1m = 1 on an exact relation",
+      sv["spotvol_r2_30d_1m"], 1.0, tol=1e-9)
+check("  R2 is 1 at every tenor",
+      all(abs(sv[f"spotvol_r2_{t}d_1m"] - 1.0) < 1e-9 for t in M.TENORS), True)
+check("beta STEEPENS as the tenor shortens — the point of the split",
+      [round(sv[f"spotvol_beta_{t}d_1m"], 6) for t in M.TENORS]
+      == sorted(round(sv[f"spotvol_beta_{t}d_1m"], 6) for t in M.TENORS), True)
+close("the 7d/90d ratio is the understatement being fixed",
+      sv["spotvol_beta_7d_1m"] / sv["spotvol_beta_90d_1m"], 4.0, tol=1e-9)
+check("the 3m window estimates the same relation, not a different one",
+      all(abs(sv[f"spotvol_beta_{t}d_3m"] - RESP[t]) < 1e-6 for t in M.TENORS),
+      True)
+
 check("vov_30d_1m computed with 21+ diffs", sv["vov_30d_1m"] is not None, True)
-d_iv = [-2.0 * pattern[i % 4] for i in range(29)]
+d_iv = [RESP[30] * pattern[i % 4] for i in range(69)]
 mm = sum(d_iv[-21:]) / 21
 close("vov_30d_1m = stdev(d iv, 21) * sqrt(252)", sv["vov_30d_1m"],
       math.sqrt(sum((x - mm) ** 2 for x in d_iv[-21:]) / 20) * math.sqrt(252))
-short = C._spot_vol(ivh[:4], ivh[3]["d"], M.BASELINE_SNAPSHOT)
-check("too little history -> beta NULL", short["spotvol_beta_1m"], None)
+check("vov RISES as the tenor shortens, like beta",
+      [round(sv[f"vov_{t}d_1m"], 9) for t in M.TENORS]
+      == sorted((round(sv[f"vov_{t}d_1m"], 9) for t in M.TENORS), reverse=True),
+      True)
+check("vov keeps its 1m ESTIMATION-window label, which is not a tenor",
+      [n for n in M.BASE_NAMES if n.startswith("vov_")],
+      [f"vov_{t}d_1m" for t in M.TENORS])
+
+short = C._spot_vol({t: r[:4] for t, r in ivh.items()}, ivh[30][3]["d"],
+                    M.BASELINE_SNAPSHOT)
+check("too little history -> beta NULL", short["spotvol_beta_30d_1m"], None)
 check("  and vov NULL", short["vov_30d_1m"], None)
-# A hole in the snapshot history is not a one-day move.
-gapped = ivh[:10] + [{"d": ivh[9]["d"] + timedelta(days=40),
-                      "iv": 9.9, "s": 500.0}] + ivh[10:]
-gv = C._spot_vol(gapped, gapped[-1]["d"], M.BASELINE_SNAPSHOT)
+
+# THE FAILURE THE PER-TENOR SPLIT MUST NOT HAVE: borrowing another tenor's
+# series. With only 30d supplied, every other tenor must be NULL.
+only30 = C._spot_vol({30: ivh[30]}, TDS, M.BASELINE_SNAPSHOT)
+check("a tenor absent from the history is NULL, not borrowed from 30d",
+      [only30[f"spotvol_beta_{t}d_1m"] for t in M.TENORS if t != 30],
+      [None] * 5)
+check("  while the tenor that IS present still computes",
+      only30["spotvol_beta_30d_1m"] is not None, True)
+
+# A hole in the history is not a one-day move.
+gapped = {t: r[:10] + [{"d": r[9]["d"] + timedelta(days=40), "iv": 9.9,
+                        "s": 500.0}] + r[10:] for t, r in ivh.items()}
+gv = C._spot_vol(gapped, gapped[30][-1]["d"], M.BASELINE_SNAPSHOT)
 check("a 40-day gap does not enter the regression as a daily move",
-      abs(gv["spotvol_beta_1m"] - (-2.0)) < 1e-6, True)
+      abs(gv["spotvol_beta_30d_1m"] - RESP[30]) < 1e-6, True)
 
 # THE AS-OF RULE. At the baseline bucket the row being computed IS the day's
 # daily observation and belongs inside its own window; at any other bucket that
 # observation has not happened yet, so the window stops at T-1. Without the
 # second half a REBUILD would hand a 09:45 row the 15:45 value from six hours
 # in its future, and backfilled rows would beat live ones on the same key.
-spiked = ivh + [{"d": ivh[-1]["d"] + timedelta(days=1), "iv": 9.9, "s": 500.0}]
-TDx = spiked[-1]["d"]
+spiked = {t: r + [{"d": r[-1]["d"] + timedelta(days=1), "iv": 9.9, "s": 500.0}]
+          for t, r in ivh.items()}
+TDx = spiked[30][-1]["d"]
 at_close = C._spot_vol(spiked, TDx, M.BASELINE_SNAPSHOT)
 at_noon = C._spot_vol(spiked, TDx, "1215")
 check("the baseline bucket INCLUDES its own day's observation",
-      abs(at_close["spotvol_beta_1m"] - (-2.0)) > 1e-6, True)
+      abs(at_close["spotvol_beta_30d_1m"] - RESP[30]) > 1e-6, True)
 close("an intraday bucket stops at T-1, so it is unmoved by it",
-      at_noon["spotvol_beta_1m"], -2.0, tol=1e-6)
+      at_noon["spotvol_beta_30d_1m"], RESP[30], tol=1e-6)
 check("  which is the same value the previous close carried",
-      abs(at_noon["spotvol_beta_1m"]
-          - C._spot_vol(ivh, ivh[-1]["d"], M.BASELINE_SNAPSHOT)
-          ["spotvol_beta_1m"]) < 1e-12, True)
+      abs(at_noon["spotvol_beta_30d_1m"] - sv["spotvol_beta_30d_1m"]) < 1e-12,
+      True)
+check("  and the as-of rule holds at EVERY tenor, not just 30d",
+      all(abs(at_noon[f"spotvol_beta_{t}d_1m"] - RESP[t]) < 1e-6
+          for t in M.TENORS), True)
 
 
 print("\n=== 9. quality ===")
@@ -561,7 +607,7 @@ class FakeCursor:
             self._rows = self.data["ohlc"]
         elif "earnings_calendar" in sql:
             self._rows = [(d,) for d in self.data.get("earnings", [])]
-        elif "dte = 30" in sql:
+        elif "dte = ANY" in sql:
             # Honours the snapshot argument on purpose. If compute ever goes
             # back to asking for the row's own bucket, the thin history planted
             # under a non-baseline key makes every spot-vol column NULL and
@@ -606,8 +652,10 @@ data = {
     "diag": [("pcp", 100.0, 4.0, False, False, False)],
     "ohlc": [(date(2026, 5, 1) + timedelta(days=i), 100.0, 101.0, 99.0,
               100.0 + i) for i in range(40)],
-    "ivhist": [(date(2026, 5, 1) + timedelta(days=i), 0.28, 100.0)
-               for i in range(40)],
+    # (trade_date, dte, atm_iv, underlying_price) — the history query now
+    # pulls every tenor in one go, not just dte = 30.
+    "ivhist": [(date(2026, 5, 1) + timedelta(days=i), _t, 0.28, 100.0)
+               for _t in M.TENORS for i in range(40)],
 }
 row = C.compute_metrics(FakeConn(data), "SPY", date(2026, 6, 15), "1545")
 
@@ -647,10 +695,12 @@ print("\n=== 12b. daily-derived columns carry across the session ===")
 
 ivdates = [date(2026, 5, 1) + timedelta(days=i) for i in range(40)]
 daily = {
-    "1545": [(d, 0.28 + 0.004 * ((i % 5) - 2), 100.0 + 0.6 * ((i % 7) - 3))
-             for i, d in enumerate(ivdates)],
+    "1545": [(d, _t, 0.28 + 0.004 * ((i % 5) - 2),
+              100.0 + 0.6 * ((i % 7) - 3))
+             for _t in M.TENORS for i, d in enumerate(ivdates)],
     # What an intraday bucket actually has: days of history, not months.
-    "1215": [(ivdates[-2], 0.281, 100.2), (ivdates[-1], 0.279, 99.8)],
+    "1215": [(ivdates[-2], _t, 0.281, 100.2) for _t in M.TENORS]
+            + [(ivdates[-1], _t, 0.279, 99.8) for _t in M.TENORS],
 }
 ddata = {**data, "ivhist": daily,
          "earnings": [date(2026, 6, 3), date(2026, 9, 2)]}
@@ -664,12 +714,15 @@ daily_cols = [c.name for c in M.BASE_COLUMNS if c.family in DAILY_FAMILIES]
 check(f"{len(daily_cols)} columns claim to be daily-derived",
       len(daily_cols) > 40, True)
 
-check("spotvol_beta_1m is populated at an INTRADAY bucket",
-      mid_row["spotvol_beta_1m"] is not None, True)
-check("  and spotvol_r2_1m", mid_row["spotvol_r2_1m"] is not None, True)
-check("  and vov_30d_1m", mid_row["vov_30d_1m"] is not None, True)
+check("spotvol_beta is populated at an INTRADAY bucket, at EVERY tenor",
+      [t for t in M.TENORS
+       if mid_row[f"spotvol_beta_{t}d_1m"] is None], [])
+check("  and spotvol_r2",
+      [t for t in M.TENORS if mid_row[f"spotvol_r2_{t}d_1m"] is None], [])
+check("  and vov",
+      [t for t in M.TENORS if mid_row[f"vov_{t}d_1m"] is None], [])
 check("  (it is a real regression, not a fabricated zero)",
-      abs(mid_row["spotvol_beta_1m"]) > 1e-9, True)
+      abs(mid_row["spotvol_beta_30d_1m"]) > 1e-9, True)
 
 check("days_to_earnings is populated at an INTRADAY bucket",
       mid_row["days_to_earnings"], (date(2026, 9, 2) - TD).days)
@@ -689,8 +742,7 @@ check("log_ret_d agrees across buckets",
 # The one honest exception, and it is not carry-forward failing: the baseline
 # bucket's own row IS the day's daily observation, so it is inside its window
 # while 12:15 stops at T-1. Everything else in the family must match exactly.
-asof_sensitive = {"vov_30d_1m", "spotvol_beta_1m", "spotvol_beta_3m",
-                  "spotvol_r2_1m", "spotvol_r2_3m"}
+asof_sensitive = {c.name for c in M.BASE_COLUMNS if c.family == "spot_vol"}
 mismatch = [c for c in daily_cols
             if c not in asof_sensitive and close_row[c] != mid_row[c]]
 check("every other daily column is IDENTICAL at 1215 and 1545", mismatch, [])
@@ -708,18 +760,19 @@ check("no daily column is NULL intraday while set at the close",
 # longer remove MAX_DIFF_GAP_DAYS drops the diff and the test would pass for the
 # wrong reason.
 TDX = ivdates[-1] + timedelta(days=1)
-spiked = {**daily, "1545": daily["1545"] + [(TDX, 0.99, 500.0)]}
+spiked = {**daily, "1545": daily["1545"]
+          + [(TDX, _t, 0.99, 500.0) for _t in M.TENORS]}
 sdata = {**ddata, "ivhist": spiked}
 noon_x = C.compute_metrics(FakeConn(sdata), "SPY", TDX, "1215")
 close_x = C.compute_metrics(FakeConn(sdata), "SPY", TDX, "1545")
 plain_x = C.compute_metrics(FakeConn(ddata), "SPY", TDX, "1215")
 check("a value planted at trade_date's close does NOT reach the 1215 row",
-      noon_x["spotvol_beta_1m"], plain_x["spotvol_beta_1m"])
+      noon_x["spotvol_beta_30d_1m"], plain_x["spotvol_beta_30d_1m"])
 check("  but it DOES reach the 1545 row — that row is the observation",
-      close_x["spotvol_beta_1m"] != noon_x["spotvol_beta_1m"], True)
+      close_x["spotvol_beta_30d_1m"] != noon_x["spotvol_beta_30d_1m"], True)
 check("  and both are real values, so the difference is not None vs None",
-      noon_x["spotvol_beta_1m"] is not None
-      and close_x["spotvol_beta_1m"] is not None, True)
+      noon_x["spotvol_beta_30d_1m"] is not None
+      and close_x["spotvol_beta_30d_1m"] is not None, True)
 
 
 
