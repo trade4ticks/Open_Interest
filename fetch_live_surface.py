@@ -334,7 +334,13 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
     set_max_connections(connections)
     totals = {"tickers": 0, "surface": 0, "atm": 0, "diagnostics": 0,
               "failed": [], "captures": [],
-              "persist_bytes": 0, "persist_secs": 0.0, "persist_failed": []}
+              "persist_bytes": 0, "persist_secs": 0.0, "persist_failed": [],
+              # (ticker, trade_date, snapshot) for rows that reached Postgres.
+              # The pipeline scopes its metrics pass to exactly these: captures
+              # holds every ticker that was FETCHED, including ones whose fit
+              # or write later failed, and computing metrics for those would
+              # read a surface that is not there.
+              "written": []}
 
     def fetch(tk: str):
         t0 = time.monotonic()
@@ -458,6 +464,8 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
                 for k in ("surface", "atm", "diagnostics"):
                     totals[k] += written[k]
                 totals["tickers"] += 1
+                totals["written"].append((tk, got["trade_date"],
+                                          got["snapshot"]))
 
             # Progress, flushed as it happens. The log was empty after six
             # minutes of the deadlocked run because the parent logged nothing
@@ -475,7 +483,7 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
 
 # --- Main -------------------------------------------------------------------
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Live intraday surface capture.")
     ap.add_argument("--tickers", help="comma-separated; default = all in the "
                                       "snapshots store")
@@ -512,7 +520,19 @@ def main() -> int:
                     help=argparse.SUPPRESS)   # deprecated no-op; kept so an
                                               # existing manual command or
                                               # cron entry does not break
-    args = ap.parse_args()
+    return ap
+
+
+def run(args) -> tuple:
+    """One capture cycle. Returns (exit_code, totals).
+
+    Split from main() so run_live_pipeline.py can drive a capture and
+    then read totals["written"] — the (ticker, trade_date, snapshot)
+    triples that actually reached Postgres. A pipeline cannot derive
+    the bucket from the wall clock instead: a 72s capture can straddle
+    a 5-minute boundary, and the label the rows were written under is
+    the only correct scope for the metrics pass.
+    """
 
     log_file = setup_file_logging("fetch_live_surface")
     now_et = datetime.now(ET).replace(tzinfo=None)
@@ -602,7 +622,12 @@ def main() -> int:
     print(f"\nLog: {log_path()}")
     if lock:
         lock.close()
-    return 0 if totals["tickers"] else 1
+    return (0 if totals["tickers"] else 1), totals
+
+
+def main() -> int:
+    rc, _ = run(build_parser().parse_args())
+    return rc
 
 
 if __name__ == "__main__":
