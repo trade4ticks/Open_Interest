@@ -42,8 +42,8 @@ from datetime import date, datetime
 from lib.market_hours import get_trading_days, last_trading_day
 from lib.metrics_compute import HistoryCache, compute_metrics
 from lib.metrics_store import (
-    check_catalog_drift, snapshots_for_date, sync_catalog,
-    sync_metrics_schema, write_metrics, write_zscores, zscore_rows,
+    check_catalog_drift, snapshots_for_date, sync_all,
+    write_metrics, write_zscores, zscore_rows,
 )
 
 logging.basicConfig(
@@ -195,9 +195,11 @@ def main() -> int:
             return 0
 
         if args.command == "catalog":
-            n_base, n_z = sync_metrics_schema(conn)
-            n_cat = sync_catalog(conn)
-            check_catalog_drift(conn)
+            # sync_all, not the steps inline — it also applies the metrics
+            # migrations, whose position either side of the column sync is
+            # load-bearing. `catalog` is the command reached for after a
+            # registry change, which is exactly when a rename needs to land.
+            n_base, n_z, n_cat = sync_all(conn)
             print(f"columns added: {n_base} base, {n_z} z; "
                   f"catalog rows: {n_cat}")
             return 0

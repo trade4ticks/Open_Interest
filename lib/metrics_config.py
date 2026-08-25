@@ -36,6 +36,12 @@ from dataclasses import dataclass
 
 # --- Grid -------------------------------------------------------------------
 TENORS = [7, 14, 21, 30, 60, 90]
+
+
+def _tenor_label(t: int) -> str:
+    return f"{t}d"
+
+
 DELTA_LABELS = ["10p", "25p", "atm", "25c", "10c"]
 
 # Label -> put_delta node in equity_surface. 'atm' is absent on purpose: it
@@ -61,8 +67,42 @@ RR_NODES = [(25, "25c", "25p"), (10, "10c", "10p")]
 TERM_PAIRS = [(7, 14), (14, 30), (30, 90), (7, 30)]
 TERM_SLOPE_DELTAS = ["25p", "atm", "25c"]
 
-# (label, trading-day window, the ATM tenor VRP measures it against)
-RV_WINDOWS = [("1w", 5, 7), ("1m", 21, 30), ("3m", 63, 90)]
+# --- Realized-vol windows, matched to the tenor grid ------------------------
+# Tenors are CALENDAR days; realized vol is computed over TRADING days. The two
+# do not map one-to-one, and a column called rv_14d that is actually a 10-day
+# window will be misread by someone eventually — so the mapping is derived from
+# one named constant here, restated in every description, and carried in the
+# catalog's formula field.
+#
+# The constant is the standard month convention, 21 trading days per 30 calendar
+# days (252/12). Everything else is round(0.7 * t):
+#
+#     tenor (cal)     7    14    21    30    60    90
+#     trading days    5    10    15    21    42    63
+#
+# 30 -> 21, 90 -> 63 and 7 -> 5 are the windows that already existed as rv_1m,
+# rv_3m and rv_1w. They are the SAME numbers under new names, which is why
+# sql/11_rv_tenor_rename.sql renames rather than recomputes them.
+TD_PER_MONTH = 21
+CD_PER_MONTH = 30
+
+
+def _trading_days(tenor: int) -> int:
+    return round(tenor * TD_PER_MONTH / CD_PER_MONTH)
+
+
+# (label, trading-day window, the ATM tenor VRP measures it against).
+# Derived from TENORS rather than written out, so a tenor added to the grid
+# cannot leave the VRP family behind — which is exactly how vrp ended up pinned
+# at three windows while every other tenor-bearing metric had six.
+RV_WINDOWS = [(_tenor_label(_t), _trading_days(_t), _t) for _t in TENORS]
+
+# Guard the table above against a silent edit to the convention. These are the
+# windows the descriptions and the catalog claim; if the arithmetic ever stops
+# producing them, the mismatch surfaces at import rather than in a column that
+# quietly means something else.
+assert [n for _, n, _ in RV_WINDOWS] == [5, 10, 15, 21, 42, 63], RV_WINDOWS
+
 RET_WINDOWS = [("d", 1), ("1w", 5), ("1m", 21)]
 SPOTVOL_WINDOWS = [("1m", 21), ("3m", 63)]
 VOV_WINDOW = 21
@@ -122,10 +162,6 @@ class Col:
     @property
     def z_eligible(self) -> bool:
         return self.family not in NO_Z_FAMILIES
-
-
-def _tenor_label(t: int) -> str:
-    return f"{t}d"
 
 
 # =============================================================================
@@ -273,34 +309,86 @@ for _lbl, _n in RET_WINDOWS:
              "log_return", f"{_n}-trading-day log return, closes through T-1.",
              f"ln(close[T-1] / close[T-1-{_n}])"))
 
+# THE NAME IS CALENDAR DAYS, THE WINDOW IS TRADING DAYS. rv_14d is a TEN
+# trading-day window, because the 14 matches the 14-CALENDAR-day tenor it is
+# the VRP denominator for. Every description and every formula below states the
+# trading-day count explicitly for that reason.
+_MAP = ", ".join(f"{_t}d->{_trading_days(_t)}td" for _t in TENORS)
+
 for _lbl, _n, _tenor in RV_WINDOWS:
+    _noise = ("" if _n >= 21 else
+              f" NOISY: {_n} returns is a thin sample for a standard "
+              f"deviation, and the shorter the window the thinner. That is the "
+              f"honest cost of matching the tenor rather than the convenient "
+              f"cost of not — a noisy correct window beats a precise wrong "
+              f"one. The z-score against this ticker's own history absorbs a "
+              f"good deal of it, since the same noise is in the baseline.")
     _add(Col(f"rv_{_lbl}", "realized_vol", "DOUBLE PRECISION", "vol_decimal",
-             f"Close-to-close realized vol over {_n} trading days, "
-             f"annualised. Closes through T-1.",
-             f"stdev(log returns, ddof=1) over {_n}td * sqrt(252)"))
+             f"Close-to-close realized vol over {_n} TRADING days, annualised, "
+             f"closes through T-1. Named for the {_tenor}-CALENDAR-day tenor "
+             f"it matches, not for its window length: tenors are calendar "
+             f"days and realized vol is trading days, so the grid maps "
+             f"{_MAP} at 21td per 30cd.{_noise}",
+             f"stdev(log returns, ddof=1) over {_n}td * sqrt(252); "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor))
     _add(Col(f"rv_park_{_lbl}", "realized_vol", "DOUBLE PRECISION",
              "vol_decimal",
-             f"Parkinson realized vol over {_n} trading days. Uses the "
-             f"high-low range, so far less noisy than close-close at this "
-             f"window.",
-             f"sqrt(sum(ln(h/l)^2) / (4*ln2*{_n})) * sqrt(252)"))
+             f"Parkinson realized vol over {_n} TRADING days, matched to the "
+             f"{_tenor}d tenor. Uses the high-low range, so materially less "
+             f"noisy than close-close at this window — which matters most at "
+             f"the short end, where the close-close sample is thinnest.",
+             f"sqrt(sum(ln(h/l)^2) / (4*ln2*{_n})) * sqrt(252); "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor))
     _add(Col(f"rv_gk_{_lbl}", "realized_vol", "DOUBLE PRECISION",
              "vol_decimal",
-             f"Garman-Klass realized vol over {_n} trading days, from full "
-             f"OHLC.",
-             "sqrt(mean(0.5*ln(h/l)^2 - (2*ln2-1)*ln(c/o)^2)) * sqrt(252)"))
+             f"Garman-Klass realized vol over {_n} TRADING days, matched to "
+             f"the {_tenor}d tenor, from full OHLC.",
+             f"sqrt(mean(0.5*ln(h/l)^2 - (2*ln2-1)*ln(c/o)^2)) * sqrt(252); "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor))
+
+# --- VRP --------------------------------------------------------------------
+# ON THE CONVENTION, ON THE RECORD: the wider volatility literature computes VRP
+# against a VARIANCE-SWAP implied — the CBOE-style integral across the whole
+# strike ladder — not against ATM IV. That was evaluated and ruled out here: it
+# needs the raw chain with its full strike range, cannot be recovered from a
+# 19-node delta grid, and the live path discards the raw frame.
+#
+# The consequence is a LEVEL difference, concentrated in the wing contribution,
+# which makes this VRP read lower than a variance-swap VRP by roughly the
+# convexity premium. That gap is fairly stable per ticker, so it largely cancels
+# under per-ticker z-scoring. Read the absolute level against an outside
+# platform at your peril; "is VRP unusual for this name today" is unaffected.
+_VS_NOTE = ("CONVENTION: measured against ATM IV, not a variance-swap implied "
+            "(the CBOE strike-ladder integral). The latter needs the full raw "
+            "chain, which the 19-node delta grid cannot reconstruct and the "
+            "live path does not retain. The difference is a per-ticker-stable "
+            "level offset in the wing contribution, so it largely cancels "
+            "under z-scoring but does NOT make the absolute level comparable "
+            "to an outside platform's VRP.")
 
 for _lbl, _n, _tenor in RV_WINDOWS:
     _add(Col(f"vrp_{_lbl}", "vrp", "DOUBLE PRECISION", "vol_decimal",
-             f"Variance risk premium at {_tenor}d: ATM IV minus {_n}td "
-             f"close-close realized vol. Close-close is kept as the "
-             f"denominator for comparability even though Parkinson is less "
-             f"noisy.",
-             f"iv_{_tenor}d_atm - rv_{_lbl}", tenor=_tenor, wing="atm"))
+             f"Variance risk premium at {_tenor}d: {_tenor}d ATM IV minus "
+             f"rv_{_lbl}, the TENOR-MATCHED {_n}-trading-day close-close "
+             f"realized vol. Implied and realized are measured over the same "
+             f"horizon here — a 7-day implied against a month of realized is "
+             f"the mismatch this family exists to remove. Close-close is kept "
+             f"as the denominator across all six for comparability, even "
+             f"though rv_park_{_lbl} is less noisy. {_VS_NOTE}",
+             f"iv_{_tenor}d_atm - rv_{_lbl}; "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor, wing="atm"))
     _add(Col(f"vrp_ratio_{_lbl}", "vrp", "DOUBLE PRECISION", "ratio",
-             f"ATM IV over realized vol at {_tenor}d. NULL rather than "
-             f"infinity when rv -> 0.",
-             f"iv_{_tenor}d_atm / rv_{_lbl}", tenor=_tenor, wing="atm"))
+             f"{_tenor}d ATM IV over the tenor-matched {_n}td realized vol. "
+             f"NULL rather than infinity as rv -> 0. Scale-free, so it "
+             f"compares a 12-vol name against an 80-vol one where vrp_{_lbl} "
+             f"does not. {_VS_NOTE}",
+             f"iv_{_tenor}d_atm / rv_{_lbl}, NULL if rv <= 0; "
+             f"{_tenor} calendar days -> {_n} trading days",
+             tenor=_tenor, wing="atm"))
 
 _add(Col("vov_30d_1m", "spot_vol",
          "DOUBLE PRECISION", "vol_decimal",
@@ -327,8 +415,13 @@ for _lbl, _n in SPOTVOL_WINDOWS:
 _add(Col("downside_semivol_1m", "realized_vol", "DOUBLE PRECISION",
          "vol_decimal",
          "Annualised stdev of close-close log returns over DOWN days only, "
-         "21td window, closes through T-1.",
-         "stdev(r for r in 21td returns if r < 0, ddof=1) * sqrt(252)"))
+         "21td window, closes through T-1. The '1m' here is the OLD label "
+         "convention and is NOT tenor-matched: it is the same 21-trading-day "
+         "window as rv_30d, but this metric has no tenor of its own and does "
+         "not retarget with the dashboard's tenor control. Kept unrenamed "
+         "because renaming it would break readers for no gain.",
+         "stdev(r for r in 21td returns if r < 0, ddof=1) * sqrt(252); "
+         "21td, equivalent to the 30d tenor window"))
 
 # --- Quality ----------------------------------------------------------------
 for _t in TENORS:

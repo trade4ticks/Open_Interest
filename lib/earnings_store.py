@@ -14,7 +14,6 @@ import logging
 from datetime import date, datetime
 
 import pandas as pd
-import psycopg2.extras
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +108,12 @@ def fetch_ticker(ticker: str, limit: int = DEFAULT_LIMIT) -> tuple:
 
 def upsert_calendar(conn, rows: list) -> int:
     """Overwrite on conflict — a future date that firms up must not be skipped."""
+    # Imported here, not at module scope. lib/metrics_compute pulls
+    # days_to_earnings out of this module and is otherwise database-free, so a
+    # top-level psycopg2 import would make the pure metric path — and the test
+    # suite that exercises it — require a driver it never uses.
+    import psycopg2.extras
+
     if not rows:
         return 0
     updates = [c for c in CAL_COLS if c not in ("ticker", "earnings_date")]

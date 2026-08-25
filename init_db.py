@@ -67,14 +67,13 @@ def main() -> None:
         # creates key-only skeletons and the ~600 metric columns are generated
         # from lib/metrics_config.py. Without this the tables exist but hold
         # nothing, which is the failure mode the drift check exists to catch.
+        # sync_all rather than the three steps inline: it also applies the
+        # metrics migrations, and their position either side of the column sync
+        # matters (see PRE_SYNC_SQL / POST_SYNC_SQL).
         try:
-            from lib.metrics_store import (
-                check_catalog_drift, sync_catalog, sync_metrics_schema,
-            )
+            from lib.metrics_store import sync_all
             print("Syncing equity_metrics columns      ...", end=" ", flush=True)
-            n_base, n_z = sync_metrics_schema(conn)
-            n_cat = sync_catalog(conn)
-            check_catalog_drift(conn)
+            n_base, n_z, n_cat = sync_all(conn)
             print(f"OK ({n_base} base + {n_z} z column(s), "
                   f"{n_cat} catalog row(s))")
         except Exception as e:

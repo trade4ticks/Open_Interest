@@ -8,7 +8,7 @@ whatever the code did the first time, including the sign errors.
 The tests that matter most:
 
   * OHLC windows end at T-1. A close on T that the snapshot could not have
-    known is planted in the fixture; if it leaks into log_ret_d or rv_1w, vrp
+    known is planted in the fixture; if it leaks into log_ret_d or rv_7d, vrp
     carries a full session of lookahead and a variance-premium backtest looks
     excellent for the wrong reason.
   * The zero-cost solve returns NULL rather than extrapolating past the
@@ -294,8 +294,9 @@ for i, c in enumerate(hist):
     bars.append({"d": d, "o": c * 0.995, "h": c * 1.01, "l": c * 0.99, "c": c})
 bars.append({"d": T, "o": 104.0, "h": 210.0, "l": 104.0, "c": 200.0})
 
-rvrow = C._realized(bars, T, {(7, "atm"): 0.35, (30, "atm"): 0.28,
-                              (90, "atm"): 0.30})
+rvrow = C._realized(bars, T, {(7, "atm"): 0.35, (14, "atm"): 0.32,
+                              (21, "atm"): 0.30, (30, "atm"): 0.28,
+                              (60, "atm"): 0.29, (90, "atm"): 0.30})
 close("log_ret_d uses close[T-1]/close[T-2]", rvrow["log_ret_d"],
       math.log(104.0 / 101.5))
 check("  and NOT the planted close on T",
@@ -303,35 +304,76 @@ check("  and NOT the planted close on T",
 close("log_ret_1w over 5 sessions", rvrow["log_ret_1w"],
       math.log(104.0 / 101.0))
 
+# The mapping is the thing most likely to be got wrong by a later edit, so it
+# is asserted against the documented table rather than against itself.
+check("RV_WINDOWS covers every tenor", [t for _, _, t in M.RV_WINDOWS],
+      M.TENORS)
+check("calendar tenor -> trading-day window mapping",
+      [(t, n) for _, n, t in M.RV_WINDOWS],
+      [(7, 5), (14, 10), (21, 15), (30, 21), (60, 42), (90, 63)])
+check("rv_14d is named for the TENOR, not its 10-day window",
+      dict((t, lbl) for lbl, _, t in M.RV_WINDOWS)[14], "14d")
+
 rets = [math.log(b / a) for a, b in zip(hist[:-1], hist[1:])]
 m = sum(rets[-5:]) / 5
 sd = math.sqrt(sum((r - m) ** 2 for r in rets[-5:]) / 4)
-close("rv_1w = stdev(5 returns, ddof=1) * sqrt(252)", rvrow["rv_1w"],
+close("rv_7d = stdev(5 returns, ddof=1) * sqrt(252)", rvrow["rv_7d"],
       sd * math.sqrt(252))
-check("rv_1w excludes T's 92% move", rvrow["rv_1w"] < 1.0, True)
+check("rv_7d excludes T's 92% move", rvrow["rv_7d"] < 1.0, True)
 
 pk = [math.log(b["h"] / b["l"]) ** 2 for b in bars[-6:-1]]
-close("rv_park_1w (Parkinson)", rvrow["rv_park_1w"],
+close("rv_park_7d (Parkinson)", rvrow["rv_park_7d"],
       math.sqrt(sum(pk) / (4 * math.log(2) * 5)) * math.sqrt(252))
 gk = [0.5 * math.log(b["h"] / b["l"]) ** 2
       - (2 * math.log(2) - 1) * math.log(b["c"] / b["o"]) ** 2
       for b in bars[-6:-1]]
-close("rv_gk_1w (Garman-Klass)", rvrow["rv_gk_1w"],
+close("rv_gk_7d (Garman-Klass)", rvrow["rv_gk_7d"],
       math.sqrt(sum(gk) / 5) * math.sqrt(252))
 check("Parkinson is not equal to close-close (it is a different estimator)",
-      abs(rvrow["rv_park_1w"] - rvrow["rv_1w"]) > 1e-6, True)
+      abs(rvrow["rv_park_7d"] - rvrow["rv_7d"]) > 1e-6, True)
 
-close("vrp_1w = iv_7d_atm - rv_1w", rvrow["vrp_1w"], 0.35 - rvrow["rv_1w"])
-close("vrp_ratio_1w", rvrow["vrp_ratio_1w"], 0.35 / rvrow["rv_1w"])
-check("insufficient history -> NULL", rvrow["rv_3m"], None)
-check("  and its vrp too", rvrow["vrp_3m"], None)
+close("vrp_7d = iv_7d_atm - rv_7d", rvrow["vrp_7d"], 0.35 - rvrow["rv_7d"])
+close("vrp_ratio_7d", rvrow["vrp_ratio_7d"], 0.35 / rvrow["rv_7d"])
+
+# 7 sessions of history: 6 returns. The 5td window fills, the 10td one cannot.
+check("6 returns is short of the 10td window -> NULL", rvrow["rv_14d"], None)
+check("  and its vrp too", rvrow["vrp_14d"], None)
+check("  and the 63td window at the long end", rvrow["rv_90d"], None)
+check("  and its vrp too", rvrow["vrp_90d"], None)
+
+# THE POINT OF THE WHOLE FAMILY: each VRP pairs its OWN tenor's implied with
+# its OWN matched window, never a shared one. Needs 64 sessions so all six
+# windows fill, and a distinct IV per tenor so a VRP built off the wrong
+# implied cannot coincidentally agree.
+_IV6 = {7: 0.35, 14: 0.32, 21: 0.30, 30: 0.28, 60: 0.29, 90: 0.31}
+_long = []
+for i in range(65):
+    _c = 100.0 * (1.0 + 0.004 * ((i % 7) - 3))      # deterministic wiggle
+    _long.append({"d": T - timedelta(days=65 - i), "o": _c * 0.998,
+                  "h": _c * 1.006, "l": _c * 0.994, "c": _c})
+six = C._realized(_long, T, {(t, "atm"): v for t, v in _IV6.items()})
+
+for _lbl, _n, _t in M.RV_WINDOWS:
+    check(f"rv_{_lbl} populated off 64 returns", six[f"rv_{_lbl}"] is not None,
+          True)
+    close(f"vrp_{_lbl} = iv_{_t}d_atm - rv_{_lbl}",
+          six[f"vrp_{_lbl}"], _IV6[_t] - six[f"rv_{_lbl}"])
+    close(f"vrp_ratio_{_lbl} = iv_{_t}d_atm / rv_{_lbl}",
+          six[f"vrp_ratio_{_lbl}"], _IV6[_t] / six[f"rv_{_lbl}"])
+
+check("all six vrp values are distinct — none is a copy of another",
+      len({round(six[f"vrp_{lbl}"], 12) for lbl, _, _ in M.RV_WINDOWS}), 6)
+check("swapping in the 30d implied would change vrp_7d",
+      abs(six["vrp_7d"] - (_IV6[30] - six["rv_7d"])) > 1e-9, True)
 
 flat = [{"d": T - timedelta(days=30 - i), "o": 100.0, "h": 100.0,
          "l": 100.0, "c": 100.0} for i in range(30)]
-z = C._realized(flat, T, {(7, "atm"): 0.35, (30, "atm"): 0.28,
-                          (90, "atm"): 0.30})
-check("rv -> 0 gives vrp_ratio NULL, not inf", z["vrp_ratio_1w"], None)
-check("  (rv really is zero)", z["rv_1w"], 0.0)
+z = C._realized(flat, T, {(7, "atm"): 0.35, (14, "atm"): 0.32,
+                          (21, "atm"): 0.30, (30, "atm"): 0.28,
+                          (60, "atm"): 0.29, (90, "atm"): 0.30})
+check("rv -> 0 gives vrp_ratio NULL, not inf", z["vrp_ratio_7d"], None)
+check("  (rv really is zero)", z["rv_7d"], 0.0)
+check("  at every tenor, not just the short one", z["vrp_ratio_21d"], None)
 check("no down days -> downside_semivol NULL", z["downside_semivol_1m"], None)
 
 
@@ -424,27 +466,51 @@ check("a date before the first known one still counts forward",
 
 
 print("\n=== 11. z-scores ===")
+# The window and the value being scored are SEPARATE arguments: a 10:15 reading
+# is measured against 15:45 closes and is not one of them. Self-inclusion is
+# gone, so the window below is the PRIOR baseline observations only.
 base = M.Z_BASE_COLUMNS[0].name
-series = [float(i) for i in range(21)]            # today = 20, mean = 10
-w = {(base, 63): series, (base, 252): series}
-zr = zscore_row(w, "SPY", date(2026, 6, 1), "1545")
-sd21 = math.sqrt(sum((x - 10.0) ** 2 for x in series) / 20)
-close(f"{base}_z_63 (21 obs meets the minimum)", zr[f"{base}_z_63"],
-      (20.0 - 10.0) / sd21)
-check("z_252 NULL — 21 obs is below its 63 minimum",
+need = max(M.Z_MIN_OBS[63], M.BASELINE_MIN_N)
+prior = [float(v) for v in range(need)]
+today = 100.0
+w = {(base, 63): prior, (base, 252): prior}
+zr = zscore_row(w, {base: today}, "SPY", date(2026, 6, 1), "1545")
+
+pm = sum(prior) / len(prior)
+psd = math.sqrt(sum((x - pm) ** 2 for x in prior) / (len(prior) - 1))
+close(f"{base}_z_63 scored against the PRIOR window, today excluded",
+      zr[f"{base}_z_63"], (today - pm) / psd)
+check(f"z_252 NULL — {need} obs is below its "
+      f"{max(M.Z_MIN_OBS[252], M.BASELINE_MIN_N)} minimum",
       zr[f"{base}_z_252"], None)
-check("today IS inside its own window", M.Z_MIN_OBS[63], 21)
-zc = zscore_row({(base, 63): [5.0] * 21}, "SPY", date(2026, 6, 1), "1545")
-check("constant series -> NULL, not 0/0", zc[f"{base}_z_63"], None)
-zn = zscore_row({(base, 63): series[:-1] + [None]}, "SPY", date(2026, 6, 1),
-                "1545")
-check("today NULL -> z NULL", zn[f"{base}_z_63"], None)
-zg = zscore_row({(base, 63): [None] * 10 + series[:11]}, "SPY",
+check("the 63 minimum is the larger of Z_MIN_OBS and BASELINE_MIN_N",
+      need, max(M.Z_MIN_OBS[63], M.BASELINE_MIN_N))
+
+# Self-inclusion inflates sigma and pulls the score toward zero. Proving the
+# two differ in the expected direction is the point of the redefinition.
+incl = prior + [today]
+im = sum(incl) / len(incl)
+isd = math.sqrt(sum((x - im) ** 2 for x in incl) / (len(incl) - 1))
+check("excluding today gives a LARGER |z| than including it would",
+      abs(zr[f"{base}_z_63"]) > abs((today - im) / isd), True)
+
+zs = zscore_row({(base, 63): prior[:need - 1]}, {base: today}, "SPY",
                 date(2026, 6, 1), "1545")
+check("one observation short of the minimum -> NULL", zs[f"{base}_z_63"], None)
+zc = zscore_row({(base, 63): [5.0] * need}, {base: 5.0}, "SPY",
+                date(2026, 6, 1), "1545")
+check("constant window -> NULL, not 0/0", zc[f"{base}_z_63"], None)
+zn = zscore_row(w, {base: None}, "SPY", date(2026, 6, 1), "1545")
+check("no value to score -> z NULL", zn[f"{base}_z_63"], None)
+zg = zscore_row({(base, 63): [None] * 10 + prior[:need - 1]}, {base: today},
+                "SPY", date(2026, 6, 1), "1545")
 check("gaps counted as absent, not as zeros", zg[f"{base}_z_63"], None)
 check("z row carries the join key",
       (zr["ticker"], zr["trade_date"], zr["snapshot"]),
       ("SPY", date(2026, 6, 1), "1545"))
+check("the baseline bucket is the single source", M.BASELINE_SNAPSHOT, "1545")
+check("every vrp column is z-eligible",
+      all(c.z_eligible for c in M.BASE_COLUMNS if c.family == "vrp"), True)
 
 
 # =============================================================================

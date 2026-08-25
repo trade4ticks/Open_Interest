@@ -17,8 +17,8 @@ AS-OF SEMANTICS — READ THIS BEFORE CHANGING THE OHLC WINDOWS
 ------------------------------------------------------------
 Every OHLC-derived window ends at T-1, STRICTLY. A row stamped
 (T, '1345') describes what is knowable at 13:45 on T, and T's close is not:
-it has not happened. Letting rv_1m see close[T] would put a full session of
-lookahead into vrp_1m — the exact bias that makes a variance-premium backtest
+it has not happened. Letting rv_30d see close[T] would put a full session of
+lookahead into vrp_30d — the exact bias that makes a variance-premium backtest
 look excellent and live trading not. This mirrors the knowledge-at-time rule
 the daily_features data dictionary states for the OI block.
 
@@ -514,6 +514,10 @@ def _realized(ohlc: list, trade_date, iv: dict) -> dict:
                     if None not in (prev, cur) and prev > 0 and cur > 0
                     else None)
 
+    # RV_WINDOWS is (label, TRADING-day window, matched CALENDAR-day tenor).
+    # The label is the tenor — rv_14d is a 10-trading-day window — so that a
+    # VRP compares a 14-day implied against 14 days of realized rather than
+    # against whatever window happened to be available. See metrics_config.
     for lbl, n, tenor in RV_WINDOWS:
         win = [r for r in rets[-n:] if r is not None] if len(rets) >= n else []
         row[f"rv_{lbl}"] = (_f(_stdev(win) * _SQRT_252)
@@ -522,6 +526,8 @@ def _realized(ohlc: list, trade_date, iv: dict) -> dict:
         row[f"rv_gk_{lbl}"] = _garman_klass(bars[-n:] if len(bars) >= n else [])
 
     for lbl, n, tenor in RV_WINDOWS:
+        # Tenor-matched by construction: the ATM IV at `tenor` calendar days
+        # against the realized vol over the `n` trading days that span them.
         atm_iv = iv.get((tenor, "atm"))
         rv = row.get(f"rv_{lbl}")
         row[f"vrp_{lbl}"] = (_f(atm_iv - rv) if None not in (atm_iv, rv)

@@ -334,6 +334,52 @@ def zscore_rows(conn, ticker: str, snapshot: str, dates: list) -> list:
     return out
 
 
+# Idempotent migrations, split by where they must sit relative to the column
+# sync. Both lists are re-applied on every run; each file no-ops when its change
+# is already in place.
+#
+# PRE  — renames. sync_metrics_schema only ever ADDs, so if it ran first it
+#        would create rv_30d as a fresh NULL column, the rename would then find
+#        the new name already present and skip, and rv_1m would be left as an
+#        orphan holding all the history while rv_30d sat empty. The drift check
+#        catches the orphan, but only after a rebuild had already been run
+#        against a column that was silently NULL.
+# POST — views over metric columns. On a fresh database 09 creates only the key
+#        skeleton and every metric column arrives from the registry, so a view
+#        naming rv_7d cannot be created until the sync has added it.
+PRE_SYNC_SQL = ["11_rv_tenor_rename.sql"]
+POST_SYNC_SQL = ["12_rv_compat_views.sql"]
+
+
+def _apply_sql(conn, names: list) -> None:
+    from pathlib import Path
+    sql_dir = Path(__file__).resolve().parent.parent / "sql"
+    for name in names:
+        path = sql_dir / name
+        if not path.exists():
+            continue
+        with conn.cursor() as cur:
+            cur.execute(path.read_text(encoding="utf-8"))
+        conn.commit()
+        log.info("migration applied: %s", name)
+
+
+def sync_all(conn) -> tuple:
+    """Migrate, add columns, regenerate the catalog, assert no drift.
+
+    THE one entry point for bringing the metrics schema up to date. Both
+    init_db.py and metrics_store.init_db() call this rather than sequencing the
+    steps themselves — the ordering above is load-bearing, and two copies of it
+    is one copy too many.
+    """
+    _apply_sql(conn, PRE_SYNC_SQL)
+    n_base, n_z = sync_metrics_schema(conn)
+    n_cat = sync_catalog(conn)
+    _apply_sql(conn, POST_SYNC_SQL)
+    check_catalog_drift(conn)
+    return n_base, n_z, n_cat
+
+
 def init_db(conn, sql_path=None) -> None:
     """Apply sql/09_equity_metrics.sql, then sync columns and the catalog."""
     from pathlib import Path
@@ -343,9 +389,7 @@ def init_db(conn, sql_path=None) -> None:
     with conn.cursor() as cur:
         cur.execute(path.read_text(encoding="utf-8"))
     conn.commit()
-    n_base, n_z = sync_metrics_schema(conn)
-    n_cat = sync_catalog(conn)
-    check_catalog_drift(conn)
+    n_base, n_z, n_cat = sync_all(conn)
     log.info("applied %s — %d base + %d z column(s) added, %d catalog row(s)",
              path.name, n_base, n_z, n_cat)
 
