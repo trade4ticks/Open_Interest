@@ -136,6 +136,17 @@ def main() -> int:
 
     rc, totals = capture.run(args)
     cap_secs = time.monotonic() - t0
+
+    # A capture that never ran is not a capture that failed. Cron fires 9-16
+    # but the grid starts at 09:35, so several firings a day legitimately do
+    # nothing; saying so plainly beats a "0 ticker(s)" line that reads like a
+    # bad cycle.
+    if totals.get("skipped"):
+        log.info("capture skipped — %s", totals["skipped"])
+        print(f"capture skipped — {totals['skipped']}")
+        print(f"Log: {log_path()}")
+        return rc
+
     written = totals.get("written", [])
     log.info("capture stage: %d ticker(s) written in %.0fs",
              len(written), cap_secs)

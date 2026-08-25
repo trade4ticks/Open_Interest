@@ -325,6 +325,28 @@ def fit_one(args) -> dict:
 
 # --- Cycle ------------------------------------------------------------------
 
+def new_totals(skipped: str = "") -> dict:
+    """The totals shape, defined once.
+
+    run_cycle builds one of these and every early exit in run() returns one
+    too, so `rc, totals = run(args)` unpacks whatever happened. run() used to
+    return a bare int when the market window was closed, which crashed the
+    pipeline on every cron firing before 09:35 and after 16:00.
+
+    `skipped` is the reason no capture was attempted, empty when one was.
+    """
+    return {"tickers": 0, "surface": 0, "atm": 0, "diagnostics": 0,
+            "failed": [], "captures": [],
+            "persist_bytes": 0, "persist_secs": 0.0, "persist_failed": [],
+            # (ticker, trade_date, snapshot) for rows that reached Postgres.
+            # The pipeline scopes its metrics pass to exactly these: captures
+            # holds every ticker that was FETCHED, including ones whose fit or
+            # write later failed, and computing metrics for those would read a
+            # surface that is not there.
+            "written": [],
+            "skipped": skipped}
+
+
 def run_cycle(conn, tickers: list, connections: int, workers: int,
               max_inflight: int, persist: bool = True) -> dict:
     """One capture pass over the universe."""
@@ -332,15 +354,7 @@ def run_cycle(conn, tickers: list, connections: int, workers: int,
     from lib.thetadata import fetch_first_order_snapshot, set_max_connections
 
     set_max_connections(connections)
-    totals = {"tickers": 0, "surface": 0, "atm": 0, "diagnostics": 0,
-              "failed": [], "captures": [],
-              "persist_bytes": 0, "persist_secs": 0.0, "persist_failed": [],
-              # (ticker, trade_date, snapshot) for rows that reached Postgres.
-              # The pipeline scopes its metrics pass to exactly these: captures
-              # holds every ticker that was FETCHED, including ones whose fit
-              # or write later failed, and computing metrics for those would
-              # read a surface that is not there.
-              "written": []}
+    totals = new_totals()
 
     def fetch(tk: str):
         t0 = time.monotonic()
@@ -539,7 +553,7 @@ def run(args) -> tuple:
     open_now, reason = market_window(now_et)
     if not open_now and not args.force:
         log.info("outside the market window — %s", reason)
-        return 0
+        return 0, new_totals(skipped=f"outside the market window — {reason}")
 
     lock = None
     if args.no_lock:
@@ -550,7 +564,7 @@ def run(args) -> tuple:
         if lock is False:
             log.warning("previous cycle still running (%s held) — skipping. "
                         "A cycle is never retried: 'now' has moved.", LOCK_PATH)
-            return 0
+            return 0, new_totals(skipped="previous cycle still running")
 
     print("=== live intraday surface ===")
     print(f"Log: {log_file}")
