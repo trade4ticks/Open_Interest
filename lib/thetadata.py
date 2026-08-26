@@ -1133,6 +1133,64 @@ def _parse_csv_frame(body: bytes) -> pd.DataFrame:
     return table.to_pandas()
 
 
+# /v3/option/history/eod is used only for expiration enumeration. CSV is worth
+# a great deal there (see enumerate_expirations_eod), but unlike
+# /v3/option/history/greeks/first_order it has no production mileage on CSV in
+# this codebase. So it is probed rather than assumed: the first call that comes
+# back without a usable `expiration` column demotes the whole run to JSON and
+# redoes that call, loudly and exactly once.
+#
+# This is a deliberate exception to the "no automatic fallback on parse
+# failure" rule stated for _RESPONSE_FORMAT above, and the difference is the
+# blast radius: a bad format on a data response loses one cell, while a bad
+# format on the ENUMERATION response means zero expirations, which silently
+# turns the entire run into a no-op that reports "NOTHING WRITTEN" for every
+# ticker. Failing over once and saying so is the safer of the two.
+_EOD_ENUM_FORMAT: str | None = None
+_EOD_ENUM_LOCK = threading.Lock()
+
+
+def _eod_enum_format() -> str:
+    with _EOD_ENUM_LOCK:
+        return _EOD_ENUM_FORMAT or response_format()
+
+
+def _demote_eod_enum_format(reason: str) -> None:
+    global _EOD_ENUM_FORMAT
+    with _EOD_ENUM_LOCK:
+        if _EOD_ENUM_FORMAT == "json":
+            return
+        _EOD_ENUM_FORMAT = "json"
+    log.warning("expiration enumeration: /v3/option/history/eod did not serve "
+                "usable CSV (%s) — falling back to JSON for the rest of this "
+                "run. Enumeration will be slower and allocate more, but "
+                "coverage is unaffected.", reason)
+
+
+def _csv_unique_column(body: bytes, column: str) -> list:
+    """Distinct values of ONE column of a CSV response, without pandas.
+
+    For callers that want a handful of distinct values out of a response with
+    a million rows — expiration enumeration being the case that matters. The
+    row-dict path builds a dict per row and then parses the same ~50 dates tens
+    of thousands of times over; this reads the CSV in pyarrow, takes the unique
+    of a single column, and hands back a short list.
+    """
+    if not body or not body.strip():
+        return []
+    table = pacsv.read_csv(
+        pa.BufferReader(body),
+        convert_options=pacsv.ConvertOptions(
+            column_types=_CSV_COLUMN_TYPES,
+            null_values=["", "NaN", "nan", "null", "NULL"],
+            strings_can_be_null=True,
+        ),
+    )
+    if column not in table.schema.names:
+        return []
+    return table.column(column).unique().to_pylist()
+
+
 def _get_snapshot(endpoint: str, params: dict,
                   total_timeout: int = SNAPSHOT_TOTAL_TIMEOUT,
                   fmt: str = "json"):
@@ -1305,9 +1363,23 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
         "end_date":   end_date.strftime("%Y%m%d"),
     }
     label = f"enum {symbol} {start_date}..{end_date}"
+    # Enumeration is by far the heaviest response in a snapshot run: one
+    # session with expiration=* is the entire EOD chain, and only its distinct
+    # `expiration` values are wanted. On JSON that meant json.loads building an
+    # object graph for every row, then `_parse_rows` building a dict per row on
+    # top of it, then parsing the same ~50 dates once per row — all to fill a
+    # set of ~50 entries. The CSV path reads it in pyarrow and takes the unique
+    # of one column.
+    #
+    # /v3/option/history/greeks/first_order is known to serve CSV (the intraday
+    # fetcher has run on it in production). /v3/option/history/eod is NOT
+    # independently confirmed, so this one probes rather than assumes: see
+    # _eod_enum_format().
+    fmt = _eod_enum_format()
 
     try:
-        data = _get_with_retry("/v3/option/history/eod", params, timeout, label)
+        data = _get_with_retry("/v3/option/history/eod", params, timeout, label,
+                               fmt=fmt)
     except NoDataError:
         return set()
     except BadRequestError as exc:
@@ -1338,8 +1410,26 @@ def enumerate_expirations_eod(symbol: str, start_date: date, end_date: date,
 
     t_parse = time.monotonic()
     out: set[date] = set()
-    for r in _parse_rows(data):
-        d = _parse_ymd(r.get("expiration"))
+    if fmt == "csv":
+        try:
+            values = _csv_unique_column(data, "expiration")
+        except Exception as exc:
+            _demote_eod_enum_format(f"CSV parse raised {type(exc).__name__}: {exc}")
+            values = []
+        if not values and data:
+            # Bytes came back but no expiration column survived. On this
+            # endpoint that is indistinguishable from "CSV is not served here",
+            # and guessing wrong empties the store, so demote to JSON for the
+            # rest of the run and redo this one call.
+            _demote_eod_enum_format("response carried no usable `expiration` "
+                                    "column")
+            data = _get_with_retry("/v3/option/history/eod", params, timeout,
+                                   label, fmt="json")
+            values = [r.get("expiration") for r in _parse_rows(data)]
+    else:
+        values = [r.get("expiration") for r in _parse_rows(data)]
+    for v in values:
+        d = _parse_ymd(v)
         if d is not None:
             out.add(d)
     _add_timing(parse_seconds=time.monotonic() - t_parse)
@@ -1475,6 +1565,21 @@ def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
     A 570 on a single-session point query cannot be relieved by splitting the
     date range any further, so it propagates to the caller, which records the
     unit as failed rather than retrying a request that would fail identically.
+
+    Response format: this function honours `response_format()` (CSV by
+    default), like `fetch_first_order_window` above. It previously did not —
+    it took the module default of JSON and then went through `_parse_rows`,
+    which materialises one Python dict per row on top of the object graph
+    json.loads has already built. That is the exact path the section comment at
+    the top of this module records as abandoned for holding the GIL, and it is
+    also the worst of the two for resident memory: millions of short-lived
+    dicts and strs per run fragment pymalloc's arenas, so the freed space is
+    not returned to the OS and RSS ratchets upward for the life of the process.
+    The CSV reader parses in pyarrow's C++ and never builds the object graph.
+
+    `fetch_first_order_window` is the same endpoint with start_time != end_time
+    and was already switched; leaving this one behind was an oversight, not a
+    distinction. The returned frame is the same either way.
     """
     date_str = trade_date.strftime("%Y%m%d")
     params = {
@@ -1488,10 +1593,12 @@ def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
     }
     label = (f"first_order {symbol} exp={expiration} "
              f"{trade_date} @{snapshot_time}")
+    fmt = response_format()
 
     try:
         data = _get_with_retry(
-            "/v3/option/history/greeks/first_order", params, timeout, label
+            "/v3/option/history/greeks/first_order", params, timeout, label,
+            fmt=fmt,
         )
     except NoDataError:
         return pd.DataFrame()
@@ -1501,8 +1608,7 @@ def fetch_first_order_raw(symbol: str, expiration: date, trade_date: date,
         raise
 
     t_parse = time.monotonic()
-    rows = _parse_rows(data)
-    out = pd.DataFrame(rows) if rows else pd.DataFrame()
+    out = _parse_csv_frame(data) if fmt == "csv" else _parse_frame(data)
     _add_timing(parse_seconds=time.monotonic() - t_parse)
     return out
 

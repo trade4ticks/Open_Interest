@@ -18,6 +18,7 @@ projection to the store schema, and their store module.
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import os
 import queue
@@ -88,6 +89,127 @@ def close_file_logging() -> None:
             pass
 
 
+# --- Resident memory --------------------------------------------------------
+#
+# Peak RSS is read from the kernel, not sampled. A sampler cannot see the spike
+# that matters here: the parquet merge allocates and frees several copies of a
+# year file well inside one 0.1s sampler tick, so the peak that gets the process
+# OOM-killed is invisible to it. /proc/self/status VmHWM is the kernel's own
+# high-water mark and catches a peak no matter how briefly it existed.
+#
+# VmHWM is monotone for the life of the process, so read naively every ticker
+# reports the run's worst-so-far and the log shows a ratchet instead of a trend.
+# Writing 5 to /proc/self/clear_refs resets it to the current VmRSS (Linux >=
+# 4.0), which is what makes a PER-TICKER peak possible. Where that write is not
+# permitted the numbers are still reported, but as run-to-date maxima; the
+# summary says which of the two it is rather than letting them be confused.
+#
+# Linux only, by construction — this is the VPS's OOM that we are chasing. Off
+# /proc every entry point degrades to a no-op and the callers are unchanged.
+
+_PROC_STATUS = Path("/proc/self/status")
+_CLEAR_REFS = Path("/proc/self/clear_refs")
+_PEAK_RESETTABLE: bool | None = None
+
+
+def proc_mem() -> tuple[int, int] | None:
+    """(VmRSS, VmHWM) in bytes, or None where /proc is unavailable."""
+    try:
+        rss = hwm = None
+        with open(_PROC_STATUS, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) * 1024
+                elif line.startswith("VmHWM:"):
+                    hwm = int(line.split()[1]) * 1024
+                    if rss is not None:
+                        break
+        if rss is None or hwm is None:
+            return None
+        return rss, hwm
+    except Exception:
+        return None
+
+
+def mem_available() -> bool:
+    return proc_mem() is not None
+
+
+def reset_peak_rss() -> bool:
+    """Reset VmHWM to the current VmRSS. True if the kernel accepted it.
+
+    The result is cached: a kernel that refuses once refuses always, and
+    probing per ticker would put a failing write in the log every time.
+    """
+    global _PEAK_RESETTABLE
+    if _PEAK_RESETTABLE is False:
+        return False
+    try:
+        _CLEAR_REFS.write_text("5\n", encoding="utf-8")
+        _PEAK_RESETTABLE = True
+        return True
+    except Exception:
+        if _PEAK_RESETTABLE is None:
+            log.info("peak-RSS reset unavailable (/proc/self/clear_refs not "
+                     "writable) — per-ticker peaks will be run-to-date maxima")
+        _PEAK_RESETTABLE = False
+        return False
+
+
+def peak_is_per_interval() -> bool:
+    """Whether reported peaks are per-measurement or run-to-date maxima."""
+    return _PEAK_RESETTABLE is True
+
+
+def mb(n: int | float) -> float:
+    return n / (1 << 20)
+
+
+@contextmanager
+def measure_memory(label: str):
+    """Record RSS in/out and the PEAK reached while the block runs.
+
+    Attribution note: RSS is a property of the PROCESS, and the parquet writer
+    thread runs concurrently with the block by design. A spike raised by the
+    writer therefore lands against whichever ticker was being fetched at the
+    time, which is the correct reading — the question this answers is "how
+    close to the ceiling was the process while working on X", not "which
+    allocation site was responsible".
+    """
+    before = proc_mem()
+    if before is None:
+        yield
+        return
+    reset_peak_rss()
+    try:
+        yield
+    finally:
+        after = proc_mem()
+        if after is not None:
+            rss_in, rss_out, peak = before[0], after[0], after[1]
+            with TIMING.lock:
+                TIMING.mem.append((label, rss_in, rss_out, peak))
+                TIMING.mem_peak = max(TIMING.mem_peak, peak)
+            log.info("  MEM %s: rss %.0f -> %.0f MB (%+.0f MB), peak %.0f MB",
+                     label, mb(rss_in), mb(rss_out), mb(rss_out - rss_in),
+                     mb(peak))
+
+
+def log_mem(label: str) -> None:
+    """One-shot RSS line, without resetting the peak.
+
+    Used from the writer thread, which must not reset a high-water mark the
+    main thread is in the middle of measuring against.
+    """
+    m = proc_mem()
+    if m is None:
+        return
+    with TIMING.lock:
+        TIMING.mem_peak = max(TIMING.mem_peak, m[1])
+    log.info("    MEM %s: rss %.0f MB, process peak %.0f MB",
+             label, mb(m[0]), mb(m[1]))
+
+
 # --- Run timing accounting --------------------------------------------------
 #
 # Two decompositions, because with N concurrent workers they cannot be one:
@@ -153,6 +275,13 @@ class RunTiming:
         self.lc_write_io = 0.0          # ParquetWriter.write_table only
         self.lc_finalize = 0.0          # close + rename + manifest
 
+        # (H) resident memory. One entry per measured interval (a ticker),
+        # (label, rss_in, rss_out, peak) in bytes. This is the series that
+        # makes a growth trend readable in the log instead of only inferable
+        # from an OOM kill in dmesg.
+        self.mem: list[tuple[str, int, int, int]] = []
+        self.mem_peak = 0
+
         # (B') worker-side, accrued IN THE WORKER by track(), in a finally
         # block, so failed and timed-out tasks are counted too. This is what
         # reconciles against the in-flight sampler.
@@ -170,7 +299,26 @@ class RunTiming:
 TIMING = RunTiming()
 
 # Sampled occupancy, for idle / under-saturation attribution.
-SAMPLES: list[tuple[int, bool]] = []     # (in-flight count, local work busy)
+# Occupancy is accumulated as running counters, not as a list of samples. At
+# 10 Hz a list grows without bound for the whole run and is one of the few
+# things here genuinely retained across every ticker; the summary only ever
+# reduced it to three scalars, so keeping the scalars costs nothing and removes
+# the growth. `SAMPLES` remains as an empty list purely so any external reader
+# does not break on the attribute.
+SAMPLES: list[tuple[int, bool]] = []     # deprecated; see SAMPLE_STATS
+
+
+class SampleStats:
+    __slots__ = ("n", "inflight_sum", "idle", "under")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.inflight_sum = 0
+        self.idle = 0
+        self.under = 0
+
+
+SAMPLE_STATS = SampleStats()
 _LOCAL_BUSY = False
 SAMPLER_STOP = threading.Event()
 
@@ -191,12 +339,27 @@ def set_local_busy(v: bool) -> None:
     _LOCAL_BUSY = v
 
 
-def start_sampler(interval: float = 0.1) -> None:
+def start_sampler(interval: float = 0.1, conns: int | None = None) -> None:
+    """Sample connection occupancy at `interval` into SAMPLE_STATS.
+
+    `conns` fixes the saturation threshold at start rather than reading it back
+    at summary time, so the "under-saturated" figure means what it meant while
+    the run was happening even if the cap is changed mid-run.
+    """
+    limit = conns if conns is not None else max_connections()
+
     def _run() -> None:
+        s = SAMPLE_STATS
         while not SAMPLER_STOP.wait(interval):
             with INFLIGHT_LOCK:
                 n = len(INFLIGHT)
-            SAMPLES.append((n, _LOCAL_BUSY))
+            busy = _LOCAL_BUSY
+            s.n += 1
+            s.inflight_sum += n
+            if n == 0 and not busy:
+                s.idle += 1
+            if n < limit:
+                s.under += 1
     threading.Thread(target=_run, daemon=True, name="sampler").start()
 
 
@@ -322,7 +485,10 @@ def print_timing_summary(wall_total: float,
     worker_total = t.enum_secs + t.query_secs
     http  = vt.get("http_seconds", 0.0)
     parse = vt.get("parse_seconds", 0.0)
-    mb    = vt.get("http_bytes", 0.0) / 1e6
+    # Not `mb`: that is the module-level bytes->MB helper, and binding it as a
+    # local here makes it a local for the WHOLE function, so the (H) section
+    # below would fail with "'float' object is not callable".
+    mbytes = vt.get("http_bytes", 0.0) / 1e6
 
     _emit("\n(B) WORKER-SIDE — concurrent, OVERLAPS (A) and itself.")
     _emit(f"    {conns} workers accrue up to "
@@ -334,7 +500,7 @@ def print_timing_summary(wall_total: float,
               f"{100.0 * http / worker_total:>6.1f}%")
         _emit(f"  {'  of which decode (json/rows/frame)':<38}{parse:>9.1f}s "
               f"{100.0 * parse / worker_total:>6.1f}%")
-    _emit(f"  {'bytes received':<38}{mb:>9.1f} MB")
+    _emit(f"  {'bytes received':<38}{mbytes:>9.1f} MB")
     if t.enum_count:
         _emit(f"  enumeration:   {t.enum_count:>6d} calls, {t.enum_secs:>8.1f}s "
               f"total, {t.enum_secs / t.enum_count:>6.2f}s avg")
@@ -409,12 +575,12 @@ def print_timing_summary(wall_total: float,
           f"{(100.0 * task / avail) if avail else 0:>6.1f}%")
     _emit(f"  {'worker-seconds unaccounted':<38}{avail - task:>9.1f}s "
           f"{(100.0 * (avail - task) / avail) if avail else 0:>6.1f}%")
-    n = len(SAMPLES)
+    s = SAMPLE_STATS
+    n = s.n
     if n:
-        mean_inflight = sum(c for c, _ in SAMPLES) / n
-        idle_frac  = sum(1 for c, busy in SAMPLES if c == 0 and not busy) / n
-        under_frac = sum(1 for c, _ in SAMPLES
-                         if c < conns) / n
+        mean_inflight = s.inflight_sum / n
+        idle_frac  = s.idle / n
+        under_frac = s.under / n
         _emit(f"  {'sampled mean in-flight':<38}{mean_inflight:>9.2f}")
         _emit(f"  {'DEAD TIME (0 in flight, no local work)':<38}"
               f"{idle_frac * wall_total:>9.1f}s {idle_frac * 100:>6.1f}%")
@@ -450,6 +616,39 @@ def print_timing_summary(wall_total: float,
               f"{t.max_frame_bytes / 1e6:>9.1f} MB "
               f"({t.max_frame_rows:,} rows)")
         _emit(f"  {'  from':<38}{t.max_frame_label}")
+
+    if t.mem:
+        # The series the OOM investigation needs: resident memory per ticker,
+        # in order, so a run that trends upward is visible here rather than
+        # only as a kill line in dmesg after the fact.
+        per_interval = peak_is_per_interval()
+        _emit("\n(H) RESIDENT MEMORY BY TICKER")
+        _emit("  peak is " + ("this ticker's own high-water mark "
+                              "(VmHWM reset per ticker)"
+                              if per_interval else
+                              "the RUN-TO-DATE maximum — VmHWM could not be "
+                              "reset,"))
+        if not per_interval:
+            _emit("  so it is monotone by construction and only its JUMPS "
+                  "are informative")
+        _emit(f"  {'ticker':<14}{'rss in':>10}{'rss out':>10}"
+              f"{'delta':>10}{'peak':>11}   (MB)")
+        for label, rss_in, rss_out, peak in t.mem:
+            _emit(f"  {label:<14}{mb(rss_in):>10.0f}{mb(rss_out):>10.0f}"
+                  f"{mb(rss_out - rss_in):>+10.0f}{mb(peak):>11.0f}")
+        # Growth measured on the BASELINE (rss between tickers), not on the
+        # peaks: the baseline is what a leak moves, while the peaks move with
+        # whichever year file happened to be merged.
+        first_base, last_base = t.mem[0][1], t.mem[-1][2]
+        _emit(f"  {'baseline first -> last':<38}"
+              f"{mb(first_base):>9.0f} -> {mb(last_base):.0f} MB "
+              f"({mb(last_base - first_base):+.0f} MB)")
+        _emit(f"  {'run peak RSS':<38}{mb(t.mem_peak):>9.0f} MB")
+        _emit("  A rising BASELINE means something is retained across "
+              "tickers.")
+        _emit("  A flat baseline with tall peaks means the write path is "
+              "sized by")
+        _emit("  the year file it merges into, not by what the run fetched.")
 
     if t.writes:
         secs = [w[0] for w in t.writes]
@@ -504,6 +703,106 @@ def print_timing_summary(wall_total: float,
     _emit("=" * 64)
 
 
+# --- Progress journal -------------------------------------------------------
+
+class ProgressJournal:
+    """Append-only record of which (ticker, batch) windows actually landed.
+
+    The store-based skip (`loaded_keys`) answers "is this cell on disk", which
+    is the right question for correctness but a slow, ticker-local one for an
+    operator whose run died at 80% and needs to know what to restart. This
+    answers "what did the run get through", in a file that outlives the tmux
+    session.
+
+    Written as line-buffered JSONL with no fsync: a SIGKILL — precisely the
+    death this exists for — leaves every flushed line intact and at worst
+    truncates the last one, which `completed` skips as unparseable.
+
+    A `written` record is emitted by the WRITER thread, after the atomic
+    rename. Never by the producer: a record must not be able to claim a batch
+    landed while its frame was still sitting in the queue. The `skipped` and
+    `empty` statuses have no pending I/O by definition and are recorded by the
+    producer directly.
+
+    Records carry a run SIGNATURE (tickers-independent: date range, batch size,
+    mode). Resume only honours records whose signature matches the current run,
+    so a journal left over from a different range or from --force cannot make
+    this run skip work it has not done.
+    """
+
+    def __init__(self, path: Path, sig: str) -> None:
+        self.path = path
+        self.sig = sig
+        self._lock = threading.Lock()
+        self._fh = None
+
+    def open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+
+    def completed(self) -> set[tuple[str, str, str]]:
+        """(ticker, w_start, w_end) triples this signature has already done."""
+        out: set[tuple[str, str, str]] = set()
+        if not self.path.exists():
+            return out
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        # A truncated final line from a killed run. Skipping it
+                        # can only cause the batch to be redone, never skipped.
+                        continue
+                    if r.get("sig") != self.sig:
+                        continue
+                    out.add((r.get("ticker", ""), r.get("w_start", ""),
+                             r.get("w_end", "")))
+        except Exception as exc:
+            log.warning("progress journal unreadable (%s) — continuing without "
+                        "resume; nothing will be skipped that is not already "
+                        "in the store", exc)
+        return out
+
+    def record(self, ticker: str, w_start: date, w_end: date,
+               status: str, rows: int = 0) -> None:
+        if self._fh is None:
+            return
+        rec = {
+            "t": datetime.now().isoformat(timespec="seconds"),
+            "sig": self.sig,
+            "ticker": ticker.upper(),
+            "w_start": w_start.isoformat(),
+            "w_end": w_end.isoformat(),
+            "status": status,
+            "rows": rows,
+        }
+        line = json.dumps(rec, separators=(",", ":"))
+        with self._lock:
+            try:
+                self._fh.write(line + "\n")
+            except Exception as exc:
+                log.warning("progress journal write failed: %s", exc)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+
+
+def run_signature(start: date, end: date, batch_days: int, mode: str) -> str:
+    """Identity of a run, for resume matching. Deliberately excludes the ticker
+    list: resuming a 121-ticker run with a 3-ticker retry of the ones that died
+    is the normal case, and requiring the lists to match would defeat it."""
+    return f"{start:%Y%m%d}-{end:%Y%m%d}:b{batch_days}:{mode}"
+
+
 # --- Background parquet writer ----------------------------------------------
 
 class ParquetWriterThread(threading.Thread):
@@ -531,22 +830,29 @@ class ParquetWriterThread(threading.Thread):
     can share this without it knowing which one it is writing to.
     """
 
-    def __init__(self, write_rows, year_path, store_dir, maxsize: int = 2):
+    def __init__(self, write_rows, year_path, store_dir, maxsize: int = 2,
+                 journal: "ProgressJournal | None" = None):
         super().__init__(daemon=True, name="parquet-writer")
         self._write_rows = write_rows
         self._year_path = year_path
         self._store_dir = store_dir
+        self._journal = journal
         self.q: "queue.Queue" = queue.Queue(maxsize=maxsize)
         self.error: BaseException | None = None
         self.error_ctx: str = ""
 
-    def submit(self, ticker: str, frame, ctx: str) -> None:
+    def submit(self, ticker: str, frame, ctx: str,
+               window: tuple[date, date] | None = None) -> None:
         """Block until the writer has room, then hand off. Raises whatever the
         writer already failed with, so a write failure stops the run promptly
-        rather than after every remaining ticker has been fetched for nothing."""
+        rather than after every remaining ticker has been fetched for nothing.
+
+        `window` is the batch's (start, end); it is journalled by the writer
+        AFTER the rename, so the progress file can never claim a batch landed
+        while its frame was still queued."""
         self._raise_if_failed()
         t0 = time.monotonic()
-        self.q.put((ticker, frame, ctx))
+        self.q.put((ticker, frame, ctx, window))
         waited = time.monotonic() - t0
         with TIMING.lock:
             TIMING.writer_wait += waited
@@ -565,7 +871,8 @@ class ParquetWriterThread(threading.Thread):
             try:
                 if item is None:
                     return
-                ticker, frame, ctx = item
+                ticker, frame, ctx, window = item
+                n_rows = len(frame)
                 t0 = time.monotonic()
                 try:
                     by_year = self._write_rows(ticker, frame)
@@ -576,29 +883,47 @@ class ParquetWriterThread(threading.Thread):
                     log.error("  %s: PARQUET WRITE FAILED — %s", ctx, exc,
                               exc_info=True)
                     continue
+                finally:
+                    # Drop the batch frame the moment the store is done with
+                    # it. Without this the writer holds a whole batch alive
+                    # across the blocking q.get() below — for the entire idle
+                    # period between two writes, which on a fast fetch and a
+                    # slow store is most of the run.
+                    frame = None
+                    item = None
                 secs = time.monotonic() - t0
 
                 if not by_year:
                     log.error("  %s: write_rows accepted %d rows but wrote no "
                               "year file — every row had an unusable "
-                              "trade_date", ctx, len(frame))
+                              "trade_date", ctx, n_rows)
                     continue
 
                 total_rows = 0
                 total_mb = 0.0
                 for y, n in sorted(by_year.items()):
                     p = self._year_path(ticker, y)
-                    mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
+                    size_mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
                     total_rows += n
-                    total_mb += mb
-                    log.info("    WROTE %s -> %d rows total, %.1f MB", p, n, mb)
+                    total_mb += size_mb
+                    log.info("    WROTE %s -> %d rows total, %.1f MB",
+                             p, n, size_mb)
                 with TIMING.lock:
                     TIMING.writer_secs += secs
                     TIMING.writer_count += 1
-                    TIMING.writes.append((secs, len(frame), total_rows, total_mb))
+                    TIMING.writes.append((secs, n_rows, total_rows, total_mb))
                 log.info("    write took %.1fs for %d new rows into %d rows / "
                          "%.1f MB (fetching continued throughout)",
-                         secs, len(frame), total_rows, total_mb)
+                         secs, n_rows, total_rows, total_mb)
+                # Reported, never reset: the main thread owns the VmHWM reset
+                # for its per-ticker window, and a second resetter would clear
+                # the peak it is measuring. This is the line that shows the
+                # merge, not the fetch, driving resident memory.
+                log_mem(f"after write {ctx}")
+
+                if self._journal is not None and window is not None:
+                    self._journal.record(ticker, window[0], window[1],
+                                         "written", n_rows)
             finally:
                 self.q.task_done()
 

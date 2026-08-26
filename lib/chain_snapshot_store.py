@@ -247,48 +247,90 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
     return out[COLUMNS]
 
 
-def _atomic_write(path: Path, df: pd.DataFrame) -> None:
+def _atomic_write_table(path: Path, table: pa.Table) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False)
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression="snappy",
                    row_group_size=ROW_GROUP_SIZE, use_dictionary=True)
     tmp.replace(path)
 
 
-def write_year(ticker: str, year: int, new_df: pd.DataFrame) -> int:
+def _atomic_write(path: Path, df: pd.DataFrame) -> None:
+    _atomic_write_table(
+        path, pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False))
+
+
+def write_year(ticker: str, year: int, new_df: pd.DataFrame,
+               coerced: bool = False) -> int:
     """
     Merge new_df into {ticker}/{year}.parquet (creating the file if missing).
 
     Dedupes on (trade_date, snapshot, expiration, strike, option_type) keeping
     LATEST so a refetch overrides, then sorts by SORT_KEYS before writing.
     Returns the total row count after merging.
+
+    `coerced=True` promises new_df has already been through `_coerce`, which
+    lets `write_rows` skip a second pass. `_coerce` is idempotent, so the flag
+    is an optimisation only — it never changes the result, just the number of
+    full-frame copies alive at once.
+
+    --- Memory ---------------------------------------------------------------
+
+    This path is read-modify-rewrite of a WHOLE year file, so its cost is set
+    by the file it merges into, not by the batch it is merging. It is the
+    largest allocator in a snapshot run by a wide margin, and it grows all run
+    as the file grows.
+
+    Each rebinding below is deliberate. Written as one chained expression
+    (concat -> drop_duplicates -> sort_values -> reset_index) pandas holds the
+    intermediate of every stage alive simultaneously, because the chain keeps a
+    reference to each; that is three whole-year frames plus both inputs at the
+    high-water mark. Rebinding `merged` at each step lets the previous stage's
+    frame be freed as soon as the next one is built, and dropping the inputs
+    right after the concat has copied them removes two more. `ignore_index` on
+    the sort folds what was a separate `reset_index` copy into it.
+
+    Note that a year frame in pandas is several times its on-disk size: date32
+    columns come back as object arrays of `datetime.date` (a pointer plus a
+    ~32-byte object per cell, times three date columns), where parquet stores
+    4 bytes. That multiplier is why a few hundred MB of parquet becomes
+    multiple GB of RSS here. Converting to Arrow before releasing the pandas
+    frame — rather than after, as the previous ordering did — keeps the fat
+    representation and the serialisation buffers from being live together.
     """
     if new_df.empty:
         return 0
 
-    new_df = _coerce(new_df)
-    new_df = new_df[new_df["trade_date"].apply(
+    if not coerced:
+        new_df = _coerce(new_df)
+    keep = new_df["trade_date"].map(
         lambda d: d is not None and not pd.isna(d) and d.year == year
-    )]
+    ).astype(bool)
+    if not keep.all():
+        new_df = new_df[keep]
+    del keep
     if new_df.empty:
         return 0
 
     existing = read_year(ticker, year)
     if existing.empty:
         merged = new_df
+        del existing
     else:
         merged = pd.concat([existing, new_df], ignore_index=True)
+        # concat has already copied both inputs; holding them through the
+        # dedupe and sort below is two whole frames of pure waste.
+        del existing
+    new_df = None
 
-    merged = (
-        merged
-        .drop_duplicates(subset=DEDUPE_KEYS, keep="last")
-        .sort_values(SORT_KEYS)
-        .reset_index(drop=True)
-    )
+    merged = merged.drop_duplicates(subset=DEDUPE_KEYS, keep="last")
+    merged = merged.sort_values(SORT_KEYS, ignore_index=True)
 
-    _atomic_write(year_path(ticker, year), merged)
-    return len(merged)
+    n = len(merged)
+    table = pa.Table.from_pandas(merged, schema=_SCHEMA, preserve_index=False)
+    del merged
+    _atomic_write_table(year_path(ticker, year), table)
+    return n
 
 
 def write_rows(ticker: str, df: pd.DataFrame) -> dict:
@@ -300,8 +342,13 @@ def write_rows(ticker: str, df: pd.DataFrame) -> dict:
     df = df[df["trade_date"].notna()]
     if df.empty:
         return {}
+
+    # Group on a derived Series rather than an assigned column: `assign` copies
+    # the whole frame to add __year and `drop(columns=...)` copies it back, so
+    # the old form paid two extra full-batch copies for a grouping key that
+    # never needed to be in the frame at all.
+    years = df["trade_date"].map(lambda d: d.year)
     out: dict = {}
-    df = df.assign(__year=df["trade_date"].apply(lambda d: d.year))
-    for y, chunk in df.groupby("__year"):
-        out[int(y)] = write_year(ticker, int(y), chunk.drop(columns="__year"))
+    for y, chunk in df.groupby(years, sort=True):
+        out[int(y)] = write_year(ticker, int(y), chunk, coerced=True)
     return out

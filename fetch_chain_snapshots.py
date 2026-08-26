@@ -79,6 +79,20 @@ sequentially with a single 4-worker pool covering only the expiration x
 snapshot fan-out (enumeration runs on the main thread between fan-outs), and
 lib/thetadata.py holds a BoundedSemaphore(4) around every snapshot request.
 
+--- Memory ----------------------------------------------------------------
+
+Peak RSS is dominated by the STORE's write path, not by the fetch. The store
+is one parquet file per (ticker, year) and its append is read-modify-rewrite,
+so a write costs a multiple of the file it merges into and grows all run as
+that file grows — the batch being written is the small term. See the memory
+note on `lib/chain_snapshot_store.write_year`.
+
+Every run reports resident memory per ticker, section (H) of the summary, and
+after each parquet write. Read the BASELINE row: a rising baseline means
+something is retained across tickers, while a flat baseline with tall peaks
+means the write path is sized by the year file, which is the expected shape
+here and the reason `--batch-days` alone does not bound it.
+
 Usage:
     python fetch_chain_snapshots.py
         (prompts for tickers + date range)
@@ -87,7 +101,11 @@ Usage:
         (refetch dates already present in the store)
 
     python fetch_chain_snapshots.py --batch-days 5
-        (write more often — lower peak memory, less lost to an interrupt)
+        (write more often — smaller batch frames, but MORE whole-year
+         rewrites, so it does not lower the peak the writer reaches)
+
+    python fetch_chain_snapshots.py --resume --start ... --end ...
+        (skip (ticker, batch) windows a previous run journalled as written)
 """
 from __future__ import annotations
 
@@ -99,6 +117,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
@@ -108,11 +127,15 @@ from lib.chain_fetch_common import (
     TIMING,
     chunk_range,
     ParquetWriterThread,
+    ProgressJournal,
     log_path,
+    measure_memory,
+    mem_available,
     preflight_store,
     print_timing_summary,
     prompt_date,
     prompt_tickers,
+    run_signature,
     set_local_busy,
     start_sampler,
     start_watchdog,
@@ -162,6 +185,11 @@ assert set(SNAPSHOT_TIMES) == set(SNAPSHOT_LABELS), \
 # much work an interrupted run discards. Lower it to reduce peak memory on
 # wide chains; raise it to write less often.
 DEFAULT_BATCH_DAYS = 30
+
+# Progress journal. Deliberately NOT timestamped like the run log: a resume has
+# to find the previous run's file without being told where it is.
+DEFAULT_PROGRESS_FILE = (Path(__file__).resolve().parent / "logs"
+                         / "chain_snapshots_progress.jsonl")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -352,7 +380,9 @@ def pool_size() -> int:
 def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
                  writer: ParquetWriterThread,
                  force: bool = False, debug_response: bool = False,
-                 repair: bool = False) -> int:
+                 repair: bool = False,
+                 journal: ProgressJournal | None = None,
+                 done_batches: set[tuple[str, str, str]] | None = None) -> int:
     """Enumerate + fetch every session in every batch for one ticker.
 
     Every ThetaData request issued here is a point query — one expiration,
@@ -366,7 +396,31 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
     (trade_date, snapshot) "loaded" flag stays honest: a run interrupted
     mid-batch leaves nothing for that batch, and a rerun redoes it in full
     rather than skipping a partial gap.
+
+    `done_batches` is the resume set read from the progress journal. It is a
+    fast path only: skipping on it is equivalent to what the store-based check
+    below would conclude, because a journal entry is written by the writer
+    thread after the atomic rename and never before.
+
+    A journalled batch means "this window was written", at the same
+    (trade_date, snapshot) granularity the store's own skip works at. It is
+    NOT a claim that every (session, expiration, snapshot) cell inside it
+    landed — individual point queries can fail inside a written window, which
+    is what --repair is for. Resume and repair answer different questions and
+    compose: resume gets you back to where the run died, repair fills the
+    holes inside what it wrote.
     """
+    if done_batches:
+        remaining = [(a, b) for (a, b) in batches
+                     if (ticker.upper(), a.isoformat(), b.isoformat())
+                     not in done_batches]
+        if len(remaining) != len(batches):
+            log.info("  %s: resume — %d/%d batch(es) already journalled",
+                     ticker, len(batches) - len(remaining), len(batches))
+        batches = remaining
+        if not batches:
+            return 0
+
     years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
     t_lk = time.monotonic()
     set_local_busy(True)
@@ -398,6 +452,8 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         if not todo:
             log.info("  %s %s..%s: all %d sessions loaded — skip",
                      ticker, w_start, w_end, len(sessions))
+            if journal is not None:
+                journal.record(ticker, w_start, w_end, "skipped")
             continue
 
         # --- enumerate + fetch, pipelined in ONE pool -----------------------
@@ -617,16 +673,35 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
             log.warning("  %s %s..%s: NOTHING WRITTEN — no rows survived "
                         "(see the counts above for which stage lost them)",
                         ticker, w_start, w_end)
+            # Journalled ONLY when the window is genuinely empty at the vendor.
+            # A window that came back empty because every query failed looks
+            # identical here, so it is left unrecorded and a --resume rerun
+            # retries it — the same reasoning as the store, which does not mark
+            # a session loaded when nothing was written for it.
+            if journal is not None and not failures and not enum_failures:
+                journal.record(ticker, w_start, w_end, "empty")
             continue
 
         combined = pd.concat(frames, ignore_index=True)
+        # concat has copied every element, so the list is now a second full
+        # copy of the batch. It matters more than it looks: `frames` is only
+        # rebound at the top of the NEXT iteration, so without this it stays
+        # resident through that batch's entire fan-out.
+        frames.clear()
+        n_combined = len(combined)
         # Hand off and move on. The next batch's enumeration and point queries
         # start immediately; the merge-and-rewrite happens behind them. Blocks
         # only if the writer is still busy with the previous batch, which is
         # recorded as writer_wait so backpressure is measured rather than
         # guessed at.
-        writer.submit(ticker, combined, f"{ticker} {w_start}..{w_end}")
-        fetched += len(combined)
+        writer.submit(ticker, combined, f"{ticker} {w_start}..{w_end}",
+                      window=(w_start, w_end))
+        # Same reason as `frames.clear()` above, and the one that costs most:
+        # the local binding outlives the submit, so the previous batch stayed
+        # resident for the whole of the next batch's fan-out — on top of the
+        # copy the writer queue is already holding.
+        combined = None
+        fetched += n_combined
 
     return fetched
 
@@ -665,6 +740,16 @@ def main() -> None:
     ap.add_argument("--debug-response", action="store_true",
                     help="dump columns + first row of the first non-empty "
                          "response per batch (diagnosing empty stores)")
+    ap.add_argument("--resume", action="store_true",
+                    help=("skip (ticker, batch) windows the progress journal "
+                          "records as already written for this same date "
+                          "range, batch size and mode. Entries are written by "
+                          "the writer thread AFTER the atomic rename, so a "
+                          "resume never skips a batch that did not land."))
+    ap.add_argument("--progress-file", default=None,
+                    help=("path to the progress journal "
+                          f"(default {DEFAULT_PROGRESS_FILE}). Append-only "
+                          "JSONL; read by --resume, always written."))
     ap.add_argument("--tickers", help="comma-separated; skips the prompt")
     ap.add_argument("--start", help="YYYYMMDD; skips the prompt")
     ap.add_argument("--end", help="YYYYMMDD; skips the prompt")
@@ -708,6 +793,17 @@ def main() -> None:
 
     batches = chunk_range(start, end, args.batch_days)
 
+    # --- progress journal ---------------------------------------------------
+    mode = "repair" if args.repair else ("force" if args.force else "normal")
+    journal = ProgressJournal(
+        Path(args.progress_file) if args.progress_file else DEFAULT_PROGRESS_FILE,
+        run_signature(start, end, args.batch_days, mode),
+    )
+    done_batches: set[tuple[str, str, str]] = set()
+    if args.resume:
+        done_batches = journal.completed()
+    journal.open()
+
     print(f"\n{len(tickers)} tickers x {len(sessions)} sessions "
           f"({start} -> {end})")
     print(f"{len(batches)} write batch(es) of <= {args.batch_days} calendar days, "
@@ -717,10 +813,25 @@ def main() -> None:
           "one instant.")
     print("Note: the last session is included even if today's 15:45 snapshot "
           "has not happened yet — it simply returns no data.\n")
+    print(f"Progress: {journal.path}")
+    if args.resume:
+        want = {(t, a.isoformat(), b.isoformat())
+                for t in tickers for (a, b) in batches}
+        already = want & done_batches
+        whole = [t for t in tickers
+                 if all((t, a.isoformat(), b.isoformat()) in done_batches
+                        for (a, b) in batches)]
+        print(f"Resume:   {len(already)}/{len(want)} batch(es) already "
+              f"journalled; {len(whole)} ticker(s) complete and will be "
+              f"skipped outright")
+    else:
+        print("Resume:   off (--resume to skip what a previous run "
+              "journalled)")
+    print()
 
     run_t0 = time.monotonic()
     reset_snapshot_timing()
-    start_sampler()
+    start_sampler(conns=max_connections())
 
     preflight_store(CHAIN_SNAPSHOTS_DIR, CHAIN_EOD_DIR)
 
@@ -737,20 +848,35 @@ def main() -> None:
 
     writer = ParquetWriterThread(write_rows, year_path,
                                  CHAIN_SNAPSHOTS_DIR,
-                                 maxsize=args.write_queue)
+                                 maxsize=args.write_queue,
+                                 journal=journal)
     writer.start()
+
+    if not mem_available():
+        log.info("resident-memory reporting unavailable (no /proc/self/status) "
+                 "— the (H) section will be omitted")
 
     # Tickers are sequential on purpose: the connection budget is spent inside
     # each chunk's fan-out, so ticker-level parallelism would buy nothing and
     # could only risk exceeding the cap.
     total = 0
     failed_tickers: list[str] = []
-    with tqdm(total=len(tickers), unit="tk", ncols=90, desc="snapshots") as bar:
-        for t in tickers:
+    done_tickers: list[str] = []
+    n_tickers = len(tickers)
+    with tqdm(total=n_tickers, unit="tk", ncols=90, desc="snapshots") as bar:
+        for i, t in enumerate(tickers, 1):
             try:
-                total += fetch_ticker(t, batches, writer, force=args.force,
-                                      debug_response=args.debug_response,
-                                      repair=args.repair)
+                # Memory is measured per ticker so a growth trend is legible in
+                # the log while the run is alive, rather than only as an
+                # anon-rss figure in dmesg after the kill.
+                with measure_memory(t):
+                    total += fetch_ticker(t, batches, writer, force=args.force,
+                                          debug_response=args.debug_response,
+                                          repair=args.repair,
+                                          journal=journal,
+                                          done_batches=done_batches)
+                done_tickers.append(t)
+                log.info("  DONE %s (%d/%d)", t, i, n_tickers)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -768,12 +894,31 @@ def main() -> None:
     print(f"OK ({time.monotonic() - flush_t0:.1f}s)")
 
     stop_background_threads()
+    # Closed only after the writer has drained, so every journal line the
+    # writer had left to emit is on disk before the file is released.
+    journal.close()
 
     print(f"\n{total:,} rows fetched and merged into {CHAIN_SNAPSHOTS_DIR}")
     print("Fetch-and-store only — no metrics repointed, no cron wired.")
     print(f"Log written to {log_path()}")
 
     print_timing_summary(time.monotonic() - run_t0)
+
+    # What landed and what did not, stated rather than left to be inferred
+    # from the log. This is the line to read after a run that died.
+    print(f"\nTickers: {len(done_tickers)}/{n_tickers} completed"
+          + (f", {len(failed_tickers)} failed" if failed_tickers else "")
+          + (f", {n_tickers - len(done_tickers) - len(failed_tickers)} not "
+             "reached" if n_tickers - len(done_tickers) - len(failed_tickers)
+             else ""))
+    not_reached = [t for t in tickers
+                   if t not in done_tickers and t not in failed_tickers]
+    if not_reached:
+        print(f"  not reached: {', '.join(not_reached[:15])}"
+              f"{' ...' if len(not_reached) > 15 else ''}")
+    print(f"  progress journal: {journal.path}")
+    print("  re-run with --resume (same --start/--end/--batch-days) to pick "
+          "up where this left off")
 
     if failed_tickers:
         print(f"\n{len(failed_tickers)} ticker(s) FAILED: "
