@@ -15,7 +15,7 @@ parquet is this script's job.
 
 Sources (roots resolve from config.py, set in .env — do not assume a literal
 path here, both stores have already moved once):
-    snapshots (default)  {CHAIN_SNAPSHOTS_DIR}/<TICKER>/<YYYY>.parquet
+    snapshots (default)  {CHAIN_SNAPSHOTS_DIR}/<TICKER>/<YYYYMM>.parquet
     intraday             {CHAIN_INTRADAY_DIR}/<TICKER>/<YYYYMMDD>.parquet
 
 Both share one 20-column schema, so there is no per-store branching beyond
@@ -76,7 +76,7 @@ def files_for(ticker: str, source: str, day: date) -> list:
     """Parquet file(s) that could hold `day` for this ticker.
 
     The two stores are laid out differently — one file per session for
-    intraday, one per year for snapshots — so this is the only place the
+    intraday, one per month for snapshots — so this is the only place the
     difference shows up.
     """
     d = _store_dir(source) / ticker.upper()
@@ -85,7 +85,7 @@ def files_for(ticker: str, source: str, day: date) -> list:
     if source == SOURCE_INTRADAY:
         p = d / f"{day:%Y%m%d}.parquet"
         return [p] if p.exists() else []
-    p = d / f"{day:%Y}.parquet"
+    p = d / f"{day:%Y%m}.parquet"
     return [p] if p.exists() else []
 
 
@@ -152,7 +152,7 @@ def expected_cost(ticker: str, source: str, days: list) -> int:
     seen = set()
     for day in days:
         for p in files_for(ticker, source, day):
-            if p in seen:            # snapshots keeps a whole year in one file
+            if p in seen:            # snapshots keeps a whole month in one file
                 continue
             seen.add(p)
             try:
@@ -371,6 +371,24 @@ def main() -> int:
             raise SystemExit(
                 f"No tickers found under {_store_dir(args.source)}. "
                 f"Pass --tickers, or check --source.")
+
+        # The snapshots store is {TICKER}/{YYYYMM}.parquet. A ticker still
+        # holding pre-migration {YYYY}.parquet files would make files_for()
+        # return nothing for every day, and this run would report "no rows"
+        # per ticker and exit 0 — a silent no-op that looks like a completed
+        # build. Refuse instead, the same way the fetcher does.
+        if args.source == SOURCE_SNAPSHOTS:
+            from lib.chain_snapshot_store import list_legacy_year_files
+            stale = sorted(t for t in tickers if list_legacy_year_files(t))
+            if stale:
+                raise SystemExit(
+                    f"\n{len(stale)} ticker(s) still hold pre-migration "
+                    f"{{YYYY}}.parquet files: {', '.join(stale[:10])}"
+                    f"{' ...' if len(stale) > 10 else ''}\n"
+                    "The snapshots store is now {TICKER}/{YYYYMM}.parquet and "
+                    "year files are not read, so this run would find no rows "
+                    "and silently do nothing.\n"
+                    "  python migrate_chain_snapshots_to_monthly.py --dry-run")
 
         if args.command == "batch":
             if not (args.start and args.end):

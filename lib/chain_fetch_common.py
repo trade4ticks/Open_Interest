@@ -826,15 +826,18 @@ class ParquetWriterThread(threading.Thread):
     become the bottleneck. Sizing matters more for the intraday store, where a
     single batch frame is a full session of 5-minute bars.
 
-    write_rows / year_path are injected rather than imported so the two stores
-    can share this without it knowing which one it is writing to.
+    write_rows / path_for are injected rather than imported so the stores can
+    share this without it knowing which one it is writing to. `path_for` maps
+    a partition key to its file; the key is whatever that store's `write_rows`
+    returns as its dict keys — a year for chain_store, a month (YYYYMM) for
+    chain_snapshot_store. This thread never interprets it, only passes it back.
     """
 
-    def __init__(self, write_rows, year_path, store_dir, maxsize: int = 2,
+    def __init__(self, write_rows, path_for, store_dir, maxsize: int = 2,
                  journal: "ProgressJournal | None" = None):
         super().__init__(daemon=True, name="parquet-writer")
         self._write_rows = write_rows
-        self._year_path = year_path
+        self._path_for = path_for
         self._store_dir = store_dir
         self._journal = journal
         self.q: "queue.Queue" = queue.Queue(maxsize=maxsize)
@@ -875,7 +878,7 @@ class ParquetWriterThread(threading.Thread):
                 n_rows = len(frame)
                 t0 = time.monotonic()
                 try:
-                    by_year = self._write_rows(ticker, frame)
+                    by_part = self._write_rows(ticker, frame)
                 except BaseException as exc:            # noqa: BLE001
                     # A write failure is systemic (permissions, schema, disk),
                     # not batch-specific. Record it; the main thread raises.
@@ -893,16 +896,16 @@ class ParquetWriterThread(threading.Thread):
                     item = None
                 secs = time.monotonic() - t0
 
-                if not by_year:
+                if not by_part:
                     log.error("  %s: write_rows accepted %d rows but wrote no "
-                              "year file — every row had an unusable "
-                              "trade_date", ctx, n_rows)
+                              "file — every row had an unusable trade_date",
+                              ctx, n_rows)
                     continue
 
                 total_rows = 0
                 total_mb = 0.0
-                for y, n in sorted(by_year.items()):
-                    p = self._year_path(ticker, y)
+                for part, n in sorted(by_part.items()):
+                    p = self._path_for(ticker, part)
                     size_mb = (p.stat().st_size / 1e6) if p.exists() else 0.0
                     total_rows += n
                     total_mb += size_mb
@@ -1072,12 +1075,27 @@ def preflight_store(store_dir: Path, sibling_dir: Path) -> None:
 
 # --- Batching ---------------------------------------------------------------
 
-def chunk_range(start: date, end: date, max_days: int) -> list[tuple[date, date]]:
+def _month_end(d: date) -> date:
+    if d.month == 12:
+        return date(d.year, 12, 31)
+    return date(d.year, d.month + 1, 1) - timedelta(days=1)
+
+
+def chunk_range(start: date, end: date, max_days: int,
+                snap_month: bool = False) -> list[tuple[date, date]]:
     """Split [start, end] into inclusive calendar-day windows of <= max_days.
 
     These are WRITE batches, not request windows — every request the fetchers
     issue covers a single session.  A batch with no trading days is harmless:
     it yields no sessions and is skipped.
+
+    `snap_month` additionally stops a window from crossing a month boundary.
+    For a store partitioned by month that turns each batch into exactly one
+    file: without it a window spanning, say, Jan 20 - Feb 18 rewrites both
+    January's and February's file, and the NEXT window rewrites February
+    again — so every month file is merged roughly twice per run instead of
+    once. `max_days` still applies as the upper bound, so a long month is
+    still split if asked.
     """
     if max_days < 1:
         raise ValueError("max_days must be >= 1")
@@ -1085,6 +1103,8 @@ def chunk_range(start: date, end: date, max_days: int) -> list[tuple[date, date]
     cur = start
     while cur <= end:
         w_end = min(cur + timedelta(days=max_days - 1), end)
+        if snap_month:
+            w_end = min(w_end, _month_end(cur))
         out.append((cur, w_end))
         cur = w_end + timedelta(days=1)
     return out

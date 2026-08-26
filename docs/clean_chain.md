@@ -33,7 +33,7 @@ Both accept an optional `config=` (a dict or a path) which defaults to
 
 Works unchanged on both stores — the 5-minute
 (`chain_intraday/<TICKER>/<YYYYMMDD>.parquet`) and twice-daily
-(`chain_snapshots/<TICKER>/<YYYY>.parquet`) — because they share one 20-column
+(`chain_snapshots/<TICKER>/<YYYYMM>.parquet`) — because they share one 20-column
 schema. There is no store-specific branching.
 
 ## Thresholds are inherited and known mis-tuned

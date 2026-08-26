@@ -1,7 +1,31 @@
 """
 Parquet storage for twice-daily intraday option-chain snapshots.
 
-Layout:  {CHAIN_SNAPSHOTS_DIR}/{ticker}/{year}.parquet
+Layout:  {CHAIN_SNAPSHOTS_DIR}/{ticker}/{YYYYMM}.parquet
+
+--- Why monthly ------------------------------------------------------------
+
+This store was {ticker}/{year}.parquet until the append path OOM-killed the
+fetcher on a 15GB VPS. The append is read-modify-rewrite of a whole file, so
+its peak memory is set by the file it merges into, not by the batch being
+merged — and a year file only ever grows. A year frame in pandas is also
+several times its on-disk size, because date32 comes back as an object array
+of datetime.date (a pointer plus a ~32-byte object per cell, across three date
+columns) where parquet stores 4 bytes. A few hundred MB on disk became
+multiple GB of RSS, four copies live at the high-water mark.
+
+Monthly divides that by ~12 and is where the problem stops: a ~15MB file is
+~120MB of pandas, so the merge peaks in the hundreds of MB rather than the
+gigabytes.
+
+Not per-session, which lib/chain_intraday_store.py uses: that store's memory
+bound comes from streaming one expiration at a time through a
+pq.ParquetWriter, not from its file granularity, and it holds 78 snapshots per
+session against this store's 2. Per-session here would mean ~212,000 files
+against ~10,200 for monthly, for a problem already solved at monthly — and
+chain_intraday made the same file-count trade itself, choosing session files
+over {date}/{expiration} to keep a rolling window at 2,400 files rather than
+84,000.
 
 Sibling to lib/chain_store.py (the EOD greeks chain).  Deliberately separate:
 this store is fed by /v3/option/history/greeks/first_order at 09:45 and 15:45,
@@ -37,16 +61,21 @@ now carries that information, so source_session would only duplicate
 trade_date.  Map snapshot -> source_session at join time if a validation join
 against chain_eod needs it.
 
-Write behaviour: read the existing year file, concat, dedupe on
+Write behaviour: read the existing month file, concat, dedupe on
 (trade_date, snapshot, expiration, strike, option_type) keeping the LATEST
 values (so a refetch overrides), SORT, then write atomically (.tmp + rename).
 
 The sort is load-bearing, not cosmetic.  Rows are sorted by trade_date first
 so that each row group covers a narrow date range; combined with an explicit
 ROW_GROUP_SIZE this gives tight per-row-group min/max statistics and therefore
-effective date-range predicate pushdown within a single year file.  Sorting
-alone would not achieve this — pyarrow's default row-group size is large
-enough that a year could land as a handful of groups each spanning months.
+effective date-range predicate pushdown within a single file.  Sorting alone
+would not achieve this — pyarrow's default row-group size is large enough that
+a month could land as a single group spanning all of it.
+
+That pushdown is now actually exercised: build_equity_surface.load_day passes
+filters=[("trade_date", "==", day)]. It did not until the same change that
+introduced this layout, which is why the store could carry a whole year per
+file for as long as it did without anyone noticing the read cost.
 """
 from __future__ import annotations
 
@@ -113,8 +142,26 @@ def ticker_dir(ticker: str) -> Path:
     return CHAIN_SNAPSHOTS_DIR / ticker.upper()
 
 
-def year_path(ticker: str, year: int) -> Path:
-    return ticker_dir(ticker) / f"{year}.parquet"
+# Month keys are the int YYYYMM, which is exactly the filename stem, sorts
+# chronologically as an integer, and cannot be confused with a bare year the
+# way a (year, month) tuple silently could during the migration.
+
+def month_key(d: date) -> int:
+    return d.year * 100 + d.month
+
+
+def month_path(ticker: str, ym: int) -> Path:
+    return ticker_dir(ticker) / f"{ym:06d}.parquet"
+
+
+def months_between(start: date, end: date) -> set[int]:
+    """Every month key touched by the inclusive range [start, end]."""
+    out: set[int] = set()
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        out.add(y * 100 + m)
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
 
 
 def list_tickers() -> list[str]:
@@ -128,17 +175,40 @@ def list_tickers() -> list[str]:
     return sorted(out)
 
 
-def list_years(ticker: str) -> list[int]:
+def list_months(ticker: str) -> list[int]:
+    """Month keys present on disk, ascending.
+
+    A stem that is not a 6-digit YYYYMM is skipped rather than guessed at —
+    which is what makes a leftover {YYYY}.parquet from before the monthly
+    migration invisible here instead of being read as month 2024 of year 20.
+    """
     d = ticker_dir(ticker)
     if not d.exists():
         return []
-    years = []
+    months = []
     for p in d.glob("*.parquet"):
-        try:
-            years.append(int(p.stem))
-        except ValueError:
+        stem = p.stem
+        if len(stem) != 6 or not stem.isdigit():
             continue
-    return sorted(years)
+        ym = int(stem)
+        if not 1 <= ym % 100 <= 12:
+            continue
+        months.append(ym)
+    return sorted(months)
+
+
+def list_legacy_year_files(ticker: str) -> list[Path]:
+    """Pre-migration {YYYY}.parquet files still present for this ticker.
+
+    Exists so callers can SAY that unmigrated data is being ignored rather
+    than silently returning less than the store holds. `list_months` skips
+    these by construction; without this they would be invisible.
+    """
+    d = ticker_dir(ticker)
+    if not d.exists():
+        return []
+    return sorted(p for p in d.glob("*.parquet")
+                  if len(p.stem) == 4 and p.stem.isdigit())
 
 
 def has_data(ticker: str) -> bool:
@@ -147,22 +217,22 @@ def has_data(ticker: str) -> bool:
 
 
 def parquet_glob(ticker: str) -> str:
-    """Glob string pointing at every year file for one ticker (for DuckDB)."""
+    """Glob string pointing at every month file for one ticker (for DuckDB)."""
     return str(ticker_dir(ticker) / "*.parquet")
 
 
 # --- Read ------------------------------------------------------------------
 
-def read_year(ticker: str, year: int,
-              columns: list[str] | None = None) -> pd.DataFrame:
-    p = year_path(ticker, year)
+def read_month(ticker: str, ym: int,
+               columns: list[str] | None = None) -> pd.DataFrame:
+    p = month_path(ticker, ym)
     if not p.exists():
         return pd.DataFrame(columns=columns or COLUMNS)
     return pd.read_parquet(p, columns=columns)
 
 
 def loaded_cells(ticker: str,
-                 years: set[int] | None = None,
+                 months: set[int] | None = None,
                  dates: set[date] | None = None) -> set[tuple[date, date, str]]:
     """(trade_date, expiration, snapshot) triples present in the store.
 
@@ -171,14 +241,14 @@ def loaded_cells(ticker: str,
     (trade_date, snapshot) — which is why a plain re-run cannot see a hole
     inside a session that wrote *some* expirations.
 
-    Reads three columns only. Pass `years` and/or `dates` to bound the scan.
+    Reads three columns only. Pass `months` and/or `dates` to bound the scan.
     """
     out: set[tuple[date, date, str]] = set()
-    for y in list_years(ticker):
-        if years is not None and y not in years:
+    for ym in list_months(ticker):
+        if months is not None and ym not in months:
             continue
         try:
-            tbl = pq.read_table(year_path(ticker, y),
+            tbl = pq.read_table(month_path(ticker, ym),
                                 columns=["trade_date", "expiration", "snapshot"])
         except Exception:
             continue
@@ -191,24 +261,25 @@ def loaded_cells(ticker: str,
     return out
 
 
-def loaded_keys(ticker: str, years: set[int] | None = None) -> set[tuple[date, str]]:
+def loaded_keys(ticker: str, months: set[int] | None = None) -> set[tuple[date, str]]:
     """Distinct (trade_date, snapshot) pairs already present for this ticker.
 
     Used by the fetcher to skip work that's already done.  Reads only the two
-    key columns — these year files are large and a full read would dominate
-    startup.  Pass `years` to restrict the scan to the years the caller's date
-    range actually touches.
+    key columns — a full read would dominate startup.  Pass `months` to
+    restrict the scan to the months the caller's date range actually touches;
+    under the monthly layout that is a far tighter bound than the year set it
+    replaced.
     """
     out: set[tuple[date, str]] = set()
-    for y in list_years(ticker):
-        if years is not None and y not in years:
+    for ym in list_months(ticker):
+        if months is not None and ym not in months:
             continue
         try:
-            tbl = pq.read_table(year_path(ticker, y),
+            tbl = pq.read_table(month_path(ticker, ym),
                                 columns=["trade_date", "snapshot"])
         except Exception:
             # A truncated or unreadable file must not make the caller think
-            # those dates are loaded — treat as "nothing loaded" for that year.
+            # those dates are loaded — treat as "nothing loaded" for that month.
             continue
         df = tbl.to_pandas().drop_duplicates()
         for td, sn in zip(df["trade_date"], df["snapshot"]):
@@ -260,10 +331,10 @@ def _atomic_write(path: Path, df: pd.DataFrame) -> None:
         path, pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False))
 
 
-def write_year(ticker: str, year: int, new_df: pd.DataFrame,
-               coerced: bool = False) -> int:
+def write_month(ticker: str, ym: int, new_df: pd.DataFrame,
+                coerced: bool = False) -> int:
     """
-    Merge new_df into {ticker}/{year}.parquet (creating the file if missing).
+    Merge new_df into {ticker}/{YYYYMM}.parquet (creating the file if missing).
 
     Dedupes on (trade_date, snapshot, expiration, strike, option_type) keeping
     LATEST so a refetch overrides, then sorts by SORT_KEYS before writing.
@@ -276,27 +347,23 @@ def write_year(ticker: str, year: int, new_df: pd.DataFrame,
 
     --- Memory ---------------------------------------------------------------
 
-    This path is read-modify-rewrite of a WHOLE year file, so its cost is set
-    by the file it merges into, not by the batch it is merging. It is the
-    largest allocator in a snapshot run by a wide margin, and it grows all run
-    as the file grows.
+    This is still read-modify-rewrite, so its cost is set by the file it merges
+    into rather than by the batch — but the file is now a month, which is what
+    bounds it. See the module docstring for why monthly and not yearly or
+    per-session.
 
     Each rebinding below is deliberate. Written as one chained expression
     (concat -> drop_duplicates -> sort_values -> reset_index) pandas holds the
     intermediate of every stage alive simultaneously, because the chain keeps a
-    reference to each; that is three whole-year frames plus both inputs at the
+    reference to each; that is three whole-file frames plus both inputs at the
     high-water mark. Rebinding `merged` at each step lets the previous stage's
     frame be freed as soon as the next one is built, and dropping the inputs
     right after the concat has copied them removes two more. `ignore_index` on
     the sort folds what was a separate `reset_index` copy into it.
 
-    Note that a year frame in pandas is several times its on-disk size: date32
-    columns come back as object arrays of `datetime.date` (a pointer plus a
-    ~32-byte object per cell, times three date columns), where parquet stores
-    4 bytes. That multiplier is why a few hundred MB of parquet becomes
-    multiple GB of RSS here. Converting to Arrow before releasing the pandas
-    frame — rather than after, as the previous ordering did — keeps the fat
-    representation and the serialisation buffers from being live together.
+    Converting to Arrow before releasing the pandas frame — rather than after,
+    as the original ordering did — keeps the fat pandas representation and the
+    parquet serialisation buffers from being live at the same time.
     """
     if new_df.empty:
         return 0
@@ -304,7 +371,8 @@ def write_year(ticker: str, year: int, new_df: pd.DataFrame,
     if not coerced:
         new_df = _coerce(new_df)
     keep = new_df["trade_date"].map(
-        lambda d: d is not None and not pd.isna(d) and d.year == year
+        lambda d: (d is not None and not pd.isna(d)
+                   and d.year * 100 + d.month == ym)
     ).astype(bool)
     if not keep.all():
         new_df = new_df[keep]
@@ -312,7 +380,7 @@ def write_year(ticker: str, year: int, new_df: pd.DataFrame,
     if new_df.empty:
         return 0
 
-    existing = read_year(ticker, year)
+    existing = read_month(ticker, ym)
     if existing.empty:
         merged = new_df
         del existing
@@ -329,13 +397,13 @@ def write_year(ticker: str, year: int, new_df: pd.DataFrame,
     n = len(merged)
     table = pa.Table.from_pandas(merged, schema=_SCHEMA, preserve_index=False)
     del merged
-    _atomic_write_table(year_path(ticker, year), table)
+    _atomic_write_table(month_path(ticker, ym), table)
     return n
 
 
 def write_rows(ticker: str, df: pd.DataFrame) -> dict:
-    """Write rows spanning any number of years. Splits by year and merges into
-    each year's file. Returns {year: row_count_after_merge}."""
+    """Write rows spanning any number of months. Splits by month and merges
+    into each month's file. Returns {YYYYMM: row_count_after_merge}."""
     if df.empty:
         return {}
     df = _coerce(df)
@@ -344,11 +412,11 @@ def write_rows(ticker: str, df: pd.DataFrame) -> dict:
         return {}
 
     # Group on a derived Series rather than an assigned column: `assign` copies
-    # the whole frame to add __year and `drop(columns=...)` copies it back, so
+    # the whole frame to add the key and `drop(columns=...)` copies it back, so
     # the old form paid two extra full-batch copies for a grouping key that
     # never needed to be in the frame at all.
-    years = df["trade_date"].map(lambda d: d.year)
+    keys = df["trade_date"].map(month_key)
     out: dict = {}
-    for y, chunk in df.groupby(years, sort=True):
-        out[int(y)] = write_year(ticker, int(y), chunk, coerced=True)
+    for ym, chunk in df.groupby(keys, sort=True):
+        out[int(ym)] = write_month(ticker, int(ym), chunk, coerced=True)
     return out

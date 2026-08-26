@@ -7,8 +7,8 @@ first-order greek set, implied_vol, iv_error, and the underlying price at the
 snapshot instant.  09:45 and 15:45 are used deliberately in place of 09:30 and
 16:00, which are unreliable.
 
-Writes to {CHAIN_SNAPSHOTS_DIR}/{ticker}/{year}.parquet, created automatically
-on first write.  The root resolves in config.py from CHAIN_SNAPSHOTS_DIR in
+Writes to {CHAIN_SNAPSHOTS_DIR}/{ticker}/{YYYYMM}.parquet, created
+automatically on first write.  The root resolves in config.py from CHAIN_SNAPSHOTS_DIR in
 .env; it falls back to a sibling of CHAIN_EOD_DIR only when that is unset, so
 do not read a literal path from here — production sets it explicitly and the
 store has already moved once.  The run prints the resolved path in preflight.
@@ -81,11 +81,13 @@ lib/thetadata.py holds a BoundedSemaphore(4) around every snapshot request.
 
 --- Memory ----------------------------------------------------------------
 
-Peak RSS is dominated by the STORE's write path, not by the fetch. The store
-is one parquet file per (ticker, year) and its append is read-modify-rewrite,
-so a write costs a multiple of the file it merges into and grows all run as
-that file grows — the batch being written is the small term. See the memory
-note on `lib/chain_snapshot_store.write_year`.
+Peak RSS is dominated by the STORE's write path, not by the fetch: the append
+is read-modify-rewrite, so a write costs a multiple of the file it merges into
+and the batch being written is the small term. The store is partitioned by
+MONTH for exactly this reason — it was per-year, and the resulting peak
+OOM-killed this script on a 15GB VPS. See the memory note on
+`lib/chain_snapshot_store.write_month` and the layout note in that module's
+docstring.
 
 Every run reports resident memory per ticker, section (H) of the summary, and
 after each parquet write. Read the BASELINE row: a rising baseline means
@@ -101,7 +103,7 @@ Usage:
         (refetch dates already present in the store)
 
     python fetch_chain_snapshots.py --batch-days 5
-        (write more often — smaller batch frames, but MORE whole-year
+        (write more often — smaller batch frames, but MORE whole-month
          rewrites, so it does not lower the peak the writer reaches)
 
     python fetch_chain_snapshots.py --resume --start ... --end ...
@@ -146,10 +148,12 @@ from lib.chain_fetch_common import (
 )
 from lib.chain_snapshot_store import (
     SNAPSHOT_LABELS,
+    list_legacy_year_files,
     loaded_cells,
     loaded_keys,
+    month_path,
+    months_between,
     write_rows,
-    year_path,
 )
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
@@ -421,7 +425,12 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         if not batches:
             return 0
 
-    years = {y for (a, b) in batches for y in range(a.year, b.year + 1)}
+    # Month keys, not years: under the monthly layout this bounds the
+    # resumability scan to the files the range actually touches, which for a
+    # one-month backfill is one file rather than a whole year of them.
+    months = set()
+    for a, b in batches:
+        months |= months_between(a, b)
     t_lk = time.monotonic()
     set_local_busy(True)
     if repair:
@@ -429,9 +438,9 @@ def fetch_ticker(ticker: str, batches: list[tuple[date, date]],
         # which point queries actually fail. The coarse (session, label) key
         # cannot see a hole inside a session that wrote some expirations.
         already = set()
-        present_cells = loaded_cells(ticker, years)
+        present_cells = loaded_cells(ticker, months)
     else:
-        already = set() if force else loaded_keys(ticker, years)
+        already = set() if force else loaded_keys(ticker, months)
         present_cells = set()
     set_local_busy(False)
     TIMING.loaded_keys += time.monotonic() - t_lk
@@ -776,6 +785,22 @@ def main() -> None:
     else:
         tickers = prompt_tickers(list_oi_tickers)
 
+    # An unmigrated {YYYY}.parquet is invisible to list_months, so a run over a
+    # ticker that still has one would conclude the store holds nothing, refetch
+    # the lot, and write it into month files sitting next to the year file it
+    # could not see. Refuse instead — before any request is issued.
+    unmigrated = sorted(t for t in tickers if list_legacy_year_files(t))
+    if unmigrated:
+        raise SystemExit(
+            f"\nFATAL: {len(unmigrated)} ticker(s) still hold pre-migration "
+            f"{{YYYY}}.parquet files: {', '.join(unmigrated[:10])}"
+            f"{' ...' if len(unmigrated) > 10 else ''}\n"
+            "This store is now {ticker}/{YYYYMM}.parquet, and year files are "
+            "not read — continuing would refetch data the store already has.\n"
+            "  python migrate_chain_snapshots_to_monthly.py --dry-run\n"
+            "then the same without --dry-run (--tickers / --years to scope it)."
+        )
+
     start = (datetime.strptime(args.start, "%Y%m%d").date()
              if args.start else prompt_date("Fetch start date"))
     end = (datetime.strptime(args.end, "%Y%m%d").date()
@@ -791,7 +816,9 @@ def main() -> None:
     if not sessions:
         raise SystemExit("No NYSE trading days in the requested range.")
 
-    batches = chunk_range(start, end, args.batch_days)
+    # snap_month: the store is partitioned by month, so a batch that does not
+    # cross a month boundary is exactly one file per write. See chunk_range.
+    batches = chunk_range(start, end, args.batch_days, snap_month=True)
 
     # --- progress journal ---------------------------------------------------
     mode = "repair" if args.repair else ("force" if args.force else "normal")
@@ -846,7 +873,7 @@ def main() -> None:
     TIMING.startup = time.monotonic() - run_t0
     start_watchdog()
 
-    writer = ParquetWriterThread(write_rows, year_path,
+    writer = ParquetWriterThread(write_rows, month_path,
                                  CHAIN_SNAPSHOTS_DIR,
                                  maxsize=args.write_queue,
                                  journal=journal)

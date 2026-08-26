@@ -57,7 +57,10 @@ from tqdm import tqdm
 
 from config import CHAIN_SNAPSHOTS_DIR
 from lib.chain_fetch_common import log_path, setup_file_logging, track
-from lib.chain_snapshot_store import SNAPSHOT_LABELS, list_tickers, list_years, year_path
+from lib.chain_snapshot_store import (
+    SNAPSHOT_LABELS, list_legacy_year_files, list_months, list_tickers,
+    month_path,
+)
 from lib.market_hours import get_trading_days
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import (
@@ -104,12 +107,21 @@ def read_index(ticker: str) -> pd.DataFrame:
     are all the audit needs.
     """
     frames = []
-    for y in list_years(ticker):
-        p = year_path(ticker, y)
+    # An unmigrated {YYYY}.parquet is invisible to list_months, so an audit
+    # that ignored it would report the whole year as a gap and send the
+    # operator into a pointless --repair.
+    legacy = list_legacy_year_files(ticker)
+    if legacy:
+        log.error("  %s: %d pre-migration year file(s) present (%s) — they are "
+                  "NOT audited. Run migrate_chain_snapshots_to_monthly.py "
+                  "first, or this ticker will read as almost entirely missing.",
+                  ticker, len(legacy), ", ".join(p.name for p in legacy[:5]))
+    for ym in list_months(ticker):
+        p = month_path(ticker, ym)
         try:
             tbl = pq.read_table(p, columns=["trade_date", "snapshot", "expiration"])
         except Exception as exc:
-            log.error("  %s/%d.parquet unreadable — %s", ticker, y, exc)
+            log.error("  %s/%06d.parquet unreadable — %s", ticker, ym, exc)
             continue
         frames.append(tbl.to_pandas())
     if not frames:
