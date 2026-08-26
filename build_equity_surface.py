@@ -89,12 +89,37 @@ def files_for(ticker: str, source: str, day: date) -> list:
     return [p] if p.exists() else []
 
 
+def _read_day(p: Path, day: date) -> pd.DataFrame:
+    """One file's rows for `day`, pushed down to the parquet reader.
+
+    The snapshots store holds a whole year per file and is written sorted by
+    trade_date with an explicit ROW_GROUP_SIZE, precisely so a single date
+    touches only the row groups whose min/max bracket it. Nothing asked for
+    that until now: this read was `pd.read_parquet(p)`, which materialised
+    ~250 sessions to keep one, once per day in the loop — so a 160-session
+    batch read the same year file 160 times and discarded ~99.6% of each.
+
+    The filter is on trade_date only, so BOTH snapshots of the day still come
+    through; splitting by (snapshot, expiration) happens downstream.
+
+    Falls back to the whole-file read if the reader rejects the predicate. A
+    surface build must not fail over an optimisation, and the caller's pandas
+    filter is still there to narrow whatever comes back.
+    """
+    try:
+        return pd.read_parquet(p, filters=[("trade_date", "==", day)])
+    except Exception as exc:                                  # noqa: BLE001
+        log.debug("  %s: predicate pushdown unavailable (%s) — reading whole "
+                  "file", p.name, type(exc).__name__)
+        return pd.read_parquet(p)
+
+
 def load_day(ticker: str, source: str, day: date) -> pd.DataFrame:
     """Raw rows for one ticker-day, already narrowed to that trade_date."""
     frames = []
     for p in files_for(ticker, source, day):
         try:
-            frames.append(pd.read_parquet(p))
+            frames.append(_read_day(p, day))
         except Exception as exc:                              # noqa: BLE001
             log.warning("  %s: unreadable (%s) — %s", p.name,
                         type(exc).__name__, exc)
@@ -103,6 +128,9 @@ def load_day(ticker: str, source: str, day: date) -> pd.DataFrame:
     df = pd.concat(frames, ignore_index=True)
     if df.empty or "trade_date" not in df.columns:
         return pd.DataFrame()
+    # Kept even though the pushdown above already narrows: the fallback path
+    # returns the whole file, and pruning is only as exact as the reader makes
+    # it. This is the line that guarantees the contract in the docstring.
     td = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
     return df[td == day]
 
