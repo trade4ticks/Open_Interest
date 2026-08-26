@@ -140,6 +140,55 @@ check("and covers every month",
        202407, 202408, 202409, 202410, 202411, 202412])
 
 
+print("\n=== 5. schema normalisation decides safely ===")
+import pyarrow as pa
+from lib.chain_snapshot_store import _SCHEMA
+from migrate_chain_snapshots_to_monthly import resolve_target_schema
+
+
+def _swap(**by_name):
+    """_SCHEMA with some fields' types replaced."""
+    return pa.schema([(f.name, by_name.get(f.name, f.type)) for f in _SCHEMA])
+
+
+t, norm, unsafe = resolve_target_schema(_SCHEMA)
+check("identical schema needs nothing", (norm, unsafe), ([], []))
+
+# The real divergence: 2026's files stored the three string columns wide.
+wide = _swap(ticker=pa.large_string(), snapshot=pa.large_string(),
+             option_type=pa.large_string())
+t, norm, unsafe = resolve_target_schema(wide)
+check("large_string is normalised", norm,
+      ["ticker", "snapshot", "option_type"])
+check("and nothing is unsafe", unsafe, [])
+check("target uses the store's type", t.field("ticker").type, pa.string())
+check("target keeps the other columns",
+      t.field("strike").type, _SCHEMA.field("strike").type)
+
+# Lossy differences must halt, not be guessed at.
+check("float32 for float64 is unsafe",
+      resolve_target_schema(_swap(strike=pa.float32()))[2], ["strike"])
+check("date64 for date32 is unsafe",
+      resolve_target_schema(_swap(trade_date=pa.date64()))[2], ["trade_date"])
+check("a coarser timestamp is unsafe",
+      resolve_target_schema(_swap(timestamp=pa.timestamp("s")))[2],
+      ["timestamp"])
+check("int for float is unsafe",
+      resolve_target_schema(_swap(bid=pa.int64()))[2], ["bid"])
+
+# A mix reports both, and the unsafe one is what stops the run.
+mixed = _swap(ticker=pa.large_string(), strike=pa.float32())
+t, norm, unsafe = resolve_target_schema(mixed)
+check("mixed: safe listed", norm, ["ticker"])
+check("mixed: unsafe listed", unsafe, ["strike"])
+
+# Metadata must survive, or normalised files read back with different pandas
+# dtypes than their already-correct neighbours.
+check("source metadata is carried onto the target",
+      resolve_target_schema(wide.with_metadata({b"pandas": b"{}"}))[0].metadata,
+      {b"pandas": b"{}"})
+
+
 print("\n" + "=" * 60)
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:

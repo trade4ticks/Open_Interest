@@ -79,6 +79,7 @@ file for as long as it did without anyone noticing the read cost.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -87,6 +88,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import CHAIN_SNAPSHOTS_DIR
+
+log = logging.getLogger(__name__)
 
 # Snapshot labels used across the store and the fetcher.
 SNAPSHOT_LABELS = ("0945", "1545")
@@ -318,7 +321,50 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
     return out[COLUMNS]
 
 
+def normalize_to_schema(table: pa.Table, where: str = "") -> pa.Table:
+    """Force `table` to _SCHEMA's column types, reporting anything it changed.
+
+    Every file in this store must carry the same Arrow types, and three of the
+    columns it must agree on — snapshot, option_type and (with trade_date and
+    expiration) strike — are part of DEDUPE_KEYS. A file that stores them as
+    large_string while its neighbours use string holds the same values at a
+    different offset width: pandas cannot tell the difference, but any
+    Arrow-level operation across the two can, and a migration or a
+    concat_tables over the pair fails on the type rather than on the data.
+
+    That is not hypothetical: 2026's files diverged to large_string while
+    2025's were string, which is what the monthly migration halted on. Whatever
+    produced them, the durable fix is that no write reaches disk without
+    passing through here — this is the single choke point every write in this
+    module goes through, so a divergent writer gets corrected AND named in the
+    log rather than leaving a file to be discovered months later.
+
+    The cast is lossless for the widening/narrowing this actually sees
+    (large_string <-> string differ only in offset width, int64 vs int32) and
+    raises on anything genuinely lossy, which is the behaviour we want: silent
+    truncation would be far worse than a failed write.
+    """
+    if table.schema.equals(_SCHEMA):
+        return table
+    changed = [f.name for f in _SCHEMA
+               if table.schema.field(f.name).type != f.type]
+    if changed:
+        log.warning(
+            "%schain_snapshots: incoming table has non-canonical type(s) for "
+            "%s — casting to the store schema. Types were: %s. A writer is "
+            "producing types the store does not use; this write is corrected, "
+            "but the writer should be fixed.",
+            f"{where}: " if where else "",
+            ", ".join(changed),
+            ", ".join(f"{n}={table.schema.field(n).type}" for n in changed[:5]))
+    # Carry the incoming metadata onto the canonical schema. A bare
+    # cast(_SCHEMA) would drop it, and it is what makes pd.read_parquet hand
+    # back StringDtype rather than object for the three string columns.
+    return table.cast(_SCHEMA.with_metadata(table.schema.metadata))
+
+
 def _atomic_write_table(path: Path, table: pa.Table) -> None:
+    table = normalize_to_schema(table, where=path.name)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression="snappy",

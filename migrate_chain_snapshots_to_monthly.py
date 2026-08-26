@@ -71,6 +71,44 @@ store.
 Verification failure is FATAL for that ticker-year: .tmp files are removed,
 the year file is left alone, and the run stops unless --keep-going.
 
+--- Column-type normalisation ----------------------------------------------
+
+Some files in this store carry ticker / snapshot / option_type as
+`large_string` where the store's _SCHEMA says `string`.  Same values, wider
+offsets (int64 vs int32).  It matters because all three are part of
+DEDUPE_KEYS, and any Arrow-level operation across a mixed pair fails on the
+type rather than the data — which is how it was found.
+
+By default this script casts those to the store's types on the way through
+and reports every file it corrected.  The cast is lossless (see
+_SAFE_NORMALIZATIONS), and doing it here is what makes the store internally
+consistent afterwards rather than leaving one year permanently divergent.
+--no-normalize restores the strict behaviour of halting instead.
+
+NOTE that this fixes the DATA, not the CAUSE.  No writer in this repository
+produces large_string: every store module declares pa.string() and passes
+schema=_SCHEMA to from_pandas, and lib/chain_snapshot_store now enforces the
+canonical types at its single write choke point (normalize_to_schema).  So
+whatever wrote those files either bypassed the store module or ran under a
+different pandas/pyarrow than the one that wrote its neighbours.
+
+The parquet footer records both.  To identify it:
+
+    python - <<'PY'
+    import pyarrow.parquet as pq
+    md = pq.ParquetFile("<store>/AAL/2026.parquet").metadata
+    print("created_by:", md.created_by)
+    kv = md.metadata or {}
+    for k, v in kv.items():
+        print(k.decode(), "=", v.decode()[:400])
+    PY
+
+`created_by` names the writing library and version (e.g. "parquet-cpp-arrow
+version 14.0.2" for pyarrow, or a DuckDB string).  A `pandas` key means it
+went through pa.Table.from_pandas and carries the pandas version that did it.
+Compare against a known-good neighbour such as AAL/2025.parquet: whichever of
+the two fields differs is the answer.
+
 Usage:
     python migrate_chain_snapshots_to_monthly.py --dry-run
     python migrate_chain_snapshots_to_monthly.py --dry-run --tickers SPY
@@ -211,17 +249,46 @@ def compare_profiles(src: dict, dst: dict) -> list[str]:
 def deep_key_match(year_file: Path, month_paths: list[Path]) -> list[str]:
     """Compare the five dedupe-key columns row-for-row, in order.
 
-    Order is meaningful: the migration is a pure copy that preserves it, so an
-    in-order comparison is both the strictest available check and the cheapest
-    way to run it — no sort, no hash table.  Reads five columns instead of
-    twenty, roughly doubling a ticker-year's read cost rather than its total.
+    Order is meaningful: the migration preserves it, so an in-order comparison
+    is both the strictest available check and the cheapest way to run it — no
+    sort, no hash table.  Reads five columns instead of twenty.
+
+    Where a column was normalised (large_string -> string), the two sides have
+    different Arrow types and `.equals()` would report a difference that is
+    only a difference of offset width.  The source is cast to the destination's
+    types first so the comparison is about VALUES.
+
+    That cast is the same one the migration performed, so on its own this
+    would not catch a bug inside the cast.  Two other things do: the string key
+    columns are additionally compared as Python string SETS, which is
+    independent of offset width entirely and cheap here because all three are
+    low-cardinality (one ticker, two snapshots, two option types); and the
+    footer min/max comparison runs over parquet's BYTE_ARRAY statistics, which
+    are the same physical form on both sides.
     """
     src = pq.read_table(year_file, columns=DEDUPE_KEYS)
     dst = pa.concat_tables(
         [pq.read_table(p, columns=DEDUPE_KEYS) for p in month_paths])
     if src.num_rows != dst.num_rows:
         return [f"deep: row count {src.num_rows:,} -> {dst.num_rows:,}"]
+
     diffs = []
+    # Offset-width-independent check on the string keys, before any cast.
+    for name in DEDUPE_KEYS:
+        if not pa.types.is_string(dst.field(name).type) and \
+           not pa.types.is_large_string(dst.field(name).type):
+            continue
+        a = sorted(v for v in pc.unique(src.column(name)).to_pylist()
+                   if v is not None)
+        b = sorted(v for v in pc.unique(dst.column(name)).to_pylist()
+                   if v is not None)
+        if a != b:
+            diffs.append(f"deep: {name} distinct values {a[:5]} -> {b[:5]}")
+    if diffs:
+        return diffs
+
+    if not src.schema.equals(dst.schema):
+        src = src.cast(dst.schema)
     for name in DEDUPE_KEYS:
         if not src.column(name).equals(dst.column(name)):
             diffs.append(f"deep: column {name} differs")
@@ -267,6 +334,51 @@ def plan_year(ticker: str, year: int, p: Path) -> dict:
         "rows_by_month": per_month,
         "date_min": lo, "date_max": hi,
     }
+
+
+# --- Schema normalisation ---------------------------------------------------
+
+# Type differences this script will silently correct on the way through.
+# Each pair is (source type, store type) and each is a pure change of physical
+# representation with an identical value domain:
+#
+#   large_string / string   differ only in the offset width, int64 vs int32.
+#                           The bytes are unchanged; nothing can be lost
+#                           unless a single array exceeds 2GB of character
+#                           data, and this script writes row groups of
+#                           ROW_GROUP_SIZE rows of short symbols and labels.
+#   large_binary / binary   same, for completeness.
+#
+# Everything else — a differing timestamp unit, a float32 where the store has
+# float64, a date64 where it has date32 — is NOT here. Those can round, shift
+# or silently truncate, and a data migration is the last place to be guessing
+# about that. They halt the run instead.
+_SAFE_NORMALIZATIONS = {
+    (pa.large_string(), pa.string()),
+    (pa.string(), pa.large_string()),
+    (pa.large_binary(), pa.binary()),
+    (pa.binary(), pa.large_binary()),
+}
+
+
+def resolve_target_schema(src_schema: pa.Schema):
+    """(target_schema, normalized_names, unsafe_names) for one source file.
+
+    The target is the store's canonical types carrying the SOURCE's metadata,
+    so a normalised file still reads back with the same pandas dtypes as its
+    already-correct neighbours.
+    """
+    normalized, unsafe = [], []
+    for f in _SCHEMA:
+        src_type = src_schema.field(f.name).type
+        if src_type == f.type:
+            continue
+        if (src_type, f.type) in _SAFE_NORMALIZATIONS:
+            normalized.append(f.name)
+        else:
+            unsafe.append(f.name)
+    target = _SCHEMA.with_metadata(src_schema.metadata)
+    return target, normalized, unsafe
 
 
 # --- Migration --------------------------------------------------------------
@@ -339,7 +451,7 @@ def _month_keys(col) -> list[int]:
 
 
 def migrate_year(ticker: str, year: int, p: Path, verify: str,
-                 keep_year_files: bool) -> dict:
+                 keep_year_files: bool, no_normalize: bool = False) -> dict:
     """Split one year file into month files. Returns a result dict.
 
     Raises nothing on a data problem — it reports `ok: False` and leaves the
@@ -364,9 +476,8 @@ def migrate_year(ticker: str, year: int, p: Path, verify: str,
     src_rows = pf.metadata.num_rows
     src_schema = pf.schema_arrow
 
-    # The store wrote these files with _SCHEMA, so a divergence means the file
-    # is not what this script is for. Refuse rather than silently re-typing
-    # someone's data on the way through.
+    # Column NAMES must match: a file with different columns is not what this
+    # script is for, and there is no safe guess to make.
     if list(src_schema.names) != list(_SCHEMA.names):
         log.error("  %s %d: schema mismatch — file has %d column(s) %s, store "
                   "schema has %d. Not migrating this file.",
@@ -374,19 +485,36 @@ def migrate_year(ticker: str, year: int, p: Path, verify: str,
                   list(src_schema.names)[:6], len(_SCHEMA.names))
         return {"ok": False, "ticker": ticker, "year": year,
                 "reason": "schema names differ from the store schema"}
-    bad = [n for n in _SCHEMA.names
-           if src_schema.field(n).type != _SCHEMA.field(n).type]
-    if bad:
-        log.error("  %s %d: column type(s) differ from the store schema: %s",
-                  ticker, year, ", ".join(bad[:6]))
-        return {"ok": False, "ticker": ticker, "year": year,
-                "reason": f"column types differ: {', '.join(bad[:3])}"}
 
-    writers = _MonthWriters(ticker, src_schema)
+    target_schema, normalized, unsafe = resolve_target_schema(src_schema)
+    if unsafe:
+        log.error("  %s %d: column type(s) differ from the store schema in a "
+                  "way this script will not cast: %s. Not migrating.",
+                  ticker, year,
+                  ", ".join(f"{n}: {src_schema.field(n).type} -> "
+                            f"{_SCHEMA.field(n).type}" for n in unsafe[:6]))
+        return {"ok": False, "ticker": ticker, "year": year,
+                "reason": f"unsafe type difference: {', '.join(unsafe[:3])}"}
+    if normalized:
+        if no_normalize:
+            log.error("  %s %d: column type(s) differ (%s) and --no-normalize "
+                      "is set. Not migrating.", ticker, year,
+                      ", ".join(normalized))
+            return {"ok": False, "ticker": ticker, "year": year,
+                    "reason": f"types differ, normalization disabled: "
+                              f"{', '.join(normalized[:3])}"}
+        log.warning("  %s %d: NORMALIZING %s to the store schema — %s",
+                    ticker, year, ", ".join(normalized),
+                    ", ".join(f"{n}: {src_schema.field(n).type} -> "
+                              f"{_SCHEMA.field(n).type}" for n in normalized[:5]))
+
+    writers = _MonthWriters(ticker, target_schema)
 
     try:
         for batch in pf.iter_batches(batch_size=ROW_GROUP_SIZE):
             tbl = pa.Table.from_batches([batch], schema=src_schema)
+            if normalized:
+                tbl = tbl.cast(target_schema)
             keys = _month_keys(tbl.column("trade_date"))
             # Sorted by trade_date, so a batch is one month or two at a
             # boundary. Slice rather than filter: contiguous runs mean no
@@ -461,11 +589,13 @@ def migrate_year(ticker: str, year: int, p: Path, verify: str,
         p.unlink()
 
     secs = time.monotonic() - t0
-    log.info("  %s %d: %d rows -> %d month file(s) in %.1fs%s",
+    log.info("  %s %d: %d rows -> %d month file(s) in %.1fs%s%s",
              ticker, year, src_rows, len(writers.paths), secs,
+             f" [normalized {', '.join(normalized)}]" if normalized else "",
              " (year file kept)" if keep_year_files else "")
     return {"ok": True, "ticker": ticker, "year": year, "rows": src_rows,
             "months": len(writers.paths), "secs": secs,
+            "normalized": normalized,
             "bytes": p.stat().st_size if keep_year_files else 0}
 
 
@@ -497,6 +627,10 @@ def main() -> int:
                           "to the rest. NOTE: the fetcher refuses to run "
                           "while a year file is present, so clear them before "
                           "resuming normal operation."))
+    ap.add_argument("--no-normalize", action="store_true",
+                    help=("halt on any column-type difference instead of "
+                          "casting the losslessly-castable ones "
+                          "(large_string <-> string) to the store schema"))
     ap.add_argument("--keep-going", action="store_true",
                     help="continue after a ticker-year fails (default: stop)")
     args = ap.parse_args()
@@ -537,18 +671,50 @@ def main() -> int:
         print(f"{'ticker':<8}{'year':>6}{'size':>12}{'rows':>14}"
               f"{'groups':>8}{'months':>8}   date range")
         out_files = 0
+        norm_units: list[tuple[str, int, list, pa.Schema]] = []
+        unsafe_units: list[tuple[str, int, list]] = []
         for t, y, p in units:
             pl = plan_year(t, y, p)
             out_files += len(pl["months"])
             rng = (f"{pl['date_min']} .. {pl['date_max']}"
                    if pl["date_min"] else "?")
+            flag = ""
+            src_schema = pq.ParquetFile(p).schema_arrow
+            if list(src_schema.names) != list(_SCHEMA.names):
+                flag = "  SCHEMA NAMES DIFFER — would not migrate"
+                unsafe_units.append((t, y, ["column names"]))
+            else:
+                _, norm, unsafe = resolve_target_schema(src_schema)
+                if unsafe:
+                    flag = f"  UNSAFE TYPES {','.join(unsafe)} — would not migrate"
+                    unsafe_units.append((t, y, unsafe))
+                elif norm:
+                    flag = f"  normalize {','.join(norm)}"
+                    norm_units.append((t, y, norm, src_schema))
             print(f"{t:<8}{y:>6}{human_bytes(pl['bytes']):>12}"
                   f"{pl['rows']:>14,}{pl['row_groups']:>8}"
-                  f"{len(pl['months']):>8}   {rng}")
+                  f"{len(pl['months']):>8}   {rng}{flag}")
             existing = month_files_of_year(t, y)
             if existing:
                 print(f"         WARNING: {len(existing)} month file(s) for "
                       f"{y} already exist and WOULD BE REPLACED")
+
+        if norm_units:
+            print(f"\n{len(norm_units)} file(s) carry non-canonical column "
+                  f"types that would be normalized to the store schema:")
+            for t, y, cols, sf in norm_units[:5]:
+                print(f"  {t} {y}: " + ", ".join(
+                    f"{c} {sf.field(c).type} -> {_SCHEMA.field(c).type}"
+                    for c in cols))
+            if len(norm_units) > 5:
+                print(f"  ... and {len(norm_units) - 5} more")
+            print("  These casts change representation only, never values. "
+                  "--no-normalize to halt on them instead.")
+        if unsafe_units:
+            print(f"\n{len(unsafe_units)} file(s) WOULD NOT MIGRATE:")
+            for t, y, cols in unsafe_units[:10]:
+                print(f"  {t} {y}: {', '.join(cols)}")
+
         print(f"\nWould read  {human_bytes(total_bytes)} across {len(units)} "
               f"file(s)")
         print(f"Would write {out_files} month file(s) of comparable total size")
@@ -577,7 +743,8 @@ def main() -> int:
     for i, (t, y, p) in enumerate(units, 1):
         size = p.stat().st_size
         log.info("[%d/%d] %s %d (%s)", i, len(units), t, y, human_bytes(size))
-        res = migrate_year(t, y, p, args.verify, args.keep_year_files)
+        res = migrate_year(t, y, p, args.verify, args.keep_year_files,
+                           no_normalize=args.no_normalize)
         if res["ok"]:
             ok.append(res)
             done_bytes += size
@@ -600,6 +767,18 @@ def main() -> int:
 
     print(f"\n{len(ok)} ticker-year(s) migrated, {len(failed)} failed, "
           f"in {(time.monotonic() - t_run) / 60:.1f} min")
+    normed = [r for r in ok if r.get("normalized")]
+    if normed:
+        print(f"{len(normed)} file(s) had column types normalized to the "
+              f"store schema (representation only, values unchanged):")
+        for r in normed[:10]:
+            print(f"  {r['ticker']} {r['year']}: "
+                  f"{', '.join(r['normalized'])}")
+        if len(normed) > 10:
+            print(f"  ... and {len(normed) - 10} more")
+        print("  The store is now internally consistent, but whatever WROTE "
+              "those types will do it again —")
+        print("  see the note at the top of this file on finding it.")
     if failed:
         for r in failed[:10]:
             print(f"  FAILED {r['ticker']} {r['year']}: {r['reason']}")

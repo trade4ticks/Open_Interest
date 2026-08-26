@@ -70,12 +70,11 @@ def load_chain(ticker: str, trade_date, snapshot: str, source: str):
         if df.empty:
             raise SystemExit(f"no live cycle for {ticker} {trade_date} {snapshot}")
     else:
-        from lib.chain_snapshot_store import year_path
-        p = year_path(ticker, trade_date.year)
+        from lib.chain_snapshot_store import month_key, month_path
+        p = month_path(ticker, month_key(trade_date))
         if not p.exists():
             raise SystemExit(f"no snapshots file: {p}")
-        df = pd.read_parquet(p)
-        df = df[df["trade_date"] == trade_date]
+        df = pd.read_parquet(p, filters=[("trade_date", "==", trade_date)])
 
     df = df[df["snapshot"].astype(str) == snapshot]
     if df.empty:
