@@ -105,6 +105,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import EQUITY_1MIN_DIR
+from lib.parquet_schema import normalize_to_schema
 
 SESSIONS = ("premarket", "regular", "after", "other")
 
@@ -301,6 +302,10 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
 def _atomic_write(path: Path, df: pd.DataFrame, schema: pa.Schema) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+    # from_pandas's `schema=` is a request, not a guarantee: a pyarrow upgrade
+    # once left it honoured for some string columns and not others. Applies to
+    # both schemas this function is called with. See lib/parquet_schema.py.
+    table = normalize_to_schema(table, schema, where=f"equity_1min/{path.name}")
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression="snappy",
                    row_group_size=ROW_GROUP_SIZE, use_dictionary=True)

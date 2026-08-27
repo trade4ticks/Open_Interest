@@ -377,7 +377,11 @@ def resolve_target_schema(src_schema: pa.Schema):
             normalized.append(f.name)
         else:
             unsafe.append(f.name)
-    target = _SCHEMA.with_metadata(src_schema.metadata)
+    # Only call with_metadata when there is metadata to carry: passing None is
+    # not documented to be a no-op and its behaviour has varied by version.
+    target = _SCHEMA
+    if src_schema.metadata:
+        target = _SCHEMA.with_metadata(src_schema.metadata)
     return target, normalized, unsafe
 
 

@@ -1,6 +1,33 @@
 psycopg2-binary>=2.9
 python-dotenv>=1.0
-pandas>=2.2
+
+# --- pandas / pyarrow: UPPER BOUNDS ARE LOAD-BEARING ------------------------
+#
+# These two decide the Arrow types the parquet stores are written with, and an
+# unbounded `pip install -U` on the VPS moved pyarrow 23 -> 24 mid-history.
+# After that, `pa.Table.from_pandas(df, schema=_SCHEMA)` stopped forcing the
+# declared type for the string columns: chain_snapshots' 2026 files came out
+# with ticker / snapshot / option_type as large_string where the schema says
+# string and every earlier file has string.
+#
+# Nothing objected at write time and pandas cannot tell the two apart on read,
+# so it went unnoticed until a migration tried to cast one of those files and
+# halted — and all three are dedupe-key columns, so a mixed pair breaks any
+# Arrow-level operation spanning them.
+#
+# lib/parquet_schema.normalize_to_schema now enforces the declared types at
+# every store's write, so a repeat is corrected and logged rather than
+# persisted. These caps are the second layer: they stop the next major from
+# arriving silently in the first place.
+#
+# The caps below are deliberately conservative because they must not conflict
+# with what is currently installed. Tighten to exact pins for a VPS you
+# control -- `pip freeze | grep -Ei '^(pandas|pyarrow|numpy)='` -- and in
+# particular set the pandas cap to its installed major once you have checked
+# it, since <4 does not by itself prevent a 2.x -> 3.x jump.
+pandas>=2.2,<4
+pyarrow>=23,<25
+
 numpy>=1.26
 requests>=2.31
 yfinance>=0.2.40
@@ -10,6 +37,5 @@ yfinance>=0.2.40
 lxml>=5.0
 pandas-market-calendars>=4.4
 tqdm>=4.66
-pyarrow>=15
 duckdb>=1.0
 sortedcontainers>=2.4

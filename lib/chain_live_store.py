@@ -73,6 +73,7 @@ import pyarrow.parquet as pq
 
 from config import CHAIN_LIVE_DIR
 from lib.chain_intraday_store import COLUMNS, SCHEMA, coerce
+from lib.parquet_schema import normalize_to_schema
 
 # Measured better than snappy on this store's shape; see module docstring.
 COMPRESSION = "zstd"
@@ -147,6 +148,11 @@ def write_cycle(ticker: str, trade_date: date, snapshot: str,
 
     table = pa.Table.from_pandas(coerce(frame), schema=SCHEMA,
                                  preserve_index=False)
+    # from_pandas's `schema=` is a request, not a guarantee: a pyarrow upgrade
+    # once left it honoured for some string columns and not others. This store
+    # shares chain_intraday's 20-column SCHEMA, so a divergence here would also
+    # be a divergence against that store. See lib/parquet_schema.py.
+    table = normalize_to_schema(table, SCHEMA, where=f"chain_live/{path.name}")
     try:
         pq.write_table(table, tmp, compression=COMPRESSION,
                        compression_level=COMPRESSION_LEVEL,

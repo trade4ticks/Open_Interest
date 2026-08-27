@@ -76,6 +76,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import CHAIN_INTRADAY_DIR
+from lib.parquet_schema import normalize_to_schema
 
 # Applied per expiration, before its row group is written.
 DEDUPE_KEYS = ["timestamp", "expiration", "strike", "option_type"]
@@ -357,6 +358,14 @@ class SessionWriter:
         f = f.sort_values(SORT_KEYS, kind="mergesort")
         table = pa.Table.from_pandas(f, schema=_SCHEMA, preserve_index=False)
         del f
+        # from_pandas's `schema=` is a request, not a guarantee: a pyarrow
+        # upgrade once left it honoured for some string columns and not others.
+        # This store would notice — self._writer was opened on _SCHEMA and
+        # write_table validates against it — but it would notice by raising
+        # mid-session, which costs the session. Correcting here keeps the
+        # write, and the WARNING still names the writer.
+        table = normalize_to_schema(table, _SCHEMA,
+                                    where=f"chain_intraday/{self.sess:%Y%m%d}")
         self.transform_secs += time.monotonic() - t_tr
 
         n = table.num_rows

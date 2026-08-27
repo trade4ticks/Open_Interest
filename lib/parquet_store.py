@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import OI_RAW_DIR
+from lib.parquet_schema import normalize_to_schema
 
 DEDUPE_KEYS = ["trade_date", "expiration", "strike", "option_type"]
 
@@ -114,6 +115,11 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
 def _atomic_write(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False)
+    # from_pandas's `schema=` is a request, not a guarantee: a pyarrow upgrade
+    # once left it honoured for some string columns and not others. option_type
+    # is a dedupe key here, so a divergence would break any Arrow operation
+    # spanning a divergent file and a correct one. See lib/parquet_schema.py.
+    table = normalize_to_schema(table, _SCHEMA, where=f"oi_raw/{path.name}")
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression="snappy")
     tmp.replace(path)
