@@ -39,3 +39,4 @@ pandas-market-calendars>=4.4
 tqdm>=4.66
 duckdb>=1.0
 sortedcontainers>=2.4
+PyYAML>=6.0
