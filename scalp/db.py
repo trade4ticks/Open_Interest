@@ -85,6 +85,20 @@ CREATE TABLE IF NOT EXISTS intraday_metrics (
     PRIMARY KEY (trade_date, symbol, bucket_start, metric)
 );
 
+-- What was dropped, by what rule, getting from raw tape to each metrics row.
+-- Condition-code exclusions, auction-edge trimming, crossed/locked quotes and
+-- same-instant collapsing all silently change the numbers; this makes the
+-- share of raw tape a row was computed from readable without opening
+-- METRICS.md. Long format for the same reason as daily_metrics: the
+-- per-condition-code breakout changes whenever the exclusion list does.
+CREATE TABLE IF NOT EXISTS provenance (
+    trade_date      DATE        NOT NULL,
+    symbol          TEXT        NOT NULL,
+    item            TEXT        NOT NULL,
+    value           DOUBLE PRECISION,
+    PRIMARY KEY (trade_date, symbol, item)
+);
+
 -- Every nightly ranking is RETAINED, never overwritten. In a month this is a
 -- feature history to test against actual fills, which is the dataset the
 -- strategy currently lacks.
@@ -126,6 +140,23 @@ def write_daily_metrics(trade_date: date, symbol: str, metrics: dict) -> int:
     rows = [(trade_date, symbol.upper(), k, _num(v))
             for k, v in metrics.items() if _storable(v)]
     return _upsert_long("daily_metrics", ["trade_date", "symbol", "metric"], rows)
+
+
+def write_provenance(trade_date: date, symbol: str, prov: dict) -> int:
+    rows = [(trade_date, symbol.upper(), k, _num(v))
+            for k, v in prov.items() if _storable(v)]
+    return _upsert_long("provenance", ["trade_date", "symbol", "item"], rows)
+
+
+def provenance_wide(trade_date: date) -> pd.DataFrame:
+    """One row per symbol, for the dashboard's provenance panel."""
+    with connect() as conn:
+        long = pd.read_sql(
+            "SELECT symbol, item, value FROM provenance WHERE trade_date = %s",
+            conn, params=(trade_date,))
+    if long.empty:
+        return long
+    return long.pivot(index="symbol", columns="item", values="value")
 
 
 def write_intraday_metrics(trade_date: date, symbol: str,

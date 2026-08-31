@@ -13,6 +13,19 @@ Both come from `metrics.compute_window`, called with different bounds. There
 is no separate daily code path, which is what keeps the future intraday
 re-rank honest: it will call the same function with the last 30 minutes.
 
+NOTHING IS FILTERED HERE. A metrics row is written for every symbol that can
+be computed, whether or not it passes any threshold. Thresholds live in
+config.DEFAULT_FILTERS and are applied at read time by rank.py and the
+dashboard. That way changing one is a page refresh rather than a recompute,
+and the rows for names that failed are kept — they are the only data that can
+say whether a threshold was set correctly. A pipeline that filters can never
+answer "what did the excluded ones look like?".
+
+A PROVENANCE ROW IS WRITTEN ALONGSIDE EACH METRICS ROW: what was dropped, by
+what rule. Condition-code exclusions broken out per code, crossed and locked
+quotes, records lost to same-instant collapsing, minutes trimmed at the
+auction edges, and the resulting share of raw tape retained.
+
 Postgres holds derived metrics only. No tick data ever.
 """
 from __future__ import annotations
@@ -51,18 +64,31 @@ def prepare(df: pd.DataFrame, day: date) -> tuple[pd.DataFrame, metrics.Columns]
     return out, cols
 
 
-def compute_symbol_day(symbol: str, day: date) -> tuple[dict | None, list[dict]]:
+def compute_symbol_day(symbol: str, day: date
+                       ) -> tuple[dict | None, list[dict], dict]:
+    """Returns (daily metrics, 15-minute rows, provenance).
+
+    NOTHING IS FILTERED HERE. A row is written for every symbol that can be
+    computed, whether or not it passes any threshold. Thresholds live in
+    config.DEFAULT_FILTERS and are applied at read time by rank.py and the
+    dashboard, so changing one is a page refresh rather than a recompute — and
+    so the rows for names that failed are kept, since they are the only data
+    that can say whether a threshold was set right.
+    """
     df = store.read_day(symbol, day)
     if df.empty:
-        return None, []
+        return None, [], {}
     df, cols = prepare(df, day)
     start, end = session_bounds(day)
 
     daily = metrics.compute_window(df, cols, start, end)
     daily["symbol_day_rows"] = len(df)
+    prov = daily.pop("_provenance", {})
     buckets = metrics.compute_buckets(df, cols, start, end,
                                       config.INTRADAY_BUCKET_MINUTES)
-    return daily, buckets
+    for b in buckets:
+        b.pop("_provenance", None)
+    return daily, buckets, prov
 
 
 def main() -> None:
@@ -103,7 +129,7 @@ def main() -> None:
                 skipped += 1
                 continue
             try:
-                daily, buckets = compute_symbol_day(symbol, day)
+                daily, buckets, prov = compute_symbol_day(symbol, day)
             except Exception as exc:
                 failed += 1
                 log.warning("  %s %s: %s: %s", symbol, day,
@@ -116,9 +142,17 @@ def main() -> None:
 
             if args.do_print:
                 printed.append({"symbol": symbol, "trade_date": day, **daily})
+                if prov:
+                    log.info("  %s provenance: %.1f%% of the tape retained, "
+                             "%d records lost to collapsing, %.0f min trimmed",
+                             symbol,
+                             100 * prov.get("trade_retained_share", float("nan")),
+                             int(prov.get("records_lost_to_collapse", 0)),
+                             prov.get("auction_minutes_trimmed", 0.0))
                 continue
 
             rows_written += db.write_daily_metrics(day, symbol, daily)
+            rows_written += db.write_provenance(day, symbol, prov)
             if not args.no_intraday:
                 rows_written += db.write_intraday_metrics(day, symbol, buckets)
 

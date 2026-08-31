@@ -771,12 +771,76 @@ QUOTE_LOOKBACK_DAYS = int(os.environ.get("SCALP_QUOTE_LOOKBACK_DAYS", "5"))
 # interval or compute-and-discard, NOT a smaller symbol list.
 
 
-# --- ranking floors ----------------------------------------------------------
-# Each metric alone has an obvious failure case, so all three are floors and
-# the ranking is a ratio of two of them.
-MIN_SPREAD_CENTS   = float(os.environ.get("SCALP_MIN_SPREAD_CENTS", "5"))
-MIN_TRADES_PER_MIN = float(os.environ.get("SCALP_MIN_TRADES_PER_MIN", "10"))
-MAX_NOISE_BPS      = float(os.environ.get("SCALP_MAX_NOISE_BPS", "10"))
+# --- filters: READ TIME ONLY -------------------------------------------------
+#
+# THE PIPELINE DOES NOT FILTER. compute.py writes a metrics row for every
+# symbol it can compute, whether or not that symbol passes anything here.
+# Nothing is dropped during compute.
+#
+# These are defaults for rank.py and the dashboard, and nothing in the metric
+# layer may import them. Two consequences, both wanted:
+#
+#   * Changing a threshold is a page refresh, not a recompute.
+#   * The rows for names that FAILED are kept, and they are the only data that
+#     can say whether a threshold was set correctly. A pipeline that filters
+#     can never answer "what did the excluded ones look like?".
+#
+# Same reasoning as retaining non-qualifying names in the universe stage.
+#
+# MAX_NOISE_BPS was 10, which would not have bound on anything: the realised
+# names measure FDX 1.8, LLY 0.85, DLTR 2.7, LITE 5.2 bps. 4 flags LITE and
+# nothing else, which is the point of having it — but it is a slider in the
+# UI, not a constant, and this is only where the slider starts.
+DEFAULT_FILTERS = {
+    "min_spread_cents":   float(os.environ.get("SCALP_MIN_SPREAD_CENTS", "5")),
+    "min_trades_per_min": float(os.environ.get("SCALP_MIN_TRADES_PER_MIN", "10")),
+    "max_noise_bps":      float(os.environ.get("SCALP_MAX_NOISE_BPS", "4")),
+}
+
+# Slider bounds for the dashboard, so a threshold can be moved through the
+# range the data actually occupies rather than typed blind.
+FILTER_RANGES = {
+    "min_spread_cents":   (0.0, 25.0, 0.5),
+    "min_trades_per_min": (0.0, 100.0, 1.0),
+    "max_noise_bps":      (0.5, 15.0, 0.1),
+}
+
+
+# --- round lots are price-tiered ---------------------------------------------
+# Since November 2025 the round lot is not 100 shares. It is tiered by price:
+#
+#     < $250          100 shares
+#     $250 - $1,000    40
+#     $1,000 - $10,000 10
+#     >= $10,000        1
+#
+# This matters structurally rather than cosmetically. FDX at ~$330 has a
+# 40-share round lot, and the s2 output shows it quoting 40 x 40 at the
+# inside — exactly one round lot. LLY at ~$1,172 has a round lot of 10. The
+# round-lot constraint is a large part of why spreads stay structurally wide
+# in these names, so a fixed size-100 boundary misclassifies the tape in
+# precisely the names this strategy targets.
+ROUND_LOT_TIERS = (
+    (250.0,     100),
+    (1_000.0,    40),
+    (10_000.0,   10),
+    (float("inf"), 1),
+)
+
+
+def round_lot_size(price: float) -> int:
+    """Round lot for a security at `price`.
+
+    Pass a per-symbol-day REFERENCE price, not each trade's price. The tier is
+    assigned by the exchanges periodically from a prior reference price, not
+    re-evaluated per print — so a name trading either side of $250 intraday
+    keeps one lot size all day, and applying the tiers per-trade would flip
+    the boundary mid-session and misclassify both sides of it.
+    """
+    for ceiling, lot in ROUND_LOT_TIERS:
+        if price < ceiling:
+            return lot
+    return 1
 
 
 # --- calibration -------------------------------------------------------------

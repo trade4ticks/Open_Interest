@@ -4,9 +4,36 @@ Every metric `compute.py` writes, what it means, and what it is computed from.
 Read this before the backfill runs; changing a definition afterwards means a
 recompute, and changing the *source* means a re-pull.
 
-All of it comes from `metrics.compute_window(df, cols, start, end)`. There is
-no separate daily path — the daily row, each 15-minute row and the future
-intraday re-rank all call that one function with different bounds.
+## ⚠️ The central hypothesis is unvalidated
+
+**`spread ÷ noise` as the ranking metric is a hypothesis, not a result.**
+
+It comes from a single observation made while trading: that stocks moving
+faster than their spread are untradeable. That observation may well be right.
+It has never been tested against anything.
+
+The entire pipeline is organised around it. Every noise variant exists to find
+the best denominator for that ratio; the horizons, the bucketing, the
+time-weighting all serve it. If the premise is wrong, the pipeline is a very
+careful measurement of the wrong quantity.
+
+Calibration against the 15 traded tickers is the first and only test it has
+been put to. **If no variant separates the top of the realised results from
+the bottom, that is the finding** — and it gets reported as one rather than
+resolved by picking whichever ratio looks tidiest.
+
+---
+
+Metrics come from two entry points, deliberately not merged:
+
+| function | source | drives |
+|---|---|---|
+| `metrics.compute_window` | `history/trade_quote` | spread, noise, flow |
+| `metrics.compute_quote_window` | `history/quote` at tick | flicker, BBO lifetime |
+
+Within each, the daily row, each 15-minute row and the future intraday re-rank
+all call the same function with different bounds. There is no separate daily
+path.
 
 ## The source, and what it cannot support
 
@@ -18,13 +45,20 @@ That is fine for spread and midpoint levels — every observation is a real
 NBBO. It is a genuine limitation for anything counting quote *events*, because
 a quote that appeared and vanished between two trades is invisible.
 
-**Two metrics from the brief are not computable from this source and return
-`NaN` rather than a substitute:**
+**BBO lifetime now comes from the quote stream, which is the correct source.**
+`bid_lifetime_ms_median` / `ask_lifetime_ms_median` measure how long a price
+actually stood before being replaced, computed from tick quotes. The earlier
+`bid_persist_ms_median_tradesampled` has been **removed**, not kept alongside:
+a knowingly-worse metric sitting next to available correct data only invites
+someone to use it. (The final run in each window is left-censored — it was
+still standing when observation stopped — so it is excluded rather than
+counted as having ended.)
+
+**One metric still returns `NaN`:**
 
 | metric | why |
 |---|---|
-| `bbo_change_without_trade_share` | Every record here has a trade by construction. "BBO changed without a trade" cannot be observed at all. |
-| true best-bid / best-offer lifetime | Needs the quote stream. What is available is persistence across trade samples, published under the honest name `bid_persist_ms_median_tradesampled`. |
+| `bbo_change_without_trade_share` | Cancel vs consumption. Needs the quote stream *and* the trade tape joined — the quote side to see the BBO change, the trade side to say whether a trade met it at that price. Not implemented. |
 
 ✅ **Settled by `s7_quote_sizing.py`: tick resolution, full retention.**
 
@@ -198,7 +232,10 @@ value.
 |---|---|
 | `trades_per_min`, `shares_per_min` | arrival rates |
 | `trade_size_mean`, `trade_size_median` | — |
-| `odd_lot_share` | size < 100 |
+| `odd_lot_share` | size < the **price-tiered** round lot |
+| `sub_100_share` | size < 100, fixed — kept for comparability only |
+| `round_lot_size`, `reference_price` | the tier in force and the price that picked it |
+| `odd_lot_flag_disagree_share` | where the tiered calculation and vendor condition 115 disagree |
 | `at_bid_share` / `at_ask_share` / `between_share` | `price ≤ bid` / `price ≥ ask` / else |
 | `two_sided_balance` | min(at_bid, at_ask) ÷ max(…) — 1.0 balanced, 0.0 one-way |
 | `off_exchange_share` | TRF/ADF codes `{2, 57, 58, 59}` |
@@ -207,6 +244,37 @@ value.
 
 `two_sided_balance` is the point of the classification — this strategy needs
 buyers *and* sellers arriving, not one-way flow.
+
+### Round lots are price-tiered, and it is not cosmetic
+
+Since November 2025 the round lot is not 100 shares:
+
+| price | round lot |
+|---|---|
+| < $250 | 100 |
+| $250 – $1,000 | **40** |
+| $1,000 – $10,000 | **10** |
+| ≥ $10,000 | 1 |
+
+FDX at ~$330 has a 40-share round lot — and the s2 output shows it quoting
+**40 × 40 at the inside, exactly one round lot**. LLY at ~$1,172 has a round
+lot of 10.
+
+The round-lot constraint is a large part of why spreads stay structurally wide
+in these names, so a fixed size-100 boundary misclassifies the tape in
+precisely the names this strategy targets. `config.round_lot_size(price)`
+applies the tiers.
+
+One **reference price per symbol-day** (median trade price), not per trade:
+the exchanges assign the tier periodically from a prior reference price, so a
+name trading either side of $250 intraday keeps one lot size all day. Applying
+tiers per-print would flip the boundary mid-session and misclassify both sides
+of it.
+
+**Free correctness check:** the vendor flags odd lots independently with
+condition 115. `odd_lot_flag_disagree_share` reports where that flag and the
+tiered calculation disagree — either the tier here is wrong or the vendor
+flags on a different basis, and both are worth seeing rather than assuming.
 
 ### `off_mid_bps` is a ranking candidate, not a diagnostic
 
@@ -232,13 +300,71 @@ the bottom.
 **If none of them separate, that is the finding and it gets reported as one.**
 A tidy ranking that doesn't track reality is worse than no ranking.
 
-Floors (`config`): `MIN_SPREAD_CENTS` 5, `MIN_TRADES_PER_MIN` 10,
-`MAX_NOISE_BPS` 10. All three are necessary conditions; each metric alone has
-an obvious failure case, which is why the ranking is a ratio subject to floors
-rather than any single number.
+### Filters are read-time only. The pipeline does not filter.
+
+`compute.py` writes a metrics row for **every** symbol it can compute, whether
+or not it passes anything. Nothing is dropped during compute.
+
+`config.DEFAULT_FILTERS` is read only by `rank.py` and the dashboard, and
+nothing in the metric layer imports it. Two consequences, both wanted:
+
+- Changing a threshold is a **page refresh, not a recompute**.
+- The rows for names that **failed** are kept — and they are the only data
+  that can say whether a threshold was set correctly. A pipeline that filters
+  can never answer "what did the excluded ones look like?"
+
+Same reasoning as retaining non-qualifying names at the universe stage.
+
+| filter | default | slider range | guards |
+|---|---|---|---|
+| `min_spread_cents` | 5 | 0 – 25 | Below ~5¢ there's nothing to capture |
+| `min_trades_per_min` | 10 | 0 – 100 | Not enough arrivals to get filled |
+| `max_noise_bps` | **4** | 0.5 – 15 | Moves further in 10s than the spread is wide |
+
+`max_noise_bps` was 10, which would not have bound on anything — the realised
+names measure FDX 1.8, LLY 0.85, DLTR 2.7, LITE 5.2 bps. 4 flags LITE and
+nothing else. It is a **slider, not a constant**, and the default is only
+where the slider starts.
 
 Dollar volume is a **floor only and appears nowhere in the ranking** — across
 the 15 traded tickers it has no relationship to outcome.
+
+## Provenance, per symbol-day
+
+Several decisions silently change the numbers — condition-code exclusions,
+auction-edge trimming, crossed and locked quotes, same-timestamp collapsing.
+Reading this document should not be the only way to find out that a row was
+computed from 94% of the tape.
+
+`compute.py` writes a **provenance row alongside each metrics row**, into its
+own `provenance` table, surfaced in the dashboard:
+
+| item | meaning |
+|---|---|
+| `dropped_condition_<code>` | trades dropped, broken out per excluded code |
+| `dropped_condition_any` | union — a print carrying two excluded codes counts once |
+| `dropped_condition_code_sum` | sum of the per-code counts; exceeds the union when codes overlap |
+| `trades_retained`, `trade_retained_share` | what survived, and as a share of raw |
+| `quotes_crossed_locked`, `quote_retained_share` | quotes dropped as crossed or locked |
+| `quote_records_before_collapse` / `_after_collapse` / `records_lost_to_collapse` | same-instant collapsing |
+| `auction_minutes_trimmed` | minutes removed from the window edges |
+
+The union and the sum are both stored because they answer different questions:
+the union is how much tape was lost, the sum is how much each rule
+contributed, and they differ exactly when a print carries two excluded codes.
+
+## Every metric links to its definition
+
+`metric_docs.py` maps each metric name to a section anchor and a one-line
+definition, so the dashboard makes every column header a link. Looking at
+`noise_bps_tw_mid_10s` is one click from learning it is a median of
+duration-weighted midpoints diffed across fixed 10-second buckets, with a
+bucket-straddle approximation.
+
+The fifteen generated `noise_bps_*` and `ratio_*` columns resolve by pattern
+rather than needing an entry each. `metric_docs.undocumented(names)` returns
+metrics with no definition — an unlinked column in the dashboard is the signal
+that a metric was added without being documented.
 
 ## Storage
 

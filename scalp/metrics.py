@@ -6,19 +6,27 @@ re-rank will pass the last 30 minutes; the 15-minute breakdown passes each
 bucket in turn. Same functions, different bounds — that is the whole reason
 the bounds are parameters rather than constants.
 
-SOURCE AND ITS LIMITS. The input is `history/trade_quote`: every trade paired
-with the prevailing NBBO at that trade. So the quote series is SAMPLED AT
-TRADE TIMES, not the full quote stream. That is fine for spread and midpoint
-levels, and it is a real limitation for anything that counts quote events —
-see `METRICS.md` for exactly which metrics are affected and which are not. Two
-metrics from the brief are NOT computable from this source at all and return
-NaN rather than a plausible substitute:
+TWO SOURCES, TWO ENTRY POINTS, DELIBERATELY NOT MERGED.
 
-  * BBO changes without a trade at that price (cancel vs consumption). Every
-    record in trade_quote has a trade by construction, so this is unmeasurable
-    here by definition.
-  * True best-bid/best-offer lifetime. What is available is persistence
-    across trade samples, which is a different quantity and is named as one.
+  compute_window()        `history/trade_quote` — every trade paired with the
+                          prevailing NBBO at that trade. Drives spread, noise
+                          and flow. Its quote series is SAMPLED AT TRADE
+                          TIMES, which is fine for spread and midpoint levels
+                          and useless for counting quote events.
+
+  compute_quote_window()  `history/quote` at tick — the real quote stream.
+                          Drives flicker and BBO lifetime.
+
+They stay separate so a trade-sampled quote series cannot reach a metric that
+needs the real stream. That mistake already happened once and produced
+`bid_persist_ms_median_tradesampled`, which has been removed rather than kept
+beside the correct figure: a knowingly-worse metric sitting next to available
+correct data only invites someone to use it.
+
+ONE METRIC STILL RETURNS NaN. `bbo_change_without_trade_share` — cancel vs
+consumption — needs both sources at once: the quote stream to see the BBO
+change and the trade tape to say whether a trade met it at that price. It is
+now computable in principle and is NOT implemented; see METRICS.md.
 
 Returning NaN is deliberate. A number computed from the wrong source would
 rank tickers and look reasonable doing it.
@@ -311,7 +319,13 @@ def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
 def flicker_metrics(q_raw: pd.DataFrame, q: pd.DataFrame, *,
                     bid: str, ask: str, time_col: str,
                     start: pd.Timestamp, end: pd.Timestamp) -> dict:
-    """Both flicker variants, because they may be different quantities.
+    """Flicker and BBO lifetime, FROM THE TICK QUOTE STREAM.
+
+    This runs on `history/quote` at tick resolution, never on trade_quote.
+    The earlier trade-sampled variant has been removed rather than kept
+    alongside: a knowingly-worse metric sitting next to available correct data
+    only invites someone to use it, and `bid_persist_ms_median_tradesampled`
+    was an honest name for an inferior quantity, not a reason to keep it.
 
     `q_raw` is pre-collapse (every record); `q` is collapsed to distinct
     instants.
@@ -337,15 +351,18 @@ def flicker_metrics(q_raw: pd.DataFrame, q: pd.DataFrame, *,
         "ask_changes_per_min": float("nan"),
         "two_sided_change_share": float("nan"),
         "same_instant_share": float("nan"),
-        # Not computable from trade_quote — see the module docstring. Every
-        # record here has a trade by construction, so "BBO changed without a
-        # trade" cannot be observed at all from this source.
+        # True lifetime of the best bid / best offer: how long a price stood
+        # before it was replaced. Correct here because the source is the tick
+        # quote stream, which sees quotes that came and went between trades.
+        "bid_lifetime_ms_median": float("nan"),
+        "ask_lifetime_ms_median": float("nan"),
+        "bid_lifetime_ms_mean": float("nan"),
+        "ask_lifetime_ms_mean": float("nan"),
+        # Cancel vs consumption. Needs the trade tape alongside this quote
+        # stream to say whether a BBO change was met by a trade at that price,
+        # so it is not computable inside this function. See
+        # cross_source_metrics and METRICS.md.
         "bbo_change_without_trade_share": float("nan"),
-        # Persistence across TRADE SAMPLES, not true best-bid lifetime. Named
-        # for what it is: a trade-sampled quote series cannot see a quote that
-        # came and went between two trades.
-        "bid_persist_ms_median_tradesampled": float("nan"),
-        "ask_persist_ms_median_tradesampled": float("nan"),
     }
     if q_raw.empty:
         return out
@@ -370,16 +387,22 @@ def flicker_metrics(q_raw: pd.DataFrame, q: pd.DataFrame, *,
     out["two_sided_change_share"] = (both / int(changed.sum())
                                      if changed.any() else float("nan"))
 
-    # Persistence across TRADE SAMPLES, not true quote lifetime. Named for
-    # what it is: with a trade-sampled quote series the true lifetime of a
-    # best bid is not observable.
+    # BBO lifetime: sum the durations of consecutive records holding the same
+    # price, so one "life" runs from the moment a price becomes the best until
+    # it is replaced. cumsum over the change flag groups those runs.
+    #
+    # The final run is left-censored by the window end — it was still standing
+    # when observation stopped — so it is excluded rather than counted as
+    # having ended, which would drag the median down.
     dur = durations_seconds(q[time_col], end) * 1000.0
-    if bid_moved.any():
-        runs = dur.groupby(bid_moved.cumsum()).sum()
-        out["bid_persist_ms_median_tradesampled"] = float(runs.median())
-    if ask_moved.any():
-        runs = dur.groupby(ask_moved.cumsum()).sum()
-        out["ask_persist_ms_median_tradesampled"] = float(runs.median())
+    for side, moved, key in ((bid, bid_moved, "bid"), (ask, ask_moved, "ask")):
+        if not moved.any():
+            continue
+        runs = dur.groupby(moved.cumsum()).sum()
+        if len(runs) > 1:
+            runs = runs.iloc[:-1]           # drop the still-standing quote
+        out[f"{key}_lifetime_ms_median"] = float(runs.median())
+        out[f"{key}_lifetime_ms_mean"] = float(runs.mean())
     return out
 
 
@@ -387,7 +410,8 @@ def flicker_metrics(q_raw: pd.DataFrame, q: pd.DataFrame, *,
 
 def flow_metrics(trades: pd.DataFrame, *, price: str, size: str,
                  bid: str, ask: str, exchange: str | None,
-                 start: pd.Timestamp, end: pd.Timestamp) -> dict:
+                 start: pd.Timestamp, end: pd.Timestamp,
+                 code_sets: pd.Series | None = None) -> dict:
     """Arrival rate, size distribution, two-sidedness, off-exchange share.
 
     `trades` must already have excluded prints removed.
@@ -401,7 +425,11 @@ def flow_metrics(trades: pd.DataFrame, *, price: str, size: str,
     out = {
         "trades_per_min": float("nan"), "shares_per_min": float("nan"),
         "trade_size_mean": float("nan"), "trade_size_median": float("nan"),
-        "odd_lot_share": float("nan"),
+        "odd_lot_share": float("nan"),          # against the TIERED round lot
+        "sub_100_share": float("nan"),          # fixed 100, for comparability
+        "round_lot_size": float("nan"),
+        "reference_price": float("nan"),
+        "odd_lot_flag_disagree_share": float("nan"),
         "at_bid_share": float("nan"), "at_ask_share": float("nan"),
         "between_share": float("nan"), "two_sided_balance": float("nan"),
         "off_exchange_share": float("nan"),
@@ -422,7 +450,36 @@ def flow_metrics(trades: pd.DataFrame, *, price: str, size: str,
     out["shares_per_min"] = float(s.fillna(0).sum()) / minutes
     out["trade_size_mean"] = float(s.mean())
     out["trade_size_median"] = float(s.median())
-    out["odd_lot_share"] = float((s < 100).mean())
+
+    # Odd lots against the PRICE-TIERED round lot, not a fixed 100. FDX at
+    # ~$330 has a 40-share round lot and quotes 40 x 40 at the inside —
+    # exactly one round lot — so a fixed boundary would call every inside-size
+    # print an odd lot in the names this strategy targets.
+    #
+    # One reference price for the whole window, because the exchanges assign
+    # the tier periodically rather than per print. Median trade price is used
+    # rather than last, so a closing spike cannot move the boundary.
+    reference = float(p.median()) if p.notna().any() else float("nan")
+    out["reference_price"] = reference
+    if np.isfinite(reference) and reference > 0:
+        lot = config.round_lot_size(reference)
+        out["round_lot_size"] = float(lot)
+        tiered_odd = s < lot
+        out["odd_lot_share"] = float(tiered_odd.mean())
+    else:
+        tiered_odd = None
+    out["sub_100_share"] = float((s < 100).mean())
+
+    # Free correctness check: the vendor flags odd lots independently with
+    # condition 115. Disagreement between that flag and the tiered calculation
+    # is either a wrong tier here or a vendor flag on a different basis, and
+    # either way it is worth seeing rather than assuming.
+    if code_sets is not None and tiered_odd is not None:
+        vendor_odd = code_sets.reindex(trades.index).apply(
+            lambda cs: 115 in cs if isinstance(cs, (set, frozenset)) else False)
+        out["odd_lot_flag_disagree_share"] = float(
+            (vendor_odd != tiered_odd).mean())
+        out["odd_lot_vendor_share"] = float(vendor_odd.mean())
 
     mid = (a + b) / 2.0
     ok = p.notna() & b.notna() & a.notna() & (mid > 0)
@@ -500,9 +557,6 @@ def compute_window(df: pd.DataFrame, cols: Columns,
                                    bid=cols.bid, ask=cols.ask,
                                    exchange=cols.exchange,
                                    start=start, end=end))
-        result.update(flicker_metrics(window, window, bid=cols.bid,
-                                      ask=cols.ask, time_col=cols.time,
-                                      start=start, end=end))
         result.update(noise_metrics(window, window, bid=cols.bid, ask=cols.ask,
                                     price=cols.price, time_col=cols.time,
                                     trade_time_col=cols.time,
@@ -510,7 +564,9 @@ def compute_window(df: pd.DataFrame, cols: Columns,
         return result
 
     # Trades: drop restatements and off-quote prints before any counting.
-    dropped = excluded_mask(window, cols.condition_cols)
+    code_sets = condition_code_sets(window, cols.condition_cols)
+    dropped = code_sets.apply(
+        lambda s: bool(s & config.EXCLUDED_CONDITION_CODES))
     trades = window[~dropped]
     result["rows_excluded"] = int(dropped.sum())
     result["excluded_share"] = float(dropped.mean())
@@ -529,13 +585,104 @@ def compute_window(df: pd.DataFrame, cols: Columns,
                                 price=cols.price, time_col=cols.time,
                                 trade_time_col=cols.time,
                                 start=q_start, end=q_end))
-    result.update(flicker_metrics(q_window, q, bid=cols.bid, ask=cols.ask,
-                                  time_col=cols.time, start=q_start, end=q_end))
     result.update(flow_metrics(trades, price=cols.price, size=cols.size,
                                bid=cols.bid, ask=cols.ask,
-                               exchange=cols.exchange, start=start, end=end))
+                               exchange=cols.exchange, start=start, end=end,
+                               code_sets=code_sets))
     result.update(ranking_ratios(result))
+    result["_provenance"] = trade_provenance(
+        window, q_window, q, code_sets, cols,
+        start=start, end=end, q_start=q_start, q_end=q_end)
     return result
+
+
+def compute_quote_window(qdf: pd.DataFrame, *, bid: str, ask: str,
+                         time_col: str,
+                         start: pd.Timestamp, end: pd.Timestamp) -> dict:
+    """Flicker and BBO lifetime from the TICK QUOTE STREAM.
+
+    Separate from compute_window because it takes a different frame from a
+    different endpoint. Keeping them apart is what stops a trade-sampled
+    quote series being fed to metrics that need the real stream — which is
+    exactly how `bid_persist_ms_median_tradesampled` came to exist.
+
+    Auction edges are NOT trimmed here: flicker is a count over a window, and
+    the caller passes whatever window it wants counted.
+    """
+    window = slice_window(qdf, time_col, start, end)
+    collapsed = collapse_to_distinct_instants(window, time_col)
+    out = {
+        "quote_window_start": start, "quote_window_end": end,
+        "quote_rows_raw": int(len(window)),
+    }
+    out.update(flicker_metrics(window, collapsed, bid=bid, ask=ask,
+                               time_col=time_col, start=start, end=end))
+    out["_quote_provenance"] = {
+        "quote_records_raw": int(len(window)),
+        "quote_records_after_collapse": int(len(collapsed)),
+        "quote_records_lost_to_collapse": int(len(window) - len(collapsed)),
+    }
+    return out
+
+
+# --- provenance --------------------------------------------------------------
+
+def trade_provenance(window: pd.DataFrame, q_window: pd.DataFrame,
+                     q: pd.DataFrame, code_sets: pd.Series, cols: Columns, *,
+                     start: pd.Timestamp, end: pd.Timestamp,
+                     q_start: pd.Timestamp, q_end: pd.Timestamp) -> dict:
+    """What was dropped, by what rule, getting from raw tape to the metrics.
+
+    Several decisions silently change the numbers — condition-code exclusions,
+    auction-edge trimming, crossed and locked quotes, same-instant collapsing.
+    Reading METRICS.md should not be the only way to find out that a row was
+    computed from 94% of the tape.
+
+    Every count is per symbol-day, and the condition drops are broken out by
+    code so a change in one code's share is visible without re-deriving it.
+    """
+    n_raw = len(window)
+    prov: dict[str, float] = {
+        "rows_raw": int(n_raw),
+        "auction_minutes_trimmed": float(
+            (q_start - start).total_seconds() / 60.0
+            + (end - q_end).total_seconds() / 60.0),
+    }
+
+    # Trades dropped by condition code, one entry per code.
+    dropped_total = 0
+    for code in sorted(config.EXCLUDED_CONDITION_CODES):
+        n = int(code_sets.apply(lambda s, c=code: c in s).sum())
+        prov[f"dropped_condition_{code}"] = n
+        dropped_total += n
+    # Sum of per-code counts can exceed the row count when a print carries two
+    # excluded codes, so the retained figure uses the union, not the sum.
+    union_dropped = int(code_sets.apply(
+        lambda s: bool(s & config.EXCLUDED_CONDITION_CODES)).sum())
+    prov["dropped_condition_any"] = union_dropped
+    prov["dropped_condition_code_sum"] = dropped_total
+    prov["trades_retained"] = int(n_raw - union_dropped)
+    prov["trade_retained_share"] = (
+        float((n_raw - union_dropped) / n_raw) if n_raw else float("nan"))
+
+    # Quotes dropped as crossed or locked.
+    if not q.empty:
+        b = pd.to_numeric(q[cols.bid], errors="coerce")
+        a = pd.to_numeric(q[cols.ask], errors="coerce")
+        usable = b.notna() & a.notna()
+        crossed = usable & ((a - b) <= 0)
+        prov["quotes_in_window"] = int(len(q))
+        prov["quotes_crossed_locked"] = int(crossed.sum())
+        prov["quote_retained_share"] = (
+            float(1.0 - crossed.sum() / usable.sum()) if usable.any()
+            else float("nan"))
+
+    # Records lost to same-instant collapsing.
+    prov["quote_records_before_collapse"] = int(len(q_window))
+    prov["quote_records_after_collapse"] = int(len(q))
+    prov["records_lost_to_collapse"] = int(len(q_window) - len(q))
+
+    return prov
 
 
 def ranking_ratios(m: dict) -> dict:
