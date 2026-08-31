@@ -756,18 +756,35 @@ def ranking_ratios(m: dict) -> dict:
     Computed for all of them so they can be compared. None is privileged
     until calibration says which separates the top of the realised results
     from the bottom — and if none does, that is the finding.
+
+    NEAR-ZERO NOISE RETURNS NaN, NOT A LARGE RATIO. SGOV, BOXX and SHV are
+    T-bill ETFs whose midpoint barely moves, so noise rounds toward zero and
+    the ratio came out at 7e11 — which sorted straight to the top of the
+    ranking.
+
+    Clamping the denominator was the other option and is worse: a clamped
+    ratio is still a number, it still sorts above every real name, and it
+    looks like a measurement rather than a division that should not have
+    happened. NaN removes the name from the ranking and says so.
+
+    This is a numerical guard, deliberately set far below any tradeable
+    value. The judgement about whether a quiet name is worth trading belongs
+    to config.DEFAULT_FILTERS["min_noise_bps"], applied at read time — a stock
+    that does not move has no two-sided flow either, so near-zero noise is a
+    disqualifier in its own right and not merely a divide-by-zero nuisance.
     """
     out: dict[str, float] = {}
     spread = m.get("spread_bps_tw")
     if spread is None or not np.isfinite(spread):
         spread = m.get("spread_bps_median", float("nan"))
+    floor = config.MIN_NOISE_BPS_FOR_RATIO
     for key, val in list(m.items()):
         if not key.startswith("noise_bps_") or key.endswith("__buckets"):
             continue
         name = key[len("noise_bps_"):]
-        out[f"ratio_{name}"] = (spread / val
-                                if val and np.isfinite(val) and val > 0
-                                else float("nan"))
+        usable = (val is not None and np.isfinite(val) and val >= floor
+                  and np.isfinite(spread))
+        out[f"ratio_{name}"] = (spread / val) if usable else float("nan")
     return out
 
 

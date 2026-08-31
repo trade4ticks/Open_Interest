@@ -22,6 +22,31 @@ been put to. **If no variant separates the top of the realised results from
 the bottom, that is the finding** — and it gets reported as one rather than
 resolved by picking whichever ratio looks tidiest.
 
+### There are currently no reference values for midpoint noise
+
+An earlier set of per-name noise figures — FDX 1.8, LLY 0.85, LITE 5.2, DLTR
+2.7 bps — was carried in config as calibration anchors. **They were the wrong
+quantity and have been relabelled.**
+
+They came from consecutive fill prices, which alternate between bid and ask,
+so they measure **trade-price** movement and therefore include the bid-ask
+bounce. Every `noise_bps_tw_mid_*` variant measures **midpoint** movement,
+which excludes the bounce by construction. The two are roughly 3–5× apart in
+scale.
+
+Left in place as targets, they would have guaranteed a false failure signal: a
+mid-based noise figure landing 3–5× below them would have looked like a broken
+metric while in fact being the correct one. They now live under
+`FILL_DERIVED_TRADE_PRICE_MOVEMENT_BPS` with that written on them.
+
+The nearest computed comparison is `noise_bps_trade_price_*`, which shares the
+bounce — and even that is bucketed on a fixed clock rather than measured
+fill-to-fill, so it is not the same measurement either.
+
+Real anchors arrive when `calibrate.py` runs over the real universe with FDX
+and the other 14 traded names in the data. Until then, no reference values
+exist for this metric and none should be invented.
+
 ---
 
 Metrics come from two entry points, deliberately not merged:
@@ -320,6 +345,39 @@ Same reasoning as retaining non-qualifying names at the universe stage.
 | `min_spread_cents` | 5 | 0 – 25 | Below ~5¢ there's nothing to capture |
 | `min_trades_per_min` | 10 | 0 – 100 | Not enough arrivals to get filled |
 | `max_noise_bps` | **4** | 0.5 – 15 | Moves further in 10s than the spread is wide |
+| `min_noise_bps` | **0.3** | 0 – 2 | Doesn't move at all — no two-sided flow to trade against |
+
+### The ratio denominator returns NaN below 0.05 bps
+
+SGOV, BOXX and SHV produced ratios of **7×10¹¹** — T-bill ETFs whose midpoint
+barely moves, so the denominator rounded toward zero and they sorted straight
+to the top of the ranking.
+
+`ranking_ratios` now returns `NaN` when noise is below
+`config.MIN_NOISE_BPS_FOR_RATIO` (0.05 bps). **NaN rather than a clamped
+denominator, deliberately:** a clamped ratio is still a number, it still sorts
+above every real name, and it looks like a measurement rather than a division
+that should not have happened.
+
+That floor is a *numerical* guard, set far below any tradeable value. The
+judgement about whether a quiet name is worth trading is `min_noise_bps` in
+the filters above, applied at read time where it can be moved without a
+recompute. Keeping the two separate matters: one protects the arithmetic, the
+other expresses an opinion, and conflating them buries the opinion where it
+cannot be changed.
+
+### ⚠️ Open question: the ratio currently rewards low noise, not wide spread
+
+The top of the ratio list is driven almost entirely by small denominators.
+FLUT at **22 bps spread and 0.23 noise** ranks above names with comparable
+spreads and slightly more movement — a ratio of ~96, against ~7 for a name
+like FDX at 12 bps over 1.8.
+
+Whether that ordering is right is precisely what calibration decides. It is
+plausible either way: a name that barely moves is easy to sit in front of, or
+it is a name with no flow to capture. Flagged here so it gets **checked rather
+than assumed**, because a ranking dominated by one term is the kind of thing
+that looks like a working model right up until it is tested.
 
 `max_noise_bps` was 10, which would not have bound on anything — the realised
 names measure FDX 1.8, LLY 0.85, DLTR 2.7, LITE 5.2 bps. 4 flags LITE and

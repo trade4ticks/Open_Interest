@@ -815,6 +815,12 @@ DEFAULT_FILTERS = {
     "min_spread_cents":   float(os.environ.get("SCALP_MIN_SPREAD_CENTS", "5")),
     "min_trades_per_min": float(os.environ.get("SCALP_MIN_TRADES_PER_MIN", "10")),
     "max_noise_bps":      float(os.environ.get("SCALP_MAX_NOISE_BPS", "4")),
+    # A stock that does not move has no two-sided flow either, so near-zero
+    # noise disqualifies a name in its own right — this is not merely the
+    # divide-by-zero guard wearing a filter's clothes. SGOV, BOXX and SHV are
+    # T-bill ETFs: their midpoints barely move, and there is nothing to scalp
+    # against a book that never reprices.
+    "min_noise_bps":      float(os.environ.get("SCALP_MIN_NOISE_BPS", "0.3")),
 }
 
 # Slider bounds for the dashboard, so a threshold can be moved through the
@@ -823,7 +829,28 @@ FILTER_RANGES = {
     "min_spread_cents":   (0.0, 25.0, 0.5),
     "min_trades_per_min": (0.0, 100.0, 1.0),
     "max_noise_bps":      (0.5, 15.0, 0.1),
+    "min_noise_bps":      (0.0, 2.0, 0.05),
 }
+
+# --- ratio denominator guard -------------------------------------------------
+# Below this, spread / noise returns NaN instead of a number.
+#
+# SGOV, BOXX and SHV produced ratios of 7e11 — T-bill ETFs whose midpoint
+# barely moves, so the denominator rounded toward zero and they sorted to the
+# top of the ranking.
+#
+# NaN rather than a clamped denominator, deliberately: a clamped ratio is
+# still a number, it still sorts above every real name, and it looks like a
+# measurement rather than a division that should not have happened.
+#
+# This is a NUMERICAL guard and is set far below any tradeable value. The
+# judgement about whether a quiet name is worth trading is
+# DEFAULT_FILTERS["min_noise_bps"], applied at read time where it can be moved
+# without a recompute. Keeping the two separate matters: one protects the
+# arithmetic, the other expresses an opinion, and conflating them would bury
+# the opinion somewhere it cannot be changed.
+MIN_NOISE_BPS_FOR_RATIO = float(
+    os.environ.get("SCALP_MIN_NOISE_BPS_FOR_RATIO", "0.05"))
 
 
 # --- round lots are price-tiered ---------------------------------------------
@@ -887,10 +914,29 @@ REALISED_DOLLARS_PER_MIN: dict[str, float] = {
     "INTU": -1.91,
 }
 
-# Crude noise proxies derived from the owner's own fill prices. Right ballpark
-# only — not a benchmark to fit, just a sanity check that a computed noise
-# variant lands in the same order of magnitude.
-APPROX_NOISE_BPS_FROM_FILLS: dict[str, float] = {
+# --- NOT calibration anchors. Do not compare these to noise_bps_*. ----------
+#
+# These were supplied as approximate noise values and used as reference points
+# for the noise variants. THAT WAS WRONG, and leaving them labelled as noise
+# would have guaranteed a false failure signal at calibration.
+#
+# They are derived from consecutive FILL PRICES, which alternate between bid
+# and ask. So they measure TRADE-PRICE movement, and trade-price movement
+# contains the bid-ask bounce. The pipeline's noise_bps_tw_mid_* variants
+# measure MIDPOINT movement, which excludes the bounce by construction.
+#
+# Two different quantities, roughly 3-5x apart in scale. A mid-based noise
+# figure that came out 3-5x below these numbers would have looked like a
+# broken metric and would in fact have been the correct one.
+#
+# The closest computed comparison is noise_bps_trade_price_*, which is the
+# variant that shares the bounce — and even that is bucketed on a fixed clock
+# rather than measured fill-to-fill, so it is not the same thing either.
+#
+# THERE ARE CURRENTLY NO REFERENCE VALUES FOR MIDPOINT NOISE. The real anchors
+# come from running calibrate.py over the real universe once FDX and the other
+# 14 traded names are in the data.
+FILL_DERIVED_TRADE_PRICE_MOVEMENT_BPS: dict[str, float] = {
     "FDX":  1.8,
     "LLY":  0.85,
     "LITE": 5.2,
