@@ -45,6 +45,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -54,6 +55,9 @@ from pyarrow import csv as pacsv
 from scalp import config
 
 log = logging.getLogger(__name__)
+
+# ThetaData's reference timezone for "current day".
+_ET = ZoneInfo("America/New_York")
 
 
 # --- Exceptions --------------------------------------------------------------
@@ -372,6 +376,18 @@ def ymd(d: date | str) -> str:
 
 def parse_date(s: str) -> date:
     return datetime.strptime(s.replace("-", ""), "%Y%m%d").date()
+
+
+def today_et() -> date:
+    """Today's date in US Eastern Time.
+
+    The vendor defines "current day" in ET, and the VPS runs in UTC — so
+    date.today() is a day ahead there for the five hours after 19:00 ET. Every
+    is-this-date-in-the-past check has to use this, because getting it wrong
+    means either refusing a legitimate same-day run or accepting a historical
+    one as live.
+    """
+    return datetime.now(_ET).date()
 
 
 # --- Endpoints ---------------------------------------------------------------

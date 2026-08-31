@@ -343,6 +343,41 @@ Supporting modules: `metrics.py` (all computation, arbitrary bounds),
 (Postgres), `quality.py` (restatement guard), `metric_docs.py` (metric →
 definition, for dashboard column links).
 
+### Checks before pushing
+
+```bash
+python -m scalp.tests.check_references   # stdlib only, runs anywhere
+python -m scalp.tests.smoke              # the above + imports + metric path
+```
+
+Three bugs have reached the VPS the same way: code written, byte-compiled,
+pushed, never executed. `td.today_et` was called and never defined;
+`profile_compute` called a function after it was deleted; `free_space_gb`
+crashed on a path that does not exist yet. **`py_compile` passes all three** —
+it checks syntax and stops.
+
+| tier | catches | needs |
+|---|---|---|
+| `check_references` | `module.attr` that does not exist | stdlib only |
+| `--help` on every script | import errors, argparse mistakes | the deps |
+| synthetic metric run | runtime errors in the metric path | the deps |
+
+Tier 1 is the important one, because it is the only tier that runs in an
+environment without pandas — which is where this code gets written. It parses
+rather than imports: it builds each module's top-level names, resolves import
+aliases, and checks every `alias.attr` against the target module.
+
+Note on linters: **pyflakes and ruff would not have caught these.** Both
+analyse one file at a time and flag undefined *local* names; neither resolves
+`td.today_et` against the contents of `scalp/thetadata.py`. A type checker
+(mypy, pyright) would, but it needs the package to be importable, and the
+dependencies are not installed where the checking happens.
+
+The synthetic frame in tier 3 deliberately contains a crossed quote, duplicate
+timestamps, an excluded condition code, an odd lot under the tiered round lot,
+a TRF print and a flat near-zero-noise tape. A smoke test on tidy data proves
+only that the happy path runs.
+
 ### Its own database
 
 ```bash
