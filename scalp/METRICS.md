@@ -26,12 +26,34 @@ a quote that appeared and vanished between two trades is invisible.
 | `bbo_change_without_trade_share` | Every record here has a trade by construction. "BBO changed without a trade" cannot be observed at all. |
 | true best-bid / best-offer lifetime | Needs the quote stream. What is available is persistence across trade samples, published under the honest name `bid_persist_ms_median_tradesampled`. |
 
-⚠️ **Open decision.** Making those two real needs a second pull from
-`history/quote` at tick interval. That is a much larger store than the 3.1 GB
-trade_quote backfill, against ~22 GB free on block 3 — plausibly the whole
-budget for a handful of symbols. Options: skip them, fetch them for a small
-subset, or fetch at a coarser interval and accept the loss. **Not decided, and
-not assumed.**
+⚠️ **Open decision — `s7_quote_sizing.py` measures it.** Making those two real
+needs a second pull from `history/quote`. The size is genuinely unknown: any
+figure extrapolated from a 30-minute sample is unreliable, because quote
+traffic is not uniform across the session and the open and close carry far more
+of it than a mid-morning half hour. s7 pulls whole days for FDX, LLY, LITE and
+DLTR and extrapolates to 544 × `QUOTE_LOOKBACK_DAYS`.
+
+Live options, in order:
+
+1. **interval=1s** — if the change counts survive it. s7 computes the flicker
+   metrics both ways so this is measured, not guessed.
+2. **compute-and-discard at tick** — pull per symbol, compute, write metrics,
+   delete the raw parquet. Peak disk is one symbol-day; raw quote ticks have
+   no use beyond producing these metrics, and a re-pull is ~20 minutes.
+3. **free space on block 3.**
+
+**Not an option: a smaller symbol list.** Flicker is an *input* to the ranking,
+not a refinement applied afterwards. Measuring it only on names a
+flicker-blind ranking already selected cannot tell us what the filter should
+have been — the names it would have promoted or demoted are exactly the ones
+never measured. It runs on the full universe or it doesn't earn its place.
+
+### Lookbacks differ by source
+
+| source | window | why |
+|---|---|---|
+| `trade_quote` | `TRADE_QUOTE_LOOKBACK_DAYS` = 10 | spread, noise and flow move with the day's conditions |
+| `history/quote` | `QUOTE_LOOKBACK_DAYS` = 5 | flicker is a book-structure property and should be more stable day to day |
 
 ## Windows and exclusions
 

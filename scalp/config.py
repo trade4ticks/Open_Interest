@@ -643,6 +643,34 @@ COMPUTE_OFF_MID_BPS = True
 # morning-vs-afternoon question.
 INTRADAY_BUCKET_MINUTES = 15
 
+# --- lookbacks ---------------------------------------------------------------
+# Two separate windows, because the two sources measure different kinds of
+# quantity.
+#
+# trade_quote drives spread, noise and flow — all of which move with the day's
+# conditions, so they want a full 10-day window to average over.
+#
+# history/quote drives flicker, which is a BOOK-STRUCTURE property: how a
+# name's participants post and cancel. That should be more stable day to day
+# than spread, so it does not need the same lookback. Five days.
+TRADE_QUOTE_LOOKBACK_DAYS = int(
+    os.environ.get("SCALP_TRADE_QUOTE_LOOKBACK_DAYS", "10"))
+QUOTE_LOOKBACK_DAYS = int(os.environ.get("SCALP_QUOTE_LOOKBACK_DAYS", "5"))
+
+# --- flicker runs on the FULL universe ---------------------------------------
+# There is deliberately no top-N subset here, and the absence is the decision.
+#
+# A subset would only make sense if flicker were a refinement applied to names
+# that had already passed the ranking. It is not: flicker is one of the inputs
+# the ranking is supposed to be built from. Measuring it only on names that a
+# flicker-blind ranking already selected tells us nothing about what the filter
+# should have been — the names it would have promoted or demoted are precisely
+# the ones never measured.
+#
+# So it runs across the whole universe or it does not earn its place. If the
+# quote-stream pull turns out too large to sustain, the answer is a coarser
+# interval or compute-and-discard, NOT a smaller symbol list.
+
 
 # --- ranking floors ----------------------------------------------------------
 # Each metric alone has an obvious failure case, so all three are floors and
