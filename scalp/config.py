@@ -108,21 +108,38 @@ VENUE_POLICY_VERIFIED = True
 # omitted window means the full session — see the volume-gap note below.
 SUPPORTS_TIME_BOUNDS = True
 
-# --- known volume gap, under investigation -----------------------------------
-# On FDX 2026-08-28, trade_quote summed to 776,192 shares and snapshot/ohlc
-# with utp_cta returned ~774,000 — two independent endpoints agreeing with each
-# other and both ~19% short of the EOD consolidated figure of 956,900.
+# --- the 19% volume gap: RESOLVED --------------------------------------------
+# Settled by s6_session_bounds.py on FDX 2026-08-28. The arithmetic, in full,
+# because a bare flag is useless to anyone reading this later:
 #
-# Two endpoints agreeing rules out tape coverage as the cause; the venue
-# question is settled and is not this. The working hypothesis is inclusion
-# rules — specifically that the closing cross falls outside the default query
-# window, which for a large cap is routinely 5-15% of daily volume.
+#     RTH prints (default window, 09:30-16:00)      776,192
+#     closing cross, counted ONCE                 + 186,344
+#                                                 ---------
+#                                                   962,536
+#     EOD consolidated reference                    956,900   (+0.59%)
 #
-# s6_session_bounds.py tests it. Do not build any metric on trade counts or
-# share volume until it resolves — a 19% shortfall concentrated at one end of
-# the session would bias trades/min and the two-sidedness classification in a
-# way that looks perfectly plausible in aggregate.
-VOLUME_GAP_RESOLVED = False
+# There was never any missing volume. Two things were happening at once:
+#
+#   1. The default query window IS regular hours — s6 found the no-parameter
+#      pull byte-identical to an explicit 09:30-16:00 pull. The closing cross
+#      prints at 16:00:03, three seconds outside it, so it was excluded by
+#      construction. That accounts for the whole 19%.
+#
+#   2. Widening the window to 04:00-20:00 does NOT simply add it back. It
+#      overshoots to 180% of EOD, because the official close is RE-REPORTED on
+#      a schedule through the evening. The same 186,344 shares at $330.88 on
+#      NYSE appear five times: once at 16:00:03.158 as condition 98 (CLOSING),
+#      then four more times as condition 51 (MC_OFFICIAL_CLOSE) at
+#      16:00:03.212, 16:10:00, 18:30:00 and 19:00:00. The opening auction does
+#      the same thing — 20,056 shares once as 62 (OPEN_REPORT) and once as 66
+#      (MC_OFFICIAL_OPEN).
+#
+# So a naive sum over a wide window double-counts auctions, and a naive sum
+# over the default window omits the closing cross entirely. Neither is a tape
+# problem and neither affects this pipeline, which pulls RTH only: trade counts
+# and spreads were never contaminated. The numbers are now understood rather
+# than merely close.
+VOLUME_GAP_RESOLVED = True
 
 
 # --- known-good reference figure (used by s1) --------------------------------
@@ -255,13 +272,49 @@ TRADE_CONDITIONS: dict[int, str] = {
     148: "EXTENDED_HOURS_TRADE",    # executed outside regular market hours
 }
 
-# Codes that mark an auction / cross print rather than a continuous-session
-# execution. Used by the volume-gap diagnostic to say WHERE the missing shares
-# are, not just that they are missing.
-AUCTION_CONDITION_CODES: frozenset[int] = frozenset({7, 26, 45, 51, 62, 66, 98})
+# Filler values in the condition columns — not codes. `ext_condition1..4` are
+# padded with 255 when the print carries fewer than four extended conditions,
+# and 0 appears the same way. Treating either as a real code fills every
+# census with a meaningless top entry.
+NO_CONDITION_SENTINELS: frozenset[int] = frozenset({0, 255})
+
+
+# --- auction prints vs restatements: the distinction that matters ------------
+# These two sets look similar and behave completely differently. Confusing them
+# is what made a wide-window pull report 180% of true daily volume.
+#
+# GENUINE AUCTION EXECUTIONS. Real prints, real shares, counted ONCE. If we
+# ever want auction volume as a feature, this is the set to sum.
+AUCTION_PRINT_CONDITION_CODES: frozenset[int] = frozenset({
+    7,    # OPEN_REPORT_IN_SEQ  — opening report, first price
+    26,   # OPEN_DETAIL         — opening detail, multi-part open reports
+    45,   # MATCH_CROSS         — crossing-session trade
+    62,   # OPEN_REPORT         — opening trade report
+    98,   # CLOSING             — market centre closing print (closing auction)
+})
+
+# RESTATEMENTS. NOT executions. These re-report an auction that already
+# printed under 62 or 98, on a schedule running for hours afterwards. On FDX
+# the official close was restated four times between 16:00:03 and 19:00:00,
+# each carrying the full 186,344 shares.
+#
+# Summing these adds volume that never traded. They are excluded from every
+# count — shares, trades, and arrival rates alike.
+RESTATEMENT_CONDITION_CODES: frozenset[int] = frozenset({
+    51,   # MC_OFFICIAL_CLOSE — restates the 98 print
+    66,   # MC_OFFICIAL_OPEN  — restates the 62 print
+})
 
 # Codes that mark a print outside regular hours.
 EXTENDED_HOURS_CONDITION_CODES: frozenset[int] = frozenset({1, 148})
+
+# Conditions excluded from all volume and trade-count metrics.
+#
+# Currently restatements only — those are excluded on the hard evidence above.
+# Odd lots (115) and derivatively-priced prints (96) are deliberately NOT here
+# yet: s4_conditions.py measures how far off the quote each code actually sits,
+# and that measurement decides, not the code's name.
+EXCLUDED_CONDITION_CODES: frozenset[int] = RESTATEMENT_CONDITION_CODES
 
 
 def condition_name(code) -> str:
@@ -271,11 +324,38 @@ def condition_name(code) -> str:
     labelled as such rather than treated as an error.
     """
     try:
-        return TRADE_CONDITIONS[int(code)]
+        code_i = int(code)
     except (TypeError, ValueError):
         return f"unknown({code!r})"
-    except KeyError:
-        return f"unlabelled({int(code)})"
+    if code_i in NO_CONDITION_SENTINELS:
+        return "(none)"
+    return TRADE_CONDITIONS.get(code_i, f"unlabelled({code_i})")
+
+
+def is_restatement(code) -> bool:
+    """True for a code that re-reports an auction that already printed."""
+    try:
+        return int(code) in RESTATEMENT_CONDITION_CODES
+    except (TypeError, ValueError):
+        return False
+
+
+# --- restatement guard -------------------------------------------------------
+# A backstop for the condition-code exclusion above, for symbols or venues
+# where a restatement arrives under a code we have not seen. The signature is
+# an identical (size, price, exchange) triple reappearing at timestamps more
+# than a second apart.
+#
+# That signature alone is NOT sufficient on its own, and the threshold below is
+# why: a 100-share print at the same price on the same venue recurs constantly
+# in any liquid name, entirely legitimately. Requiring a large print keeps the
+# guard on the class of event it was built for — an auction being re-reported —
+# rather than firing on ordinary round-lot repetition.
+#
+# The guard FLAGS and REPORTS. It never drops rows on its own: the condition
+# codes are the primary defence and this exists to catch what they miss.
+RESTATEMENT_MIN_SHARES = int(os.environ.get("SCALP_RESTATEMENT_MIN_SHARES", "5000"))
+RESTATEMENT_MIN_SECONDS = float(os.environ.get("SCALP_RESTATEMENT_MIN_SECONDS", "1.0"))
 
 
 # --- storage -----------------------------------------------------------------

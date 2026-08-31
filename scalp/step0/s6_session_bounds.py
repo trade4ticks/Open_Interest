@@ -118,11 +118,31 @@ def _cond_label(row: pd.Series, cond_cols: list[str]) -> str:
             code = int(val)
         except (TypeError, ValueError):
             continue
-        if code == 0:
-            continue          # 0 is the no-condition filler on ext_condition*
+        if code in config.NO_CONDITION_SENTINELS:
+            continue          # 0 and 255 are padding on ext_condition*, not codes
         parts.append(f"{col.replace('ext_condition', 'ext')}={code} "
                      f"({config.condition_name(code)})")
     return "; ".join(parts) if parts else "(none)"
+
+
+def _row_codes(df: pd.DataFrame, cond_cols: list[str]) -> pd.Series:
+    """Per row, the set of real condition codes across every condition column."""
+    def codes(row) -> set[int]:
+        out = set()
+        for col in cond_cols:
+            val = row[col]
+            if pd.isna(val):
+                continue
+            try:
+                code = int(val)
+            except (TypeError, ValueError):
+                continue
+            if code not in config.NO_CONDITION_SENTINELS:
+                out.add(code)
+        return out
+    if not cond_cols:
+        return pd.Series([set()] * len(df), index=df.index)
+    return df.apply(codes, axis=1)
 
 
 def main() -> None:
@@ -215,6 +235,7 @@ def main() -> None:
     # --- where the recovered shares sit -------------------------------------
     a_label = "A  default window"
     b_label = "B  04:00:00-20:00:00"
+    reconciled: int | None = None
     if a_label in extents and b_label in results:
         a_first, a_last, _ = extents[a_label]
         _, b_df = results[b_label]
@@ -247,7 +268,7 @@ def main() -> None:
                             code_i = int(code)
                         except (TypeError, ValueError):
                             continue
-                        if code_i == 0:
+                        if code_i in config.NO_CONDITION_SENTINELS:
                             continue
                         rows.append({
                             "column": col,
@@ -255,7 +276,8 @@ def main() -> None:
                             "name": config.condition_name(code_i),
                             "trades": len(grp),
                             "shares": int(grp["shares"].sum()),
-                            "auction": code_i in config.AUCTION_CONDITION_CODES,
+                            "auction": code_i in config.AUCTION_PRINT_CONDITION_CODES,
+                            "restate": code_i in config.RESTATEMENT_CONDITION_CODES,
                             "ext_hours": code_i in config.EXTENDED_HOURS_CONDITION_CODES,
                         })
                 if rows:
@@ -264,10 +286,44 @@ def main() -> None:
                            .head(25))
                     print(tbl.to_string(index=False))
                     print()
-                    print("  Condition 98 (CLOSING) dominating the 'after' bucket")
-                    print("  confirms the closing cross. Codes 1 / 148 dominating")
-                    print("  the 'before' bucket is just premarket, which RTH")
-                    print("  filtering removes anyway and does NOT explain the gap.")
+                    print("  Read the `auction` and `restate` columns, not just the")
+                    print("  share totals. Condition 98/62 are genuine auction")
+                    print("  executions; 51/66 RE-REPORT the same shares hours")
+                    print("  later and must never be added to them.")
+
+            # --- reconciliation, counting each auction once -----------------
+            # A raw sum over the wide window double-counts: the official close
+            # is restated on a schedule for hours afterwards. The honest
+            # reconciliation is the RTH total plus the genuine auction prints
+            # that fall outside it, each counted once.
+            if cond_cols:
+                b_codes = _row_codes(b_df, cond_cols)
+                is_restate = b_codes.apply(
+                    lambda s: bool(s & config.RESTATEMENT_CONDITION_CODES))
+                is_auction = b_codes.apply(
+                    lambda s: bool(s & config.AUCTION_PRINT_CONDITION_CODES))
+                a_total = int(_sizes(results[a_label][1], scol).sum())
+                outside_auction = outside & is_auction & ~is_restate
+                auction_shares = int(b_sizes[outside_auction].sum())
+                restated_shares = int(b_sizes[outside & is_restate].sum())
+                recon = a_total + auction_shares
+                reconciled = recon
+
+                c.section("reconciliation, each auction counted once")
+                print(f"  RTH prints (default window)      {a_total:>12,}")
+                print(f"  auction prints outside RTH       {auction_shares:>12,}  "
+                      f"({int(outside_auction.sum())} print(s))")
+                print(f"                                   {'-' * 12}")
+                print(f"  reconciled total                 {recon:>12,}")
+                print(f"  EOD consolidated reference       {args.expected:>12,}")
+                delta = recon - args.expected
+                print(f"  difference                       {delta:>+12,}  "
+                      f"({100 * delta / args.expected:+.2f}%)")
+                print()
+                print(f"  restatement shares excluded      {restated_shares:>12,}  "
+                      f"({int((outside & is_restate).sum())} print(s))")
+                print("  Those are re-reports of shares already counted above.")
+                print("  Adding them is what makes a wide-window sum overshoot.")
 
     # --- largest prints of the day ------------------------------------------
     target = results.get(b_label) or next(iter(results.values()))
@@ -291,23 +347,45 @@ def main() -> None:
     c.banner("WHAT TO CONCLUDE")
     if b_label in results:
         b_total = int(_sizes(results[b_label][1], scol).sum())
-        gap = args.expected - b_total
-        print(f"Widest pull: {b_total:,} of {args.expected:,} "
-              f"({100 * b_total / args.expected:.1f}%), still short by {gap:,}.")
-        if abs(gap) <= args.expected * 0.01:
+        b_pct = 100 * b_total / args.expected
+        print(f"Raw sum over the widest window: {b_total:,} of "
+              f"{args.expected:,} ({b_pct:.1f}% of EOD).")
+
+        # An OVERSHOOT is not a smaller version of an undershoot — it is a
+        # different finding with a different cause, and treating it as "short
+        # by a negative number" is how this script read 180% as a shortfall.
+        if b_pct > 105:
             print()
-            print("GAP CLOSED. The default window was the cause. fetch.py should")
-            print("pull 04:00-20:00 and filter to RTH in the metric layer, so the")
-            print("auction prints are retained as their own feature rather than")
-            print("silently dropped by the endpoint's defaults.")
+            print("OVERSHOOT — the wide window DOUBLE-COUNTS. The official open")
+            print("and close are re-reported for hours after the session under")
+            print("codes 51 and 66, carrying the full auction size each time.")
+            print("A raw sum over a wide window is therefore meaningless; use")
+            print("the reconciliation above, not this total.")
+
+        if reconciled is not None:
+            delta = reconciled - args.expected
+            print()
+            print(f"Reconciled (auctions counted once): {reconciled:,} vs "
+                  f"{args.expected:,} EOD ({100 * delta / args.expected:+.2f}%).")
+            if abs(delta) <= args.expected * 0.01:
+                print()
+                print("RESOLVED. There was no missing volume. The closing cross")
+                print("prints seconds after 16:00 and so falls outside the")
+                print("default window by construction — which is CORRECT for")
+                print("this pipeline. Auction prints carry no meaningful quote")
+                print("and would corrupt spread and noise if included.")
+                print()
+                print("Keep pulling RTH only. Trade counts and spreads were")
+                print("never contaminated.")
+            else:
+                print()
+                print("Reconciliation does not land within 1%. Something beyond")
+                print("session bounds and restatements is in play — do not close")
+                print("this out, and do not build trade-count metrics yet.")
         else:
             print()
-            print("GAP NOT CLOSED by widening the window. Session bounds are not")
-            print("the mechanism, or not the only one. Check the condition table")
-            print("above before proposing the next hypothesis — and do not build")
-            print("trades/min or the at-bid/at-ask classification until this")
-            print("resolves. A 19% shortfall concentrated anywhere in the session")
-            print("biases both, and does so invisibly.")
+            print("No condition columns, so auctions could not be separated from")
+            print("restatements and no reconciliation was possible.")
     print()
     print("Set config.VOLUME_GAP_RESOLVED = True only when the remaining")
     print("difference is understood, not merely when it is small.")

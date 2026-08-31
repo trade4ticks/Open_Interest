@@ -34,11 +34,21 @@ Run in order. **Stop after s0 and report.**
 |---|---|---|
 | `s0_availability.py` | Is `trade_quote` on the Standard plan? **GATE** | ✅ available |
 | `s1_venue_check.py` | Which endpoints actually need `venue=utp_cta`? | ✅ settled |
-| `s6_session_bounds.py` | Where are the missing 19% of shares? | ⬅ **run next** |
-| `s2_one_day.py` | Row count, real schema, wall clock, parquet size | |
+| `s6_session_bounds.py` | Where are the missing 19% of shares? | ✅ resolved |
+| `s2_one_day.py` | Row count, real schema, wall clock, parquet size | ⬅ **run next** |
 | `s3_multiday_timing.py` | Does a 544-symbol backfill need concurrency? | |
 | `s4_conditions.py` | Which trade condition codes to exclude | |
 | `s5_quote_emission.py` | Change-only emission, or periodic samples? | |
+
+### Schema, as actually returned
+
+Confirmed from s6 on `history/trade_quote`. Trade-side fields carry a `trade_`
+prefix only on the timestamp:
+
+```
+trade_timestamp  size  price  exchange  condition  ext_condition1..4
+bid  ask  bid_size  ask_size  bid_condition  ask_condition
+```
 
 ```
 python -m scalp.step0.s0_availability
@@ -81,25 +91,77 @@ nothing is the measured-correct behaviour, not an omission.
 `VENUE_POLICY_VERIFIED = True` now. It gates bulk pulls, so a multi-hour
 backfill cannot run against an unverified assumption.
 
-### The 19% volume gap is open
+### The 19% volume gap: resolved
 
-`trade_quote` summed to 776,192 shares on FDX 2026-08-28; `snapshot/ohlc` with
-`utp_cta` returned ~774,000. Two independent endpoints agreeing with each other
-and both ~19% below the EOD consolidated 956,900. Agreement between two
-endpoints rules out tape coverage — this is an inclusion-rules question.
+```
+RTH prints (default window, 09:30–16:00)      776,192
+closing cross, counted ONCE                 + 186,344
+                                            ---------
+                                              962,536
+EOD consolidated reference                    956,900   (+0.59%)
+```
 
-Working hypothesis: the closing cross falls outside the endpoint's default
-query window. The opening auction is present (first print 09:30:01, 20,056
-shares, condition 62 `OPEN_REPORT`), so if the default window is 09:30–16:00
-the opening cross lands just inside it and the closing cross just outside.
+There was never any missing volume. Two things at once:
 
-`s6_session_bounds.py` tests it directly rather than by volume delta:
-condition 98 is `CLOSING`, the vendor's own marker for closing-auction prints.
+1. **The default query window is regular hours.** s6 found the no-parameter
+   pull byte-identical to an explicit 09:30–16:00 pull. The closing cross
+   prints at 16:00:03 — three seconds outside — so it was excluded by
+   construction. That is the entire 19%.
+2. **Widening the window does not simply add it back.** A 04:00–20:00 pull
+   overshoots to 180% of EOD, because the official close is *re-reported on a
+   schedule for hours afterwards*. The same 186,344 shares at $330.88 on NYSE
+   appear five times: once at 16:00:03.158 as condition 98 (`CLOSING`), then
+   four more as condition 51 (`MC_OFFICIAL_CLOSE`) at 16:00:03.212, 16:10:00,
+   18:30:00 and 19:00:00. The opening auction does the same — 20,056 shares
+   once as 62 (`OPEN_REPORT`), once as 66 (`MC_OFFICIAL_OPEN`).
 
-`config.VOLUME_GAP_RESOLVED` is `False`. **No metric built on trade counts or
-share volume until it resolves** — a 19% shortfall concentrated at one end of
-the session biases trades/min and the at-bid/at-ask two-sidedness measure, and
-does so invisibly.
+**The RTH default window excludes the closing cross by construction, and that
+is correct for these metrics.** An auction print carries no meaningful quote —
+the FDX opening quote was bid 330.45 / ask 336.15, a $5.70 spread — so
+including auction prints would corrupt spread and noise rather than improve
+coverage. We pull RTH only; trade counts and spreads were never contaminated.
+The numbers are now understood rather than merely close.
+
+### Auction prints vs restatements
+
+Two sets that look alike and behave completely differently:
+
+- `config.AUCTION_PRINT_CONDITION_CODES` = `{7, 26, 45, 62, 98}` — genuine
+  executions. Real shares, counted **once**. This is the set to sum if auction
+  volume ever becomes a feature.
+- `config.RESTATEMENT_CONDITION_CODES` = `{51, 66}` — **not executions.** They
+  re-report an auction that already printed under 62 or 98. Summing them adds
+  volume that never traded, and is what makes a wide-window pull read 180%.
+
+`config.EXCLUDED_CONDITION_CODES` is currently the restatements only. Odd lots
+(115) and derivatively-priced prints (96) are deliberately *not* excluded yet —
+`s4_conditions.py` measures how far off the quote each code actually sits, and
+that measurement decides, not the code's name.
+
+Also: `0` and `255` are padding in `ext_condition1..4`, not codes
+(`config.NO_CONDITION_SENTINELS`). Left in, they dominate every census with a
+meaningless top entry.
+
+### The restatement guard
+
+`scalp/quality.py` is the backstop underneath the condition codes, for a
+restatement arriving under a code the table doesn't carry. It flags repeated
+large prints sharing `(size, price, exchange)` more than a second apart.
+
+The size floor (`RESTATEMENT_MIN_SHARES`, default 5,000) is load-bearing: that
+signature also describes perfectly ordinary trading, since a 100-share print at
+one price on one venue recurs dozens of times a day in any liquid name. Without
+the floor the guard would fire across a large fraction of a normal tape.
+
+Neither layer is sufficient alone, which the self-test demonstrates: the
+opening restatement (code 66) shares a timestamp with the genuine print so the
+time-based guard cannot see it, while an uncoded duplicated block is invisible
+to the codes. **The guard flags; it never drops.** Exclusion is the metric
+layer's decision, where it is visible.
+
+```
+python -m scalp.quality --selftest      # synthetic tape, no network
+```
 
 ### Exchange and condition lookups
 

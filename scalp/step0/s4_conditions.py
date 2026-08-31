@@ -121,6 +121,13 @@ def main() -> None:
                          if size else 0)
 
             for code, n in counts.head(40).items():
+                # 0 and 255 are padding on ext_condition*, not codes. Left in,
+                # they dominate every census with a meaningless top entry.
+                try:
+                    if int(code) in config.NO_CONDITION_SENTINELS:
+                        continue
+                except (TypeError, ValueError):
+                    pass
                 sub = df[df[col] == code] if pd.notna(code) else df[df[col].isna()]
                 vol = (pd.to_numeric(sub[size], errors="coerce").fillna(0).sum()
                        if size else 0)
