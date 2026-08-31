@@ -736,6 +736,40 @@ NOISE_VARIANTS = (
     "ask_side",     # ask alone — first-class
 )
 
+# --- the statistic, not just the variant -------------------------------------
+# The MEDIAN collapses to exactly zero on sparse-quote names. DDS, IESC and
+# NEU returned 0.0000 on multiple days while trading 20-35 times a minute with
+# 60-80 bps spreads — not quiet, just slow to requote. NEU filled 1,389 of
+# ~2,340 possible 10s buckets against AAPL's 2,328, so most consecutive
+# buckets held an identical midpoint and over half the changes were exactly
+# zero. The median is then zero by construction.
+#
+# It also produced the instability: AGX ran 0.069, 0.098, 0.121, then 1.727,
+# and DAVE went 0.101 to 1.797. Those names sit near the 50%-zero boundary and
+# the median flips between "zero" and "a real number" by which side the day
+# lands on — a 25x swing with nothing changing in the stock.
+#
+# So the statistic is now a dimension of the sweep rather than a decision.
+# Every variant is summarised five ways and calibration picks. Naming: the
+# bare `noise_bps_<variant>_<h>s` IS the median, kept under its existing name;
+# the rest carry an explicit suffix.
+NOISE_STATISTICS = (
+    "",        # median — the established name, correct on dense names
+    "_mean",   # mean absolute change
+    "_p75",    # robust to one jump, cannot be dragged to zero by a majority
+    "_p90",
+    "_rms",    # conventional realized-volatility estimator
+)
+
+# Noise decomposes as HOW OFTEN the mid moves x HOW FAR it moves when it does.
+# The median conflates the two and, on a sparse name, loses entirely to the
+# first term. Both are published separately because that is strictly more
+# informative than any single statistic.
+NOISE_DECOMPOSITION = (
+    "move_rate",   # share of consecutive bucket pairs that changed at all
+    "move_bps",    # median change among the pairs that MOVED
+)
+
 # --- off_mid_bps: a candidate ranking metric ---------------------------------
 # Median absolute distance of a trade from the prevailing midpoint, in bps,
 # over ordinary (non-excluded) prints. s4 computes it per condition code
@@ -821,6 +855,17 @@ DEFAULT_FILTERS = {
     # T-bill ETFs: their midpoints barely move, and there is nothing to scalp
     # against a book that never reprices.
     "min_noise_bps":      float(os.environ.get("SCALP_MIN_NOISE_BPS", "0.3")),
+    # Buckets holding a quote observation, over buckets in the window. NEU
+    # measured 0.59 against AAPL's 0.995, and that gap separates two regimes
+    # cleanly: a name whose quote updates in most 10-second buckets, and one
+    # where it does not. The second class is where the median noise statistic
+    # collapses to zero, so this filter and the noise statistic are answering
+    # related questions from opposite directions.
+    #
+    # 0.80 is a GUESS, like min_noise_bps. It sits between the two observed
+    # values with no evidence for the exact placement. Calibration moves it.
+    "min_quote_bucket_coverage":
+        float(os.environ.get("SCALP_MIN_QUOTE_BUCKET_COVERAGE", "0.80")),
 }
 
 # Slider bounds for the dashboard, so a threshold can be moved through the
@@ -830,6 +875,7 @@ FILTER_RANGES = {
     "min_trades_per_min": (0.0, 100.0, 1.0),
     "max_noise_bps":      (0.5, 15.0, 0.1),
     "min_noise_bps":      (0.0, 2.0, 0.05),
+    "min_quote_bucket_coverage": (0.0, 1.0, 0.01),
 }
 
 # --- ratio denominator guard -------------------------------------------------

@@ -13,6 +13,11 @@ Three tiers, cheapest first, each catching what the one before it cannot:
      import error, a bad default, or a malformed argparse call fails here
      rather than on the VPS.
 
+  4. THE SPARSE-QUOTE REGRESSION — a second frame whose quote updates rarely,
+     reproducing the DDS / IESC / NEU case where the MEDIAN noise statistic
+     collapses to exactly zero. Asserts that it still collapses (so the
+     fixture keeps testing the thing) and that mean, p75, p90 and rms do not.
+
   3. THE METRIC PATH ON A SYNTHETIC FRAME — builds a small trade_quote-shaped
      DataFrame and runs prepare -> compute_window -> compute_buckets ->
      cross_source_metrics, plus the quality guard. This is the tier that
@@ -176,6 +181,114 @@ def flat_trade_quote():
     return pd.DataFrame(rows)
 
 
+def sparse_trade_quote():
+    """A sparse-quote tape — the DDS / IESC / NEU case.
+
+    Those names trade 20-35 times a minute with 60-80 bps spreads, so they are
+    not quiet in any tradeable sense. Their QUOTES update rarely, which is a
+    different thing: NEU filled 1,389 of ~2,340 possible 10-second buckets
+    against AAPL's 2,328. Most consecutive buckets then hold an identical
+    midpoint, over half the changes are exactly zero, and the median noise is
+    zero by construction.
+
+    This reproduces that: a print every 30 seconds across the full session, so
+    only one 10-second bucket in three is covered, and a midpoint that moves
+    once every four prints. The result must be a median of exactly zero with
+    the other statistics still positive — if the median stops being zero here
+    the fixture has drifted and stopped testing the thing it exists for.
+    """
+    import pandas as pd
+
+    base = pd.Timestamp(f"{SESSION.isoformat()} 09:30:00")
+    rows = []
+    mid = 50.00
+    for i in range(780):                       # 780 x 30s = 6.5h, the session
+        if i % 4 == 0 and i:
+            mid += 0.02                        # a real move, once in four
+        stamp = base + pd.Timedelta(seconds=i * 30)
+        rows.append({
+            "trade_timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            "price": mid, "size": 100, "exchange": 3,
+            "condition": 0, "ext_condition1": 255, "ext_condition2": 255,
+            "ext_condition3": 255, "ext_condition4": 255,
+            "bid": mid - 0.15, "ask": mid + 0.15,
+            "bid_size": 100, "ask_size": 100,
+            "bid_condition": 0, "ask_condition": 0,
+        })
+    return pd.DataFrame(rows)
+
+
+def tier_sparse_noise() -> int:
+    """The median collapse must stay reproduced, and the alternatives must not."""
+    rule("4. sparse-quote noise — the DDS / NEU regression")
+    import math
+
+    from scalp import compute, metrics
+
+    failures = 0
+
+    def check(label: str, condition: bool, detail: str = "") -> None:
+        nonlocal failures
+        if condition:
+            print(f"  ok    {label}")
+        else:
+            failures += 1
+            print(f"  FAIL  {label}  {detail}")
+
+    df, cols = compute.prepare(sparse_trade_quote(), SESSION)
+    start, end = compute.session_bounds(SESSION)
+    m = metrics.compute_window(df, cols, start, end)
+    m.pop("_provenance", None)
+
+    median = m.get("noise_bps_tw_mid_10s")
+    mean = m.get("noise_bps_tw_mid_10s_mean")
+    p75 = m.get("noise_bps_tw_mid_10s_p75")
+    p90 = m.get("noise_bps_tw_mid_10s_p90")
+    rms = m.get("noise_bps_tw_mid_10s_rms")
+    coverage = m.get("quote_bucket_coverage_10s")
+    zero_share = m.get("zero_change_bucket_share_10s")
+    move_rate = m.get("move_rate_tw_mid_10s")
+    move_bps = m.get("move_bps_tw_mid_10s")
+
+    print(f"        median {median!r}  mean {mean!r}  p90 {p90!r}  rms {rms!r}")
+    print(f"        coverage {coverage!r}  zero-share {zero_share!r}")
+    print(f"        move_rate {move_rate!r}  move_bps {move_bps!r}")
+
+    check("FIXTURE still reproduces the collapse: median is exactly 0",
+          median == 0.0,
+          f"median is {median}, so this tape is no longer sparse enough to "
+          f"test the thing this tier exists for")
+    check("more than half the buckets are unchanged",
+          zero_share is not None and zero_share > 0.5, str(zero_share))
+    check("coverage detects the sparse regime",
+          coverage is not None and coverage < 0.5, str(coverage))
+
+    for name, value in (("mean", mean), ("p75", p75), ("p90", p90),
+                        ("rms", rms)):
+        check(f"_{name} does NOT collapse to zero",
+              value is not None and math.isfinite(value) and value > 0,
+              f"{name} is {value}; if it is 0 the alternative statistics are "
+              f"no better than the median and the fix does not work")
+
+    check("decomposition recovers the magnitude the median lost",
+          move_bps is not None and math.isfinite(move_bps) and move_bps > 0,
+          f"move_bps is {move_bps}")
+    check("move_rate matches 1 - zero_change_bucket_share",
+          move_rate is not None and zero_share is not None
+          and abs((1.0 - move_rate) - zero_share) < 1e-9,
+          f"move_rate={move_rate}, zero_share={zero_share}")
+
+    # The ranking ratio must not silently inherit a zero denominator.
+    check("ratio on the zero median is NaN, not infinite",
+          not math.isfinite(m.get("ratio_tw_mid_10s", float("nan"))),
+          str(m.get("ratio_tw_mid_10s")))
+    check("ratio on the rms statistic is a real number",
+          math.isfinite(m.get("ratio_tw_mid_10s_rms", float("nan"))),
+          str(m.get("ratio_tw_mid_10s_rms")))
+
+    return failures
+
+
 def tier_metrics() -> int:
     rule("3. metric path on a synthetic frame")
     import math
@@ -305,6 +418,7 @@ def main() -> None:
 
     failures += tier_help()
     failures += tier_metrics()
+    failures += tier_sparse_noise()
 
     print()
     if failures:

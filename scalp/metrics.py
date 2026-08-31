@@ -33,6 +33,8 @@ rank tickers and look reasonable doing it.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -314,18 +316,100 @@ def bucket_values(q: pd.DataFrame, *, value: pd.Series, time_col: str,
     return num / den
 
 
+# A change below this is float residue from the duration-weighted mean, not a
+# repricing. The smallest real US equity increment is a cent; at any price in
+# this universe that is thousands of times larger than this threshold.
+ZERO_CHANGE_EPS_BPS = 1e-6
+
+
+def _change_statistics(changes: pd.Series, prefix: str, out: dict) -> None:
+    """Every summary of one bucket-change series, written into `out`.
+
+    THE MEDIAN COLLAPSES ON SPARSE NAMES, AND THIS IS WHY THERE ARE FIVE.
+
+    DDS, IESC and NEU returned noise of exactly 0.0000 on multiple days —
+    names trading 20-35 times a minute with 60-80 bps spreads, so not quiet in
+    any tradeable sense. Their quotes simply update rarely: NEU filled 1,389
+    of ~2,340 possible 10-second buckets against AAPL's 2,328. When most
+    consecutive buckets hold an identical midpoint, more than half the changes
+    are exactly zero and the median is zero BY CONSTRUCTION.
+
+    It also explains the instability. AGX ran 0.069, 0.098, 0.121, then 1.727;
+    DAVE went 0.101 to 1.797. Those names sit near the 50%-zero boundary, so
+    the median flips between "zero" and "a real number" depending which side
+    of it the day lands — a 25x swing with nothing changing in the stock.
+
+    The median was the right choice for dense names and is unsalvageable for
+    sparse ones. Rather than patch it with a threshold, every statistic is
+    computed and calibration decides:
+
+      (bare name)  median — kept for comparison, and correct on dense names
+      _mean        mean absolute change — moves with the zeros but does not
+                   collapse to them
+      _p75, _p90   higher percentiles — still robust to a single auction-sized
+                   jump, but cannot be dragged to zero by a bare majority of
+                   unchanged buckets
+      _rms         root mean square — the conventional realized-volatility
+                   estimator, and the most sensitive to large moves
+    """
+    keys = (prefix, prefix + "_mean", prefix + "_p75", prefix + "_p90",
+            prefix + "_rms")
+    if len(changes) == 0:
+        for key in keys:
+            out[key] = float("nan")
+        return
+
+    values = changes.to_numpy(dtype="float64")
+    out[prefix] = float(np.median(values))
+    out[prefix + "_mean"] = float(np.mean(values))
+    out[prefix + "_p75"] = float(np.percentile(values, 75))
+    out[prefix + "_p90"] = float(np.percentile(values, 90))
+    out[prefix + "_rms"] = float(np.sqrt(np.mean(np.square(values))))
+
+
+def _decomposition(changes: pd.Series, variant: str, horizon,
+                   out: dict) -> float:
+    """Split the change series into how OFTEN it moved and how FAR.
+
+    Noise is really two things multiplied: the frequency of repricing and its
+    magnitude when it happens. The median conflates them and, on a sparse
+    name, loses entirely to the first term. Reporting both separately is
+    strictly more informative than any single statistic.
+
+      move_rate_*  share of consecutive bucket pairs that changed at all
+      move_bps_*   median change AMONG THE PAIRS THAT MOVED — the conditional
+                   magnitude, which is what "how far" means once the zeros are
+                   taken out
+
+    Returns the zero share, so the caller can publish it as a headline
+    diagnostic for the midpoint variant.
+    """
+    rate_key = "move_rate_" + variant + "_" + str(horizon) + "s"
+    size_key = "move_bps_" + variant + "_" + str(horizon) + "s"
+    if len(changes) == 0:
+        out[rate_key] = float("nan")
+        out[size_key] = float("nan")
+        return float("nan")
+
+    moved = changes > ZERO_CHANGE_EPS_BPS
+    out[rate_key] = float(moved.mean())
+    out[size_key] = (float(changes[moved].median()) if moved.any()
+                     else float("nan"))
+    return float(1.0 - moved.mean())
+
+
 def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
                   bid: str, ask: str, price: str, time_col: str,
                   trade_time_col: str,
                   start: pd.Timestamp, end: pd.Timestamp,
                   horizons=config.NOISE_HORIZONS_SEC) -> dict:
-    """All five noise variants at every horizon, in bps.
+    """Five noise variants x three horizons x five statistics, in bps.
 
-    Each is the MEDIAN absolute change between consecutive fixed-clock
-    buckets. Median rather than mean because a single auction-sized jump would
-    otherwise define the number.
+    Each statistic summarises the absolute change between consecutive
+    fixed-clock buckets. See _change_statistics for why there are five and not
+    just the median.
 
-    The variants exist because each has a known flaw and no one of them is
+    The VARIANTS exist because each has a known flaw and no one of them is
     trusted:
 
       tw_mid       duration-weighted midpoint. Flicker averages out. Current
@@ -339,38 +423,65 @@ def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
       ask_side }   still offer, and the midpoint destroys that asymmetry by
                    construction. s5 measured 602 bid-only moves, 664 ask-only
                    and ONE two-sided over 10,278 records.
+
+    Two diagnostics are published alongside, and both are signals in their own
+    right rather than quality flags:
+
+      zero_change_bucket_share_*  how often the midpoint did not move at all.
+                                  A direct measure of quote staleness, and it
+                                  may predict fill rate better than noise
+                                  does — a book that is not moving is one
+                                  where nothing is arriving.
+      quote_bucket_coverage_*     buckets holding an observation, over buckets
+                                  in the window. NEU at 0.59 against AAPL at
+                                  0.995 separates the two regimes cleanly.
     """
     out: dict[str, float] = {}
-    b = pd.to_numeric(q[bid], errors="coerce") if not q.empty else pd.Series(dtype=float)
-    a = pd.to_numeric(q[ask], errors="coerce") if not q.empty else pd.Series(dtype=float)
-    mid = (a + b) / 2.0 if not q.empty else pd.Series(dtype=float)
+    empty = pd.Series(dtype="float64")
+    b = pd.to_numeric(q[bid], errors="coerce") if not q.empty else empty
+    a = pd.to_numeric(q[ask], errors="coerce") if not q.empty else empty
+    mid = (a + b) / 2.0 if not q.empty else empty
 
     tp = (pd.to_numeric(trades[price], errors="coerce")
-          if not trades.empty else pd.Series(dtype=float))
+          if not trades.empty else empty)
+
+    window_seconds = max((end - start).total_seconds(), 0.0)
 
     for h in horizons:
+        possible = int(math.ceil(window_seconds / h)) if window_seconds else 0
         specs = {
-            f"noise_bps_tw_mid_{h}s":
-                (q, mid, time_col, True),
-            f"noise_bps_last_mid_{h}s":
-                (q, mid, time_col, False),
-            f"noise_bps_bid_side_{h}s":
-                (q, b, time_col, True),
-            f"noise_bps_ask_side_{h}s":
-                (q, a, time_col, True),
-            f"noise_bps_trade_price_{h}s":
-                (trades, tp, trade_time_col, False),
+            "tw_mid":      (q, mid, time_col, True),
+            "last_mid":    (q, mid, time_col, False),
+            "bid_side":    (q, b, time_col, True),
+            "ask_side":    (q, a, time_col, True),
+            "trade_price": (trades, tp, trade_time_col, False),
         }
-        for name, (frame, series, tcol, weighted) in specs.items():
+        for variant, (frame, series, tcol, weighted) in specs.items():
+            prefix = "noise_bps_" + variant + "_" + str(h) + "s"
             if frame.empty or series.empty:
-                out[name] = float("nan")
+                _change_statistics(empty, prefix, out)
+                _decomposition(empty, variant, h, out)
+                out[prefix + "__buckets"] = 0
+                if variant == "tw_mid":
+                    out["zero_change_bucket_share_" + str(h) + "s"] = float("nan")
+                    out["quote_bucket_coverage_" + str(h) + "s"] = float("nan")
                 continue
+
             vals = bucket_values(frame, value=series, time_col=tcol,
                                  start=start, end=end, horizon_sec=h,
                                  weighted=weighted)
             changes = _bps_changes(vals)
-            out[name] = float(changes.median()) if len(changes) else float("nan")
-            out[f"{name}__buckets"] = int(len(vals))
+            _change_statistics(changes, prefix, out)
+            zero_share = _decomposition(changes, variant, h, out)
+            out[prefix + "__buckets"] = int(len(vals))
+
+            # Coverage and staleness describe the QUOTE series, so they are
+            # published once for the midpoint variant. One copy per variant
+            # would be five statements of the same fact.
+            if variant == "tw_mid":
+                out["zero_change_bucket_share_" + str(h) + "s"] = zero_share
+                out["quote_bucket_coverage_" + str(h) + "s"] = (
+                    float(len(vals) / possible) if possible else float("nan"))
     return out
 
 

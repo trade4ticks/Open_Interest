@@ -194,9 +194,83 @@ noise number averages over a quantity that is one-sided almost every time it
 changes — and an unstable bid against a still offer is the strategy's actual
 case.
 
-*Approximation, stated:* a duration straddling a bucket boundary is attributed
-whole to the bucket it started in. With ~1 ms median gaps against 5–30 s
-buckets this is a rounding effect.
+### ⚠️ The median collapses on sparse-quote names
+
+`noise_bps_tw_mid_10s` returned **exactly 0.0000** for DDS, IESC and NEU on
+multiple days — names trading 20–35 times a minute with 60–80 bps spreads, so
+not quiet in any tradeable sense. Their *quotes* update rarely, which is a
+different thing:
+
+| | 10s buckets filled | of possible |
+|---|---|---|
+| NEU | 1,389 | ~2,340 |
+| AAPL | 2,328 | 2,328 |
+
+When most consecutive buckets hold an identical midpoint, over half the
+changes are exactly zero and **the median is zero by construction**.
+
+It also produced the instability. AGX ran 0.069, 0.098, 0.121, then **1.727**;
+DAVE went 0.101 to **1.797**. Those names sit near the 50%-zero boundary, so
+the median flips between "zero" and "a real number" depending which side the
+day lands on — a 25× swing with nothing changing in the stock.
+
+The median was right for dense names and is unsalvageable for sparse ones.
+Rather than patch it with a threshold, **the statistic became a dimension of
+the sweep**:
+
+| suffix | statistic | behaviour on a sparse name |
+|---|---|---|
+| *(none)* | median | collapses to 0 — kept for comparison, correct on dense names |
+| `_mean` | mean absolute change | moves with the zeros, does not collapse |
+| `_p75`, `_p90` | percentiles | robust to one auction-sized jump, cannot be dragged to zero by a bare majority |
+| `_rms` | root mean square | conventional realized-volatility estimator, most sensitive to large moves |
+
+So `noise_bps_tw_mid_10s` is the median and `noise_bps_tw_mid_10s_rms` is the
+RMS of the same series. 5 variants × 3 horizons × 5 statistics, and a ranking
+ratio for each. Calibration decides; none is privileged.
+
+### Noise decomposes into frequency × magnitude
+
+Noise is two things multiplied: **how often** the mid moves, and **how far**
+it moves when it does. The median conflates them and, on a sparse name, loses
+entirely to the first term. Both are reported separately, because that is
+strictly more informative than any single statistic:
+
+| metric | meaning |
+|---|---|
+| `move_rate_<variant>_<h>s` | share of consecutive bucket pairs that changed at all |
+| `move_bps_<variant>_<h>s` | median change **among the pairs that moved** — the conditional magnitude |
+
+A change below 10⁻⁶ bps counts as no change: that is float residue from the
+duration-weighted mean, not a repricing, and the smallest real increment is a
+cent.
+
+### Two diagnostics that are signals in their own right
+
+| metric | meaning |
+|---|---|
+| `zero_change_bucket_share_<h>s` | how often the midpoint did not move at all |
+| `quote_bucket_coverage_<h>s` | buckets holding an observation ÷ buckets in the window |
+
+These are **not quality flags**. `zero_change_bucket_share` is a direct
+measure of quote staleness and may predict fill rate better than noise does —
+a book that is not moving is one where nothing is arriving.
+`quote_bucket_coverage` separates the regimes cleanly (NEU 0.59, AAPL 0.995)
+and is now a read-time filter, `min_quote_bucket_coverage`, defaulting to
+0.80. **That default is a guess**, like `min_noise_bps` — it sits between the
+two observed values with no evidence for the exact placement.
+
+*Approximations, stated:*
+
+- A duration straddling a bucket boundary is attributed whole to the bucket it
+  started in. With ~1 ms median gaps against 5–30 s buckets this is a rounding
+  effect.
+- Changes are taken between consecutive **observed** buckets, not consecutive
+  clock buckets. On a sparse name those are not the same thing: at a 10 s
+  horizon with coverage of 0.33, consecutive observations are typically 30 s
+  apart, so the effective horizon is longer than the nominal one.
+  `quote_bucket_coverage` is what makes that visible rather than silent, and
+  is a second reason it is a signal rather than a flag.
 
 ## Flicker — both variants, because they may be different quantities
 
@@ -346,6 +420,7 @@ Same reasoning as retaining non-qualifying names at the universe stage.
 | `min_trades_per_min` | 10 | 0 – 100 | Not enough arrivals to get filled |
 | `max_noise_bps` | **4** | 0.5 – 15 | Moves further in 10s than the spread is wide |
 | `min_noise_bps` | **0.3** | 0 – 2 | Doesn't move at all — no two-sided flow to trade against |
+| `min_quote_bucket_coverage` | **0.80** | 0 – 1 | Quote too stale for the noise statistic to mean much |
 
 ### The ratio denominator returns NaN below 0.05 bps
 

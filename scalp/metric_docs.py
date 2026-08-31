@@ -89,9 +89,34 @@ EXACT: dict[str, tuple[str, str]] = {
 PATTERNS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"^noise_bps_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s$"),
      "noise",
-     "Median absolute change in {vlabel} between consecutive fixed {h}-second "
-     "buckets, in bps. Bucket-straddle approximation applies."),
-    (re.compile(r"^ratio_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s$"),
+     "MEDIAN absolute change in {vlabel} between consecutive fixed {h}-second "
+     "buckets, in bps. Collapses to exactly 0 on sparse-quote names where "
+     "over half the buckets are unchanged — prefer _mean/_p75/_p90/_rms "
+     "there. Bucket-straddle approximation applies."),
+    (re.compile(r"^noise_bps_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s_(?P<stat>mean|p75|p90|rms)$"),
+     "noise",
+     "{statlabel} of the absolute change in {vlabel} between consecutive "
+     "fixed {h}-second buckets, in bps. Does not collapse to zero on a "
+     "sparse-quote name the way the median does."),
+    (re.compile(r"^move_rate_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s$"),
+     "noise",
+     "Share of consecutive {h}-second bucket pairs where {vlabel} changed at "
+     "all — the HOW OFTEN half of the noise decomposition."),
+    (re.compile(r"^move_bps_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s$"),
+     "noise",
+     "Median change in {vlabel} among the {h}-second bucket pairs that MOVED "
+     "— the HOW FAR half, with the unchanged buckets taken out."),
+    (re.compile(r"^zero_change_bucket_share_(?P<h>\d+)s$"),
+     "noise",
+     "Share of consecutive {h}-second buckets where the midpoint did not move "
+     "at all. A direct measure of quote staleness, and a candidate signal in "
+     "its own right — a book that is not moving is one where nothing is "
+     "arriving."),
+    (re.compile(r"^quote_bucket_coverage_(?P<h>\d+)s$"),
+     "noise",
+     "Buckets holding a quote observation over buckets in the window, at "
+     "{h}s. NEU 0.59 against AAPL 0.995 separates sparse from dense quoting."),
+    (re.compile(r"^ratio_(?P<v>tw_mid|last_mid|trade_price|bid_side|ask_side)_(?P<h>\d+)s(?:_(?P<stat>mean|p75|p90|rms))?$"),
      "ranking",
      "spread_bps_tw divided by {vlabel} noise at {h}s. One of the candidate "
      "ranking metrics; none is privileged until calibration."),
@@ -99,6 +124,13 @@ PATTERNS: list[tuple[re.Pattern, str, str]] = [
      "windows",
      "Trades dropped for carrying condition code {code}."),
 ]
+
+STAT_LABELS = {
+    "mean": "Mean",
+    "p75":  "75th percentile",
+    "p90":  "90th percentile",
+    "rms":  "Root mean square",
+}
 
 VARIANT_LABELS = {
     "tw_mid":      "the duration-weighted midpoint",
@@ -120,6 +152,8 @@ def describe(metric: str) -> tuple[str, str] | None:
         parts = m.groupdict()
         if "v" in parts:
             parts["vlabel"] = VARIANT_LABELS.get(parts["v"], parts["v"])
+        if parts.get("stat"):
+            parts["statlabel"] = STAT_LABELS.get(parts["stat"], parts["stat"])
         return section, template.format(**parts)
     return None
 
