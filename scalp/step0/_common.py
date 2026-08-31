@@ -139,6 +139,10 @@ CAND_BID         = ["bid", "bid_price", "nbbo_bid"]
 CAND_ASK         = ["ask", "ask_price", "nbbo_ask"]
 CAND_BID_SIZE    = ["bid_size", "bidsize"]
 CAND_ASK_SIZE    = ["ask_size", "asksize"]
+CAND_BID_EXCH    = ["bid_exchange", "bid_exch", "bid_venue"]
+CAND_ASK_EXCH    = ["ask_exchange", "ask_exch", "ask_venue"]
+CAND_BID_COND    = ["bid_condition"]
+CAND_ASK_COND    = ["ask_condition"]
 
 
 def condition_columns(df: pd.DataFrame) -> list[str]:

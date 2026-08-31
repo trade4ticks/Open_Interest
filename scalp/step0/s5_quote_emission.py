@@ -24,13 +24,39 @@ be built at all.
     python -m scalp.step0.s5_quote_emission
     python -m scalp.step0.s5_quote_emission --symbol LITE --start-time 10:00:00 --end-time 10:30:00
 
+HOW TO READ IT — GAP STRUCTURE OUTRANKS REPEAT RATE.
+
+The first run of this script got the verdict wrong, and the mistake is worth
+keeping written down. It saw 80.1% of consecutive records identical and
+concluded periodic sampling — while its own gap distribution said the
+opposite: p50 1 ms, p90 448 ms, max 21,523 ms, mean 175 ms. A sampler produces
+near-constant gaps. Four orders of magnitude between median and maximum is not
+a clock, and no repeat rate outweighs that.
+
+The repeat rate was high because the comparison omitted `bid_exchange` and
+`ask_exchange`. NBBO records fire when any participant updates, so a different
+venue taking over at the same price and size is a genuinely new record in which
+every compared field is unchanged. The comparison below is therefore
+progressive — price, then size, then venue — and the drop at the venue step is
+the measurement that matters.
+
+This decides whether the flicker metric survives:
+
+  * EVENT-DRIVEN -> quote-records-per-minute IS book activity. Use the count
+    directly. Rebuilding it on "observed changes" would discard the
+    venue-turnover events that make a book re-form, which is the behaviour the
+    metric exists to capture.
+  * PERIODIC -> the count measures the sampling rate and is meaningless as a
+    flicker metric; rebuild it on genuine changes including venue.
+
 WHAT A BAD RESULT LOOKS LIKE
-  * >30% of consecutive records fully identical -> periodic sampling. Rebuild
-    the flicker metric on observed changes and say so in the definitions.
-  * Gaps tightly clustered at one value -> same conclusion, more decisively.
+  * Gaps tightly clustered at one value -> genuinely periodic. Rebuild the
+    flicker metric and say so in the definitions.
+  * No bid_exchange/ask_exchange columns -> venue turnover cannot be separated
+    from true duplication and the identical rate is an upper bound, not a
+    measurement. Say that rather than reporting the number as if it were one.
   * No bid_size/ask_size columns -> the separate bid-side/ask-side noise
-    metrics cannot distinguish a size change from a price change, and the
-    asymmetry the strategy cares about is only partly observable.
+    metrics cannot distinguish a size change from a price change.
   * interval=tick rejected -> sub-second work is impossible on this
     subscription; the 5s noise horizon is the floor and that needs saying
     before the metric set is finalised.
@@ -53,7 +79,9 @@ def _resolve(df: pd.DataFrame):
     bsz = c.find_column(df, c.CAND_BID_SIZE, "bid size", required=False)
     asz = c.find_column(df, c.CAND_ASK_SIZE, "ask size", required=False)
     tim = c.find_column(df, c.CAND_QUOTE_TIME, "timestamp", required=False)
-    return bid, ask, bsz, asz, tim
+    bex = c.find_column(df, c.CAND_BID_EXCH, "bid exchange", required=False)
+    aex = c.find_column(df, c.CAND_ASK_EXCH, "ask exchange", required=False)
+    return bid, ask, bsz, asz, tim, bex, aex
 
 
 def _gaps_ms(df: pd.DataFrame, tim: str) -> pd.Series | None:
@@ -113,7 +141,7 @@ def main() -> None:
         c.die("Empty response — try a different window or date.")
 
     c.describe_frame(df, sample=5)
-    bid, ask, bsz, asz, tim = _resolve(df)
+    bid, ask, bsz, asz, tim, bex, aex = _resolve(df)
 
     b = pd.to_numeric(df[bid], errors="coerce")
     a = pd.to_numeric(df[ask], errors="coerce")
@@ -123,50 +151,89 @@ def main() -> None:
     if n <= 0:
         c.die("Fewer than two records — nothing to compare.")
 
-    c.section("consecutive-record comparison")
-    print(f"records                       : {len(df):,}")
-    print(f"BBO price unchanged           : {int(price_same.sum()):,} "
-          f"({100 * price_same.sum() / n:.1f}%)")
+    # Progressive comparison. Each level adds one more field to the identity
+    # test, so the drop between levels says WHY a record that looked like a
+    # duplicate is actually new information.
+    c.section("consecutive-record comparison, progressively stricter")
+    print(f"records                            : {len(df):,}")
+    print()
+    print(f"{'identical on':<36s} {'count':>9s} {'rate':>8s}")
+    print("-" * 56)
+    print(f"{'price (bid, ask)':<36s} {int(price_same.sum()):>9,} "
+          f"{100 * price_same.sum() / n:>7.1f}%")
 
+    same = price_same
+    size_same = None
     if bsz and asz:
         bs = pd.to_numeric(df[bsz], errors="coerce")
         as_ = pd.to_numeric(df[asz], errors="coerce")
         size_same = (bs.diff() == 0) & (as_.diff() == 0)
-        fully_same = price_same & size_same
-        size_only = price_same & ~size_same
-        print(f"size unchanged                : {int(size_same.sum()):,} "
-              f"({100 * size_same.sum() / n:.1f}%)")
-        print(f"FULLY identical to previous   : {int(fully_same.sum()):,} "
-              f"({100 * fully_same.sum() / n:.1f}%)")
-        print(f"size changed, price unchanged : {int(size_only.sum()):,} "
-              f"({100 * size_only.sum() / n:.1f}%)")
+        same = price_same & size_same
+        print(f"{'+ size (bid_size, ask_size)':<36s} {int(same.sum()):>9,} "
+              f"{100 * same.sum() / n:>7.1f}%")
 
-        # The asymmetry the strategy is built around.
-        bid_moved = b.diff() != 0
-        ask_moved = a.diff() != 0
+    venue_same = None
+    if bex and aex:
+        # THE FIELD THE FIRST RUN MISSED. NBBO records fire when any
+        # participant updates. A different venue taking over the same price
+        # and size is a genuinely new record in which every previously
+        # compared field is unchanged — it looks like a duplicate and is not.
+        venue_same = (df[bex].eq(df[bex].shift())
+                      & df[aex].eq(df[aex].shift()))
+        same_with_venue = same & venue_same
+        print(f"{'+ venue (bid_exchange, ask_exchange)':<36s} "
+              f"{int(same_with_venue.sum()):>9,} "
+              f"{100 * same_with_venue.sum() / n:>7.1f}%")
+        drop = 100 * (same.sum() - same_with_venue.sum()) / n
         print()
-        print(f"bid moved, ask still          : "
-              f"{int((bid_moved & ~ask_moved).sum()):,} "
-              f"({100 * (bid_moved & ~ask_moved).sum() / n:.1f}%)")
-        print(f"ask moved, bid still          : "
-              f"{int((ask_moved & ~bid_moved).sum()):,} "
-              f"({100 * (ask_moved & ~bid_moved).sum() / n:.1f}%)")
-        print(f"both moved                    : "
-              f"{int((bid_moved & ask_moved).sum()):,} "
-              f"({100 * (bid_moved & ask_moved).sum() / n:.1f}%)")
-        print()
-        print("One-sided moves dominating is the case the midpoint destroys by")
-        print("construction — it is the reason bid-side and ask-side noise are")
-        print("computed separately rather than folded into a mid.")
-        fully_pct = 100 * fully_same.sum() / n
+        print(f"Adding venue drops the identical rate by {drop:.1f} points.")
+        print("Those records differ ONLY in which participant is posting the")
+        print("best price — real book events that the earlier comparison")
+        print("counted as duplicates.")
+        same = same_with_venue
     else:
         print()
-        print("No size columns — cannot distinguish a pure duplicate from a")
-        print("size-only change. The bid-side/ask-side asymmetry is only")
-        print("partly observable on this feed.")
-        fully_pct = 100 * price_same.sum() / n
+        print("No bid_exchange/ask_exchange columns — venue turnover cannot be")
+        print("separated from true duplication, and the identical rate below is")
+        print("an UPPER BOUND, not a measurement.")
+
+    identical_pct = 100 * same.sum() / n
+
+    if size_same is not None:
+        size_only = price_same & ~size_same
+        print()
+        print(f"size changed, price unchanged      : {int(size_only.sum()):,} "
+              f"({100 * size_only.sum() / n:.1f}%)")
+
+    # The asymmetry the strategy is built around.
+    bid_moved = b.diff() != 0
+    ask_moved = a.diff() != 0
+    both = int((bid_moved & ask_moved).sum())
+    bid_only = int((bid_moved & ~ask_moved).sum())
+    ask_only = int((ask_moved & ~bid_moved).sum())
+    c.section("one-sided vs two-sided repricing")
+    print(f"bid moved, ask still          : {bid_only:,} "
+          f"({100 * bid_only / n:.1f}%)")
+    print(f"ask moved, bid still          : {ask_only:,} "
+          f"({100 * ask_only / n:.1f}%)")
+    print(f"both moved                    : {both:,} "
+          f"({100 * both / n:.2f}%)")
+    if both and (bid_only + ask_only):
+        print(f"one-sided : two-sided         : "
+              f"{(bid_only + ask_only) / both:,.0f} : 1")
+    print()
+    print("Two-sided repricing being rare is the empirical justification for")
+    print("computing bid-side and ask-side noise separately. If the mid only")
+    print("ever moves because one side twitched, a mid-based noise number")
+    print("averages away the asymmetry that defines the trade.")
 
     # --- gap structure ------------------------------------------------------
+    # This is the DECISIVE evidence, and it outranks the repeat rate. Periodic
+    # sampling means a clock, and a clock produces near-constant gaps. Nothing
+    # about a repeated payload can outweigh a gap distribution that spans four
+    # orders of magnitude.
+    gap_ratio = None
+    gap_p50 = gap_max = None
     if tim:
         gaps = _gaps_ms(df, tim)
         if gaps is not None and len(gaps):
@@ -179,11 +246,14 @@ def main() -> None:
             zero = int((gaps == 0).sum())
             print(f"  identical timestamps : {zero:,} "
                   f"({100 * zero / len(gaps):.1f}%)")
-            spread = vals[-2] / max(vals[1], 1e-9)     # p99 / p10
+
+            gap_p50, gap_max = vals[3], vals[-1]
+            gap_ratio = vals[-2] / max(vals[3], 1e-9)      # p99 / p50
             print()
-            print(f"  p99/p10 ratio : {spread:,.1f}")
-            print("  A ratio near 1 means a fixed clock (periodic sampling).")
-            print("  A wide ratio means event-driven emission.")
+            print(f"  p99/p50 ratio : {gap_ratio:,.1f}")
+            print(f"  max/median    : {gap_max / max(gap_p50, 1e-9):,.1f}")
+            print("  Near 1 means a fixed clock (periodic sampling).")
+            print("  Orders of magnitude means event-driven emission.")
             if zero:
                 print()
                 print("  Identical timestamps mean multiple records share an")
@@ -196,27 +266,52 @@ def main() -> None:
 
     # --- verdict ------------------------------------------------------------
     c.banner("VERDICT")
-    if fully_pct > 30:
-        print(f"{fully_pct:.1f}% of records repeat the previous one exactly.")
-        print("This looks like PERIODIC SAMPLING, not change-only emission.")
+    print(f"identical-record rate (strictest test) : {identical_pct:.1f}%")
+    if gap_ratio is not None:
+        print(f"gap p99/p50                            : {gap_ratio:,.1f}")
+        print(f"gap median / max                       : "
+              f"{gap_p50:,.0f} ms / {gap_max:,.0f} ms")
+    print()
+
+    if gap_ratio is not None and gap_ratio > 10:
+        print("EVENT-DRIVEN emission. A record is written when something")
+        print("changes; there is no clock.")
+        print()
+        print("The gap distribution decides this, not the repeat rate. A")
+        print("sampler produces near-constant gaps, and a median of "
+              f"{gap_p50:,.0f} ms against a maximum of {gap_max:,.0f} ms is not")
+        print("a clock by any reading.")
+        if identical_pct > 30:
+            print()
+            print(f"The {identical_pct:.1f}% identical rate is therefore NOT")
+            print("evidence of sampling. Those records carry a real event whose")
+            print("visible fields happen to match — most often venue turnover,")
+            print("where a different participant takes over at the same price")
+            print("and size.")
+        print()
+        print("Consequences:")
+        print("  * 'quote updates per minute' IS book activity — the flicker")
+        print("    metric measured directly. Use the record count. Do NOT")
+        print("    rebuild it on 'observed changes': that would discard exactly")
+        print("    the venue-turnover events that make a book re-form, which is")
+        print("    the behaviour the metric is meant to capture.")
+        print("  * Time-weighting needs FORWARD-FILL: each quote is in force")
+        print("    until the next record, so its weight is the gap to the")
+        print("    following record, not a uniform 1.")
+    elif gap_ratio is not None:
+        print("PERIODIC SAMPLING — gaps are near-constant, which means a clock.")
         print()
         print("Consequences:")
         print("  * 'quote updates per minute' measures the sampling rate, not")
         print("    book activity. Rebuild the flicker metric on OBSERVED")
-        print("    CHANGES — consecutive records that actually differ.")
-        print("  * Time-weighting still works: each record persists to the")
-        print("    next. No forward-fill is needed, because there are no gaps.")
+        print("    CHANGES — consecutive records that genuinely differ,")
+        print("    including venue.")
+        print("  * Time-weighting still works: each record persists to the next.")
     else:
-        print(f"Only {fully_pct:.1f}% of records repeat the previous one exactly.")
-        print("This looks like EVENT-DRIVEN emission — a record is written when")
-        print("something changes.")
-        print()
-        print("Consequences:")
-        print("  * Time-weighting needs FORWARD-FILL: each quote is in force")
-        print("    until the next record, so its weight is the gap to the")
-        print("    following record, not a uniform 1.")
-        print("  * 'quote updates per minute' is a genuine book-activity")
-        print("    measure and can be used as the flicker metric directly.")
+        print("Gap structure unreadable, so emission mode is UNDETERMINED.")
+        print("Do not infer it from the identical rate alone — that is the")
+        print("mistake this section exists to prevent.")
+
     print()
     print("Either way, the 10-second noise buckets are built by weighting each")
     print("quote by its own duration inside the bucket — which is what makes a")

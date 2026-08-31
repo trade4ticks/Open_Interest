@@ -202,7 +202,19 @@ EXCHANGE_NAMES: dict[int, str] = {
     73: "Members Exchange",                     74: "EMPTY",
     75: "Long-Term Stock Exchange",             76: "EMPTY",
     77: "24X National Exchange",
+    # 78 is NOT in the vendor's published enum. It appears in all four s4
+    # census symbols at trivial volume, which is the signature of a real venue
+    # the docs have not caught up with rather than corrupt data. Labelled
+    # explicitly so it reads as a known unknown instead of silently falling
+    # through exchange_name() as an unrecognised code.
+    78: "unidentified venue (code 78, absent from vendor enum)",
 }
+
+# Codes present in real data but not in the vendor's enum. Tracked separately
+# so off-exchange share can report them rather than absorbing them into the
+# on-exchange bucket by default — they are neither confirmed lit nor confirmed
+# off-exchange, and pretending otherwise picks an answer we have not measured.
+UNIDENTIFIED_EXCHANGE_CODES: frozenset[int] = frozenset({78})
 
 # The reporting facilities — trades executed away from an exchange and printed
 # to a TRF or the ADF. This is the definition of off-exchange share, and it is
@@ -308,13 +320,39 @@ RESTATEMENT_CONDITION_CODES: frozenset[int] = frozenset({
 # Codes that mark a print outside regular hours.
 EXTENDED_HOURS_CONDITION_CODES: frozenset[int] = frozenset({1, 148})
 
-# Conditions excluded from all volume and trade-count metrics.
+# OFF-QUOTE PRINTS, set from the s4 census across FDX, LLY, LITE and DLTR.
 #
-# Currently restatements only — those are excluded on the hard evidence above.
-# Odd lots (115) and derivatively-priced prints (96) are deliberately NOT here
-# yet: s4_conditions.py measures how far off the quote each code actually sits,
-# and that measurement decides, not the code's name.
-EXCLUDED_CONDITION_CODES: frozenset[int] = RESTATEMENT_CONDITION_CODES
+# The criterion is measured behaviour, never the code's name: a code is
+# excluded when its prints sit systematically away from the prevailing quote
+# in every symbol, because such a print is not an arrival at the quote and
+# counting it as one corrupts trades/min and the at-bid/at-ask classification.
+#
+#   96  DERIVATIVE       45-70% outside NBBO, 4.3-9.4 bps off mid
+#   4   (unlabelled)     46-62% outside NBBO
+#   124 (unlabelled)     40-100% outside NBBO
+#
+# 4 and 124 carry no vendor label and are excluded purely on measurement.
+# That is the right basis — an unlabelled code printing half its volume
+# outside the NBBO is disqualified by what it does, not by what it is called.
+OFF_QUOTE_CONDITION_CODES: frozenset[int] = frozenset({4, 96, 124})
+
+# KEPT, deliberately, and worth recording why:
+#
+#   115 ODD_LOT   75-86% of ALL trades, only 1.2-2.8 bps off mid, 6-11%
+#                 outside NBBO. These are clean executions near the mid.
+#                 Excluding odd lots is a common reflex and it would delete
+#                 most of the tape for exactly the names this strategy trades.
+#
+#   95  (unlabelled)  Borderline: 17-25% outside NBBO, but carries 15-18% of
+#                 volume and sits close to the mid. Kept for now. REVISIT
+#                 AFTER CALIBRATION — if the ranking is sensitive to it, that
+#                 sensitivity is itself the finding.
+REVISIT_AFTER_CALIBRATION: frozenset[int] = frozenset({95})
+
+# Everything excluded from volume, trade-count and arrival-rate metrics.
+EXCLUDED_CONDITION_CODES: frozenset[int] = (
+    RESTATEMENT_CONDITION_CODES | OFF_QUOTE_CONDITION_CODES
+)
 
 
 def condition_name(code) -> str:
@@ -359,13 +397,89 @@ RESTATEMENT_MIN_SECONDS = float(os.environ.get("SCALP_RESTATEMENT_MIN_SECONDS", 
 
 
 # --- storage -----------------------------------------------------------------
-# Parquet is the record. Sits alongside the existing /data/chain_eod,
-# /data/equity_1min, /data/oi_raw, /data/spx_options on the VPS.
-DATA_DIR   = Path(os.environ.get("SCALP_DATA_DIR", "/data/equities_scalp")).resolve()
-RAW_DIR    = DATA_DIR / "raw"          # partitioned symbol=X/date=YYYY-MM-DD
-STEP0_DIR  = DATA_DIR / "_step0"       # discovery scratch; safe to delete
+#
+# CORRECTION TO THE BRIEF. The brief said `/data/equities_scalp/`. That is the
+# main VPS disk and it is the wrong place. Parquet goes to volume storage
+# block 3, the mount that already holds equity_1min and the other equity
+# parquet stores.
+#
+# The measured backfill is 3.1 GB and grows every session. Writing that to the
+# VPS root would fill it silently, and the failure would surface as something
+# unrelated breaking days later.
+#
+# SO THERE IS NO DEFAULT. `SCALP_DATA_DIR` must be set explicitly and is
+# validated before anything is written. A missing or wrong value fails loudly
+# at the first call rather than quietly landing 3 GB on the root filesystem.
+# This follows the convention the existing stores use — CHAIN_EOD_DIR,
+# EQUITY_1MIN_DIR and the rest are all set in .env, never defaulted into the
+# project tree.
+
+class ConfigError(RuntimeError):
+    """A required setting is missing or points somewhere unusable."""
+
+
+_DATA_DIR_ENV = "SCALP_DATA_DIR"
+_data_dir_raw = os.environ.get(_DATA_DIR_ENV)
+
+# Step 0 scratch is exempt: it is small, disposable, and already lives at
+# /data/equities_scalp/_step0. Production pulls are what must not go there.
+STEP0_DIR = Path(os.environ.get("SCALP_STEP0_DIR",
+                                "/data/equities_scalp/_step0")).resolve()
 
 PARQUET_COMPRESSION = os.environ.get("SCALP_PARQUET_COMPRESSION", "zstd")
+
+
+def _shares_root_device(path: Path) -> bool:
+    """True if `path` sits on the same filesystem as `/`.
+
+    This is the check that actually protects the root disk. A path string can
+    look like a mount and not be one — an unmounted /mnt/block3 is just an
+    empty directory on the root filesystem, and writing to it fills the VPS
+    exactly as writing to /data would. Comparing device ids catches that;
+    comparing path prefixes does not.
+    """
+    if os.name != "posix":
+        return False                     # Windows dev box; nothing to protect
+    try:
+        return os.stat(path).st_dev == os.stat("/").st_dev
+    except OSError:
+        return False
+
+
+def data_dir(*, require_separate_volume: bool = True) -> Path:
+    """The validated parquet root. Raises rather than guessing.
+
+    Pass require_separate_volume=False only for a deliberate local test on a
+    single-disk machine.
+    """
+    if not _data_dir_raw:
+        raise ConfigError(
+            f"{_DATA_DIR_ENV} is not set, and there is deliberately no default.\n"
+            "Parquet must be written to volume storage block 3, alongside the\n"
+            "existing equity_1min store, NOT to the VPS root disk.\n\n"
+            f"  export {_DATA_DIR_ENV}=/<block-3-mount>/equities_scalp\n\n"
+            "Set it in .env next to the other *_DIR entries."
+        )
+    path = Path(_data_dir_raw).resolve()
+    if not path.parent.exists():
+        raise ConfigError(
+            f"{_DATA_DIR_ENV}={path} — its parent does not exist. That usually\n"
+            "means the volume is not mounted. Refusing to create a directory\n"
+            "tree on whatever filesystem is underneath it."
+        )
+    if require_separate_volume and _shares_root_device(path.parent):
+        raise ConfigError(
+            f"{_DATA_DIR_ENV}={path} is on the SAME filesystem as /.\n"
+            "That is the root disk, which is what this setting exists to avoid.\n"
+            "Check the block 3 volume is mounted (`df -h`, `lsblk`) and that the\n"
+            "path points at the mount, not at an empty directory beside it."
+        )
+    return path
+
+
+def raw_dir() -> Path:
+    """Raw pulls, partitioned symbol=X/date=YYYY-MM-DD. Never deleted."""
+    return data_dir() / "raw"
 
 
 # --- Postgres (derived metrics only — no tick data ever) ---------------------
@@ -402,6 +516,48 @@ MARKET_TZ = "America/New_York"
 # Noise horizons, seconds. Fixed clock, not trade-to-trade — otherwise busy
 # stocks look artificially calm.
 NOISE_HORIZONS_SEC = (5, 10, 30)
+
+# --- noise variants ----------------------------------------------------------
+# All computed, all stored, compared empirically against realised $/min. No
+# single one is assumed correct.
+#
+# BID-SIDE AND ASK-SIDE ARE FIRST-CLASS OUTPUTS, NOT DIAGNOSTICS. s5 settled
+# this on FDX: over 10,278 consecutive quote records there were 602 bid-only
+# moves, 664 ask-only moves, and exactly ONE where both sides moved together.
+# One in ten thousand. Two-sided repricing essentially never happens — the
+# midpoint moves because one side twitched, and a mid-based noise number is
+# therefore an average of a quantity that is one-sided almost every time it
+# changes. The asymmetry is the phenomenon, and the mid destroys it by
+# construction.
+NOISE_VARIANTS = (
+    "tw_mid",       # time-weighted midpoint, weighted by quote duration
+    "last_mid",     # instantaneous last-quote midpoint, for comparison
+    "trade_price",  # trade prices, for comparison (contains the spread itself)
+    "bid_side",     # bid alone — first-class
+    "ask_side",     # ask alone — first-class
+)
+
+# --- off_mid_bps: a candidate ranking metric ---------------------------------
+# Median absolute distance of a trade from the prevailing midpoint, in bps,
+# over ordinary (non-excluded) prints. s4 computes it per condition code
+# already; this promotes it to a ranking candidate.
+#
+# It may simply be the answer. On ordinary odd-lot trades:
+#
+#     FDX  1.21 bps   realised  $3.13/min
+#     LLY  1.45 bps   realised  $4.02/min
+#     DLTR 1.17 bps   realised -$1.32/min
+#     LITE 2.78 bps   realised  $0.51/min
+#
+# LITE is more than double every other name on this measure and was the worst
+# tradeable name of the four. It is a spread-and-noise composite that comes
+# free from every trade — no bucketing, no time-weighting, no horizon choice.
+#
+# Note what it does NOT separate: FDX and DLTR sit 0.04 bps apart and are at
+# opposite ends of the realised results. So this is a candidate, not a
+# conclusion — it goes into calibration beside the four noise variants and the
+# comparison decides.
+COMPUTE_OFF_MID_BPS = True
 
 # Intraday granularity stored alongside the daily aggregate, for the
 # morning-vs-afternoon question.

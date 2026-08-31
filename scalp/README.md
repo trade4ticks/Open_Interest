@@ -35,10 +35,14 @@ Run in order. **Stop after s0 and report.**
 | `s0_availability.py` | Is `trade_quote` on the Standard plan? **GATE** | ✅ available |
 | `s1_venue_check.py` | Which endpoints actually need `venue=utp_cta`? | ✅ settled |
 | `s6_session_bounds.py` | Where are the missing 19% of shares? | ✅ resolved |
-| `s2_one_day.py` | Row count, real schema, wall clock, parquet size | ⬅ **run next** |
-| `s3_multiday_timing.py` | Does a 544-symbol backfill need concurrency? | |
-| `s4_conditions.py` | Which trade condition codes to exclude | |
-| `s5_quote_emission.py` | Change-only emission, or periodic samples? | |
+| `s2_one_day.py` | Row count, real schema, wall clock, parquet size | ✅ |
+| `s3_multiday_timing.py` | Does a 544-symbol backfill need concurrency? | ✅ settled |
+| `s4_conditions.py` | Which trade condition codes to exclude | ✅ list set |
+| `s5_quote_emission.py` | Change-only emission, or periodic samples? | ⬅ **re-run** |
+
+Timing and storage are settled: **5.2 min** initial backfill at concurrency 4,
+**39 s** nightly, **3.1 GB**. No concurrency work needed beyond the existing
+4-connection cap.
 
 ### Schema, as actually returned
 
@@ -176,6 +180,116 @@ from the vendor's table. The full enum runs past 148 and has not been
 transcribed. `condition_name()` returns `unlabelled(<code>)` for anything
 absent, and `s4_conditions.py` reports every observed code. An invented label
 on a code that drives an exclusion decision is worse than no label.
+
+## Storage goes to block 3, not the VPS root
+
+The brief said `/data/equities_scalp/`. That was wrong — that is the main VPS
+disk. Parquet goes to **volume storage block 3**, the mount already holding
+`equity_1min` and the other equity parquet stores.
+
+`SCALP_DATA_DIR` has **no default**. It must be set in `.env` beside the other
+`*_DIR` entries, and `config.data_dir()` validates it before anything is
+written:
+
+- unset → raises with the export line to run
+- parent missing → raises, since that usually means the volume isn't mounted
+- **on the same filesystem as `/`** → raises
+
+That last check is the one that matters. A path can look like a mount and not
+be one: an unmounted `/mnt/block3` is an ordinary empty directory on the root
+filesystem, and writing 3.1 GB there fills the VPS exactly as `/data` would.
+Comparing device ids catches it; comparing path strings does not.
+
+Step 0 scratch (`STEP0_DIR`) is exempt and stays where it is — small and
+disposable.
+
+## Emission mode: gap structure outranks repeat rate
+
+The first s5 run concluded "periodic sampling" from an 80.1% identical-record
+rate. Its own gap distribution said otherwise — p50 1 ms, p90 448 ms, max
+21,523 ms, mean 175 ms. A sampler produces near-constant gaps; four orders of
+magnitude between median and maximum is not a clock.
+
+The repeat rate was inflated because the comparison omitted `bid_exchange` and
+`ask_exchange`. NBBO records fire when *any* participant updates, so a
+different venue taking over at the same price and size is a genuinely new
+record in which every compared field is unchanged. s5 now compares
+progressively — price, then size, then venue — and the drop at the venue step
+is the measurement.
+
+This decides whether the flicker metric survives. **Event-driven means
+quote-records-per-minute IS book activity** and the count is used directly;
+rebuilding it on "observed changes" would discard exactly the venue-turnover
+events that make a book re-form. The verdict now keys on gap structure, and
+says so when the exchange columns are absent rather than reporting an upper
+bound as a measurement.
+
+## Bid-side and ask-side noise are first-class
+
+s5 measured this on FDX over 10,278 consecutive quote records:
+
+| | count |
+|---|---|
+| bid moved, ask still | 602 |
+| ask moved, bid still | 664 |
+| **both moved** | **1** |
+
+One in 10,278. Two-sided repricing essentially never happens — the midpoint
+moves because one side twitched. A mid-based noise number is therefore an
+average over a quantity that is one-sided almost every time it changes, and
+the asymmetry is the phenomenon rather than a detail. `config.NOISE_VARIANTS`
+carries `bid_side` and `ask_side` as outputs in their own right, not
+diagnostics.
+
+## Condition exclusions, set from measurement
+
+The criterion is where a code's prints actually sit relative to the quote,
+never the code's name.
+
+**Excluded** (`config.OFF_QUOTE_CONDITION_CODES`) — systematically off-quote
+across all four census symbols:
+
+| code | | evidence |
+|---|---|---|
+| 96 | `DERIVATIVE` | 45–70% outside NBBO, 4.3–9.4 bps off mid |
+| 4 | unlabelled | 46–62% outside NBBO |
+| 124 | unlabelled | 40–100% outside NBBO |
+
+4 and 124 carry no vendor label and are excluded purely on measurement, which
+is the right basis.
+
+**Kept:**
+
+- **115 `ODD_LOT`** — 75–86% of all trades, only 1.2–2.8 bps off mid, 6–11%
+  outside NBBO. Clean executions near the mid. Excluding odd lots is a common
+  reflex and here it would delete most of the tape.
+- **95 unlabelled** — borderline (17–25% outside NBBO) but carries 15–18% of
+  volume and sits close to the mid. Kept, and listed in
+  `config.REVISIT_AFTER_CALIBRATION`.
+
+Exchange **78** is absent from the vendor enum but appears in all four symbols
+at trivial volume — a real venue the docs haven't caught up with, not corrupt
+data. It is labelled explicitly and tracked in
+`config.UNIDENTIFIED_EXCHANGE_CODES` so off-exchange share can report it rather
+than absorbing it into the on-exchange bucket by default.
+
+## `off_mid_bps` is a ranking candidate
+
+Median absolute distance of a trade from the prevailing midpoint, in bps, over
+ordinary prints. Free from every trade — no bucketing, no time-weighting, no
+horizon choice.
+
+| | off_mid_bps | realised $/min |
+|---|---|---|
+| FDX | 1.21 | 3.13 |
+| LLY | 1.45 | 4.02 |
+| DLTR | 1.17 | −1.32 |
+| LITE | 2.78 | 0.51 |
+
+LITE is more than double the rest and was the worst tradeable name. But FDX and
+DLTR sit 0.04 bps apart at opposite ends of the realised results, so this
+separates the worst name and not the best from the worst. It goes into
+calibration beside the four noise variants as a candidate, not a conclusion.
 
 ## Decided, not yet built
 
