@@ -34,9 +34,9 @@ from scalp import config, thetadata as td
 from scalp.step0 import _common as c
 
 
-BID_CANDIDATES = ["bid", "bid_price", "nbbo_bid"]
-ASK_CANDIDATES = ["ask", "ask_price", "nbbo_ask"]
-PRICE_CANDIDATES = ["price", "trade_price", "last"]
+BID_CANDIDATES = c.CAND_BID
+ASK_CANDIDATES = c.CAND_ASK
+PRICE_CANDIDATES = c.CAND_TRADE_PRICE
 
 
 def main() -> None:
@@ -73,12 +73,9 @@ def main() -> None:
     bid = c.find_column(df, BID_CANDIDATES, "NBBO bid", required=False)
     ask = c.find_column(df, ASK_CANDIDATES, "NBBO ask", required=False)
     price = c.find_column(df, PRICE_CANDIDATES, "trade price", required=False)
-    size = c.find_column(df, ["size", "trade_size", "quantity", "shares"],
-                         "trade size", required=False)
-    bid_size = c.find_column(df, ["bid_size", "bidsize"], "bid size",
-                             required=False)
-    ask_size = c.find_column(df, ["ask_size", "asksize"], "ask size",
-                             required=False)
+    size = c.find_column(df, c.CAND_TRADE_SIZE, "trade size", required=False)
+    bid_size = c.find_column(df, c.CAND_BID_SIZE, "bid size", required=False)
+    ask_size = c.find_column(df, c.CAND_ASK_SIZE, "ask size", required=False)
 
     if not (bid and ask):
         c.die("No bid/ask columns in the response. This endpoint is not "

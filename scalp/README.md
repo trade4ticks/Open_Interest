@@ -30,14 +30,15 @@ run by hand.
 
 Run in order. **Stop after s0 and report.**
 
-| script | question |
-|---|---|
-| `s0_availability.py` | Is `trade_quote` on the Standard plan? **GATE** |
-| `s1_venue_check.py` | Which endpoints actually need `venue=utp_cta`? |
-| `s2_one_day.py` | Row count, real schema, wall clock, parquet size |
-| `s3_multiday_timing.py` | Does a 544-symbol backfill need concurrency? |
-| `s4_conditions.py` | Which trade condition codes to exclude |
-| `s5_quote_emission.py` | Change-only emission, or periodic samples? |
+| script | question | status |
+|---|---|---|
+| `s0_availability.py` | Is `trade_quote` on the Standard plan? **GATE** | ✅ available |
+| `s1_venue_check.py` | Which endpoints actually need `venue=utp_cta`? | ✅ settled |
+| `s6_session_bounds.py` | Where are the missing 19% of shares? | ⬅ **run next** |
+| `s2_one_day.py` | Row count, real schema, wall clock, parquet size | |
+| `s3_multiday_timing.py` | Does a 544-symbol backfill need concurrency? | |
+| `s4_conditions.py` | Which trade condition codes to exclude | |
+| `s5_quote_emission.py` | Change-only emission, or periodic samples? | |
 
 ```
 python -m scalp.step0.s0_availability
@@ -58,29 +59,75 @@ subscription change, but it is the only first-hand evidence in the codebase and
 it disagrees with the plan. (Leave that docstring alone — it belongs to the
 options project.)
 
-### s1 gates the metrics
+### The venue question is settled
 
-`venue=utp_cta` is **not** hardcoded anywhere. `config.VENUE_BY_ENDPOINT` holds
-a per-endpoint policy:
+`venue=utp_cta` is **not** hardcoded anywhere. `config.VENUE_BY_ENDPOINT` is a
+per-endpoint table, and s1 has resolved every entry:
 
-- `snapshot/ohlc` → `utp_cta`. **Measured**: the default `nqb` returned 44% of
-  true volume and omitted ~10,000 symbols; `utp_cta` matched FDX's EOD figure
-  of 956,900 shares exactly.
-- `history/trade_quote`, `history/quote` → **unresolved, sending nothing**.
-  Nothing was ever established about the history endpoints. Theta's docs
-  describe a 15-minute delayed feed from all three SIP networks alongside a
-  real-time Nasdaq Basic feed, which suggests these may already be
-  consolidated — in which case the parameter is redundant or not even accepted.
+- `snapshot/ohlc` → `utp_cta`. **Required.** The default `nqb` returned 44% of
+  true volume and omitted ~10,000 symbols.
+- `history/trade_quote`, `history/quote` → **send nothing.** s1 found the with-
+  and without-venue responses byte-identical, with 20 distinct exchange codes
+  in the tape. The endpoint accepts the parameter and ignores it; it already
+  reads the consolidated tape. This matches Theta's documented feed
+  arrangement — 15-minute delayed from all three SIP networks alongside
+  real-time Nasdaq Basic.
 
-`s1_venue_check.py` pulls the same symbol-day with and without the parameter,
-sums trade sizes, and compares both against 956,900. Then set the table and set
-`VENUE_POLICY_VERIFIED = True`. The fetch scripts refuse to run a bulk pull
-while it is `False`, so a multi-hour backfill cannot be launched against an
-unverified venue assumption.
+The original belief that `utp_cta` was needed everywhere was a generalisation
+from the snapshot result, made without evidence, and it was wrong for the
+history endpoints. **Do not add the parameter back "to be safe."** Sending
+nothing is the measured-correct behaviour, not an omission.
 
-A silently Nasdaq-only spread measurement would look completely plausible and
-there is no EOD figure downstream to catch it. This is the only point in the
-pipeline where the check is possible.
+`VENUE_POLICY_VERIFIED = True` now. It gates bulk pulls, so a multi-hour
+backfill cannot run against an unverified assumption.
+
+### The 19% volume gap is open
+
+`trade_quote` summed to 776,192 shares on FDX 2026-08-28; `snapshot/ohlc` with
+`utp_cta` returned ~774,000. Two independent endpoints agreeing with each other
+and both ~19% below the EOD consolidated 956,900. Agreement between two
+endpoints rules out tape coverage — this is an inclusion-rules question.
+
+Working hypothesis: the closing cross falls outside the endpoint's default
+query window. The opening auction is present (first print 09:30:01, 20,056
+shares, condition 62 `OPEN_REPORT`), so if the default window is 09:30–16:00
+the opening cross lands just inside it and the closing cross just outside.
+
+`s6_session_bounds.py` tests it directly rather than by volume delta:
+condition 98 is `CLOSING`, the vendor's own marker for closing-auction prints.
+
+`config.VOLUME_GAP_RESOLVED` is `False`. **No metric built on trade counts or
+share volume until it resolves** — a 19% shortfall concentrated at one end of
+the session biases trades/min and the at-bid/at-ask two-sidedness measure, and
+does so invisibly.
+
+### Exchange and condition lookups
+
+`config.EXCHANGE_NAMES` is the vendor's full published enum, transcribed
+verbatim. Code 57 is FINRA/NASDAQ TRF and carried half of FDX's tape.
+`config.OFF_EXCHANGE_CODES` is `{2, 57, 58, 59}` — the ADF plus the three
+reporting facilities — which makes `off_exchange_share` free from the
+`exchange` column with no second data source.
+
+`config.TRADE_CONDITIONS` is **partial by design**: only codes read verbatim
+from the vendor's table. The full enum runs past 148 and has not been
+transcribed. `condition_name()` returns `unlabelled(<code>)` for anything
+absent, and `s4_conditions.py` reports every observed code. An invented label
+on a code that drives an exclusion decision is worse than no label.
+
+## Decided, not yet built
+
+Recorded here so it isn't lost between now and the metric layer.
+
+- **Exclude auction-period quotes from all spread and noise metrics.** The
+  opening quote on FDX was bid 330.45 / ask 336.15 — a $5.70 spread that is an
+  auction artifact and would wreck a daily average. Exclude the first and last
+  minute of the session; the exclusion window is a config value, not a
+  constant. The calibration output reports every metric **both with and without
+  the exclusion** so the sensitivity is visible rather than assumed.
+- **`off_exchange_share` joins the flow metrics**, computed via
+  `config.is_off_exchange`. The lookup exists; the metric lands with the metric
+  code.
 
 ## Design constraints carried forward
 

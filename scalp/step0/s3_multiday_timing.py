@@ -100,7 +100,7 @@ def main() -> None:
 
     # Sessions actually present tells us the real per-symbol-day cost, since
     # a calendar window contains weekends and holidays.
-    time_col = c.find_column(df, ["date", "ms_of_day", "timestamp", "datetime"],
+    time_col = c.find_column(df, ["date"] + c.CAND_TRADE_TIME,
                              "date/time", required=False)
     sessions = None
     if time_col:

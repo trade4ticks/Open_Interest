@@ -55,12 +55,12 @@ from scalp import config, thetadata as td
 from scalp.step0 import _common as c
 
 
-# Candidate names for the trade-size column, most specific first. Exact
-# case-insensitive matching only — `bid_size` and `ask_size` will also be in
-# this response and must not be picked up.
-SIZE_CANDIDATES = ["size", "trade_size", "quantity", "shares", "volume"]
-TIME_CANDIDATES = ["ms_of_day", "timestamp", "time", "datetime", "sip_timestamp"]
-EXCHANGE_CANDIDATES = ["exchange", "venue", "exch", "trade_exchange"]
+# Candidate names live in _common so all six scripts resolve a field the same
+# way. Matching is exact and case-insensitive — `size` must never pick up
+# `bid_size`, which is present in this same response.
+SIZE_CANDIDATES = c.CAND_TRADE_SIZE + ["volume"]
+TIME_CANDIDATES = c.CAND_TRADE_TIME
+EXCHANGE_CANDIDATES = c.CAND_EXCHANGE
 
 RTH_START_MS = 9 * 3_600_000 + 30 * 60_000     # 09:30:00 ET -> 34,200,000
 RTH_END_MS   = 16 * 3_600_000                  # 16:00:00 ET -> 57,600,000

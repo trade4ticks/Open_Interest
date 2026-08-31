@@ -48,12 +48,11 @@ from scalp.step0 import _common as c
 
 def _resolve(df: pd.DataFrame):
     c.section("column resolution")
-    bid = c.find_column(df, ["bid", "bid_price"], "bid")
-    ask = c.find_column(df, ["ask", "ask_price"], "ask")
-    bsz = c.find_column(df, ["bid_size", "bidsize"], "bid size", required=False)
-    asz = c.find_column(df, ["ask_size", "asksize"], "ask size", required=False)
-    tim = c.find_column(df, ["ms_of_day", "timestamp", "time", "datetime"],
-                        "timestamp", required=False)
+    bid = c.find_column(df, c.CAND_BID, "bid")
+    ask = c.find_column(df, c.CAND_ASK, "ask")
+    bsz = c.find_column(df, c.CAND_BID_SIZE, "bid size", required=False)
+    asz = c.find_column(df, c.CAND_ASK_SIZE, "ask size", required=False)
+    tim = c.find_column(df, c.CAND_QUOTE_TIME, "timestamp", required=False)
     return bid, ask, bsz, asz, tim
 
 

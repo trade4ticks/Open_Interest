@@ -43,16 +43,6 @@ from scalp import config, thetadata as td
 from scalp.step0 import _common as c
 
 
-def _condition_columns(df: pd.DataFrame) -> list[str]:
-    """Any column that looks like it carries a condition code.
-
-    Scanned rather than matched against a fixed list: the vendor may return
-    one `condition` column, a `conditions` list, or condition_1..condition_4,
-    and which of those it is happens to be one of the things being discovered.
-    """
-    return [col for col in df.columns if "cond" in col.lower()]
-
-
 def _analyse_symbol(symbol: str, day: str) -> pd.DataFrame | None:
     print()
     print(f"[{symbol} {day}]")
@@ -95,7 +85,7 @@ def main() -> None:
         c.die("No data for any symbol — nothing to enumerate.")
 
     first = next(iter(frames.values()))
-    cond_cols = _condition_columns(first)
+    cond_cols = c.condition_columns(first)
 
     c.section("condition columns found")
     if not cond_cols:
@@ -113,14 +103,11 @@ def main() -> None:
 
     # --- resolve the fields the off-quote analysis needs ---------------------
     c.section("column resolution")
-    price = c.find_column(first, ["price", "trade_price", "last"], "trade price",
-                          required=False)
-    size = c.find_column(first, ["size", "trade_size", "quantity", "shares"],
-                         "trade size", required=False)
-    bid = c.find_column(first, ["bid", "bid_price"], "bid", required=False)
-    ask = c.find_column(first, ["ask", "ask_price"], "ask", required=False)
-    exch = c.find_column(first, ["exchange", "exch", "trade_exchange"],
-                         "exchange", required=False)
+    price = c.find_column(first, c.CAND_TRADE_PRICE, "trade price", required=False)
+    size = c.find_column(first, c.CAND_TRADE_SIZE, "trade size", required=False)
+    bid = c.find_column(first, c.CAND_BID, "bid", required=False)
+    ask = c.find_column(first, c.CAND_ASK, "ask", required=False)
+    exch = c.find_column(first, c.CAND_EXCHANGE, "exchange", required=False)
 
     for sym, df in frames.items():
         c.section(f"{sym} — condition code census")
@@ -139,6 +126,7 @@ def main() -> None:
                        if size else 0)
                 rec = {
                     "code": repr(code)[:20],
+                    "name": config.condition_name(code),
                     "trades": n,
                     "trade_pct": 100 * n / total_trades,
                     "vol_pct": (100 * vol / total_vol) if total_vol else float("nan"),
@@ -167,15 +155,43 @@ def main() -> None:
                 print(table.to_string(index=False))
 
         if exch:
-            c.section(f"{sym} — exchange codes")
+            c.section(f"{sym} — exchange codes and off-exchange share")
             ex_counts = df[exch].value_counts()
-            ex_pct = 100 * ex_counts / len(df)
-            print(pd.DataFrame({"trades": ex_counts, "pct": ex_pct})
-                  .head(30).to_string())
+            vol = (pd.to_numeric(df[size], errors="coerce").fillna(0)
+                   if size else None)
+            rows = []
+            for code, n in ex_counts.items():
+                mask = df[exch] == code
+                rows.append({
+                    "code": code,
+                    "name": config.exchange_name(code),
+                    "off_exch": config.is_off_exchange(code),
+                    "trades": n,
+                    "trade_pct": 100 * n / len(df),
+                    "share_pct": (100 * vol[mask].sum() / vol.sum()
+                                  if vol is not None and vol.sum() else float("nan")),
+                })
+            tbl = pd.DataFrame(rows).sort_values("trades", ascending=False)
+            with pd.option_context("display.max_columns", None,
+                                   "display.width", 200,
+                                   "display.float_format", "{:,.2f}".format):
+                print(tbl.head(30).to_string(index=False))
+
+            # off_exchange_share, computed the way the metric layer will.
+            off = df[exch].map(config.is_off_exchange)
             print()
-            print("Off-exchange share is the TRF codes here. If TRF prints are")
-            print("distinguishable, off-exchange share becomes a flow metric;")
-            print("if they are not, that metric is dropped rather than faked.")
+            print(f"  off_exchange_share (trades) : {100 * off.mean():.2f}%")
+            if vol is not None and vol.sum():
+                print(f"  off_exchange_share (shares) : "
+                      f"{100 * vol[off].sum() / vol.sum():.2f}%")
+            unknown = [code for code in ex_counts.index
+                       if config.exchange_name(code).startswith("unknown")]
+            if unknown:
+                print(f"  UNKNOWN exchange codes present: {unknown}")
+                print("  These are not counted as off-exchange. A code missing")
+                print("  from the table means the vendor added a venue — add it")
+                print("  to config.EXCHANGE_NAMES rather than letting it sit in")
+                print("  the on-exchange bucket by default.")
 
     c.banner("HOW TO DECIDE THE EXCLUSION LIST")
     print("Exclude a code when its prints are systematically off-quote —")

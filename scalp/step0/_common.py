@@ -116,6 +116,40 @@ def describe_frame(df: pd.DataFrame, sample: int = 5) -> None:
 
 
 # --- Column resolution -------------------------------------------------------
+#
+# Candidate lists live here so all six scripts resolve a given field the same
+# way. They are ordered most-specific-first, and matching is exact (case
+# insensitive), never substring — `size` must not pick up `bid_size`.
+#
+# The `trade_*` prefixed forms come from the s1 output, which showed
+# trade_quote returning trade-side fields under a `trade_` prefix. The bare
+# forms are kept because the vendor's own field reference documents this
+# endpoint's trade fields as `timestamp`, `sequence`, `condition`,
+# `ext_condition1..4`, `size`, `exchange`, `price` — the two naming schemes
+# appear in different places, and neither is assumed.
+
+CAND_TRADE_TIME  = ["trade_timestamp", "timestamp", "ms_of_day", "time", "datetime"]
+CAND_QUOTE_TIME  = ["quote_timestamp", "bid_timestamp", "timestamp", "ms_of_day"]
+CAND_TRADE_PRICE = ["trade_price", "price", "last"]
+CAND_TRADE_SIZE  = ["trade_size", "size", "quantity", "shares"]
+CAND_EXCHANGE    = ["trade_exchange", "exchange", "exch"]
+CAND_CONDITION   = ["trade_condition", "condition", "conditions", "cond"]
+CAND_SEQUENCE    = ["trade_sequence", "sequence", "seq"]
+CAND_BID         = ["bid", "bid_price", "nbbo_bid"]
+CAND_ASK         = ["ask", "ask_price", "nbbo_ask"]
+CAND_BID_SIZE    = ["bid_size", "bidsize"]
+CAND_ASK_SIZE    = ["ask_size", "asksize"]
+
+
+def condition_columns(df: pd.DataFrame) -> list[str]:
+    """Every column that looks like it carries a condition code.
+
+    Scanned rather than matched against a list: the vendor documents both a
+    `condition` field and `ext_condition1..4`, and the extended ones can carry
+    the auction and odd-lot markers that the primary field does not.
+    """
+    return [col for col in df.columns if "cond" in col.lower()]
+
 
 def find_column(df: pd.DataFrame, candidates: list[str], purpose: str,
                 required: bool = True) -> str | None:
