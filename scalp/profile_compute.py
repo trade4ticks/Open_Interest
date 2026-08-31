@@ -13,9 +13,10 @@ time — no changes to metrics.py, this only measures.
      row-wise `.apply(axis=1)` calls called out separately — those are Python
      function calls per row and nothing else in the path is.
 
-  3. WOULD VECTORIZING IT ACTUALLY HELP? Times the current condition-code
-     path against a vectorized equivalent AND asserts they produce identical
-     output, so the fix is proven safe and quantified before it is written.
+  3. DID THE VECTORIZATION HOLD? The condition-code path is now vectorized in
+     metrics.py. This times it against the old row-wise implementation (kept
+     in this file) and asserts they still produce identical output — so a
+     regression shows up as a failed comparison rather than as wrong numbers.
 
 Then projects the 544 x 10 backfill at the current rate and at the rate each
 fix would imply.
@@ -59,31 +60,32 @@ def _rule(title: str) -> None:
 # Not applied to metrics.py. Defined here only so the speedup and the
 # equivalence can be measured before anything is changed.
 
-def vectorized_excluded_mask(df: pd.DataFrame, condition_cols: list[str],
-                             codes: frozenset) -> pd.Series:
-    """Same result as excluded_mask, with no per-row Python call.
+def legacy_condition_code_sets(df: pd.DataFrame,
+                               condition_cols: list[str]) -> pd.Series:
+    """The row-wise implementation that used to live in metrics.py.
 
-    One `isin` per condition column, OR'd together. isin runs in pandas' C
-    layer over the whole column; the current path builds a Python set per row
-    across all seven condition columns.
+    Kept HERE, not there, so the before/after comparison still runs after the
+    fix landed — and so nothing in the pipeline can accidentally call it again.
+    This was 134.8s of 159.7s cumulative on one symbol-day.
     """
     if not condition_cols:
-        return pd.Series(False, index=df.index)
-    mask = pd.Series(False, index=df.index)
-    for col in condition_cols:
-        mask |= df[col].isin(codes)
-    return mask
+        return pd.Series([frozenset()] * len(df), index=df.index, dtype=object)
 
+    def codes(row) -> frozenset:
+        out = set()
+        for col in condition_cols:
+            val = row[col]
+            if pd.isna(val):
+                continue
+            try:
+                code = int(val)
+            except (TypeError, ValueError):
+                continue
+            if code not in config.NO_CONDITION_SENTINELS:
+                out.add(code)
+        return frozenset(out)
 
-def vectorized_code_count(df: pd.DataFrame, condition_cols: list[str],
-                          code: int) -> int:
-    """Rows carrying `code` in any condition column."""
-    if not condition_cols:
-        return 0
-    hit = pd.Series(False, index=df.index)
-    for col in condition_cols:
-        hit |= (df[col] == code)
-    return int(hit.sum())
+    return df[condition_cols].apply(codes, axis=1)
 
 
 def main() -> None:
@@ -158,53 +160,49 @@ def main() -> None:
 
     excluded = config.EXCLUDED_CONDITION_CODES
 
+    # `df` came back from compute.prepare with the flag columns already
+    # attached, so this measures the path the pipeline actually takes.
     t0 = time.perf_counter()
-    current_sets = metrics.condition_code_sets(df, cols.condition_cols)
-    current_mask = current_sets.apply(lambda s: bool(s & excluded))
-    t_current = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    fast_mask = vectorized_excluded_mask(df, cols.condition_cols, excluded)
+    fast_mask = metrics.excluded_mask(df, cols.condition_cols)
     t_fast = time.perf_counter() - t0
 
-    agree = bool((current_mask.values == fast_mask.values).all())
-    print(f"current (row-wise apply) : {t_current:7.3f}s   "
-          f"{len(df) / max(t_current, 1e-9):>10,.0f} rows/s")
-    print(f"vectorized (isin per col): {t_fast:7.3f}s   "
+    t0 = time.perf_counter()
+    legacy_sets = legacy_condition_code_sets(df, cols.condition_cols)
+    legacy_mask = legacy_sets.apply(lambda s: bool(s & excluded))
+    t_legacy = time.perf_counter() - t0
+
+    agree = bool((legacy_mask.values == fast_mask.values).all())
+    print(f"legacy (row-wise apply)  : {t_legacy:7.3f}s   "
+          f"{len(df) / max(t_legacy, 1e-9):>10,.0f} rows/s")
+    print(f"current (vectorized)     : {t_fast:7.3f}s   "
           f"{len(df) / max(t_fast, 1e-9):>10,.0f} rows/s")
-    print(f"speedup                  : {t_current / max(t_fast, 1e-9):7.1f}x")
+    print(f"speedup                  : {t_legacy / max(t_fast, 1e-9):7.1f}x")
     print()
     print(f"IDENTICAL RESULT         : {agree}")
     if not agree:
-        diff = int((current_mask.values != fast_mask.values).sum())
-        print(f"  !! {diff:,} rows differ — the vectorized form is NOT a drop-in")
-        print("  replacement as written. Do not apply it; the difference is")
-        print("  the finding.")
+        diff = int((legacy_mask.values != fast_mask.values).sum())
+        print(f"  !! {diff:,} rows differ. The vectorized path is live in")
+        print("  metrics.py, so this is a REGRESSION, not a proposal — the")
+        print("  numbers being written are wrong. Report it before running")
+        print("  anything else.")
 
-    # Per-code provenance counts, which run once per excluded code per window.
+    # Per-code provenance counts, one per excluded code.
     t0 = time.perf_counter()
     for code in sorted(excluded):
-        int(current_sets.apply(lambda s, c=code: c in s).sum())
-    t_prov_current = time.perf_counter() - t0
+        int(legacy_sets.apply(lambda s, c=code: c in s).sum())
+    t_prov_legacy = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     for code in sorted(excluded):
-        vectorized_code_count(df, cols.condition_cols, code)
+        int(metrics._flag(df, metrics.flag_col_for_code(code),
+                          cols.condition_cols, {code}).sum())
     t_prov_fast = time.perf_counter() - t0
 
     print()
     print(f"provenance per-code counts ({len(excluded)} codes)")
-    print(f"  current    : {t_prov_current:7.3f}s")
-    print(f"  vectorized : {t_prov_fast:7.3f}s   "
-          f"({t_prov_current / max(t_prov_fast, 1e-9):.1f}x)")
-
-    row_wise_total = t_current + t_prov_current
-    print()
-    print(f"row-wise work in ONE window pass : {row_wise_total:.3f}s")
-    print(f"that pass runs 27 times          : "
-          f"~{row_wise_total * 27:.1f}s if each window were full size")
-    print("(each bucket is ~1/26 the rows, so the real figure is closer to")
-    print(" 2x one full pass — the profile above gives the true number.)")
+    print(f"  legacy     : {t_prov_legacy:7.3f}s")
+    print(f"  current    : {t_prov_fast:7.3f}s   "
+          f"({t_prov_legacy / max(t_prov_fast, 1e-9):.1f}x)")
 
     # --- projection ---------------------------------------------------------
     _rule("PROJECTED BACKFILL")
@@ -222,16 +220,11 @@ def main() -> None:
     row("measured now", total)
     row("daily only (no intraday)", t_daily)
 
-    # Single-pass estimate: the daily pass plus one bucketing pass, rather
-    # than 27 independent window passes.
+    # What the single-pass restructure would add on top, if it is ever needed.
+    # HELD deliberately: the median roll-up is the one part that cannot be done
+    # naively, and it restructures reviewed code.
     single_pass = t_daily * 1.3
-    row("if intraday folds into one pass", single_pass)
-
-    # And with the row-wise work vectorized on top of that.
-    if agree and t_current > 0:
-        saved = (t_current - t_fast) + (t_prov_current - t_prov_fast)
-        row("one pass + vectorized conditions",
-            max(single_pass - saved, single_pass * 0.15))
+    row("if intraday folded into one pass (HELD)", single_pass)
 
     print()
     print("The 8-process column assumes near-linear scaling: the work is")

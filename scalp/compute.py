@@ -26,6 +26,17 @@ what rule. Condition-code exclusions broken out per code, crossed and locked
 quotes, records lost to same-instant collapsing, minutes trimmed at the
 auction edges, and the resulting share of raw tape retained.
 
+IT IS IDEMPOTENT. Every write upserts on its primary key — daily_metrics on
+(trade_date, symbol, metric), intraday_metrics on (…, bucket_start, metric),
+provenance on (…, item). Re-running after a partial failure overwrites the
+rows it already wrote and never doubles them, so truncating first is not
+required.
+
+The one thing an upsert cannot do is remove a metric that no longer exists.
+Rename or delete one and its old rows persist, still keyed and still readable.
+`--replace` deletes each symbol-day's rows before writing, for use after that
+kind of change.
+
 Postgres holds derived metrics only. No tick data ever.
 """
 from __future__ import annotations
@@ -48,7 +59,14 @@ def session_bounds(day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 
 def prepare(df: pd.DataFrame, day: date) -> tuple[pd.DataFrame, metrics.Columns]:
-    """Resolve columns and parse timestamps once per symbol-day."""
+    """Resolve columns, parse timestamps, and flag condition codes — ONCE.
+
+    All three are properties of the row, not of the window it falls in.
+    Deriving the condition flags per window meant a `.apply(axis=1)` over
+    seven columns, 27 times per symbol-day, and profiling put that one call at
+    134.8s of 159.7s cumulative. Doing it once here and carrying the result as
+    boolean columns is the whole fix.
+    """
     cols = metrics.Columns(
         time=schema.find(df, schema.CAND_TRADE_TIME, "trade timestamp"),
         price=schema.find(df, schema.CAND_PRICE, "trade price"),
@@ -61,6 +79,7 @@ def prepare(df: pd.DataFrame, day: date) -> tuple[pd.DataFrame, metrics.Columns]
     )
     out = df.copy()
     out[cols.time] = schema.parse_times(out[cols.time], session_date=day)
+    metrics.attach_condition_flags(out, cols.condition_cols)
     return out, cols
 
 
@@ -84,10 +103,11 @@ def compute_symbol_day(symbol: str, day: date
     daily = metrics.compute_window(df, cols, start, end)
     daily["symbol_day_rows"] = len(df)
     prov = daily.pop("_provenance", {})
+    # compute_buckets passes with_provenance=False. Provenance is a symbol-day
+    # fact and the daily row carries it; the bucket copies were built and then
+    # thrown away here, at a cost of one pass per excluded code per bucket.
     buckets = metrics.compute_buckets(df, cols, start, end,
                                       config.INTRADAY_BUCKET_MINUTES)
-    for b in buckets:
-        b.pop("_provenance", None)
     return daily, buckets, prov
 
 
@@ -99,6 +119,12 @@ def main() -> None:
                     help="comma-separated; default is everything on disk")
     ap.add_argument("--no-intraday", action="store_true",
                     help="skip the 15-minute rows")
+    ap.add_argument("--replace", action="store_true",
+                    help="delete each symbol-day's stored rows before writing. "
+                         "Re-running is already idempotent — the writes upsert "
+                         "on (date, symbol, metric) — but an upsert cannot "
+                         "remove a metric that no longer exists. Use this "
+                         "after renaming or deleting one.")
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="print the daily metrics instead of writing Postgres")
     ap.add_argument("--verbose", action="store_true")
@@ -151,6 +177,8 @@ def main() -> None:
                              prov.get("auction_minutes_trimmed", 0.0))
                 continue
 
+            if args.replace:
+                db.delete_symbol_day(day, symbol)
             rows_written += db.write_daily_metrics(day, symbol, daily)
             rows_written += db.write_provenance(day, symbol, prov)
             if not args.no_intraday:

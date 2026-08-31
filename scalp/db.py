@@ -188,6 +188,29 @@ def write_daily_metrics(trade_date: date, symbol: str, metrics: dict) -> int:
     return _upsert_long("daily_metrics", ["trade_date", "symbol", "metric"], rows)
 
 
+def delete_symbol_day(trade_date: date, symbol: str) -> int:
+    """Remove every stored row for one symbol-day, across all metric tables.
+
+    The writes are upserts keyed on (date, symbol, metric), so re-running is
+    already idempotent and never doubles a row. What an upsert CANNOT do is
+    remove a metric that no longer exists: rename or delete one in the code and
+    the old rows sit there indefinitely, still keyed, still readable, and now
+    wrong.
+
+    That is not hypothetical here — `bid_persist_ms_median_tradesampled` was
+    removed and `odd_lot_share` changed meaning when round lots became
+    price-tiered. Use compute.py --replace after either kind of change.
+    """
+    n = 0
+    with connect() as conn, conn.cursor() as cur:
+        for table in ("daily_metrics", "intraday_metrics", "provenance"):
+            cur.execute(f"DELETE FROM {table} "
+                        f"WHERE trade_date = %s AND symbol = %s",
+                        (trade_date, symbol.upper()))
+            n += cur.rowcount
+    return n
+
+
 def write_provenance(trade_date: date, symbol: str, prov: dict) -> int:
     rows = [(trade_date, symbol.upper(), k, _num(v))
             for k, v in prov.items() if _storable(v)]
