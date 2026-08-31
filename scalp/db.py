@@ -94,6 +94,25 @@ def connect():
         conn.close()
 
 
+def read_sql(sql: str, params: tuple | None = None) -> pd.DataFrame:
+    """Query to DataFrame, without pandas' DBAPI2 path.
+
+    `pd.read_sql` with a raw psycopg2 connection raises a UserWarning that
+    only SQLAlchemy connections are supported, and pandas has been signalling
+    it will drop the fallback. Building the frame from the cursor is a few
+    lines, removes the warning, and adds no dependency — the alternative was
+    pulling in SQLAlchemy for the sake of a DataFrame constructor.
+
+    An empty result still returns the right columns, so callers can index into
+    the frame without checking for emptiness first.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=columns)
+
+
 SCHEMA_SQL = """
 -- Nightly candidate list, with the values that qualified each name.
 CREATE TABLE IF NOT EXISTS universe (
@@ -219,10 +238,9 @@ def write_provenance(trade_date: date, symbol: str, prov: dict) -> int:
 
 def provenance_wide(trade_date: date) -> pd.DataFrame:
     """One row per symbol, for the dashboard's provenance panel."""
-    with connect() as conn:
-        long = pd.read_sql(
-            "SELECT symbol, item, value FROM provenance WHERE trade_date = %s",
-            conn, params=(trade_date,))
+    long = read_sql(
+        "SELECT symbol, item, value FROM provenance WHERE trade_date = %s",
+        (trade_date,))
     if long.empty:
         return long
     return long.pivot(index="symbol", columns="item", values="value")
@@ -320,20 +338,24 @@ def universe_symbols(trade_date: date | None = None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def universe_on(trade_date: date) -> pd.DataFrame:
+    """The whole universe snapshot for one date."""
+    return read_sql("SELECT * FROM universe WHERE trade_date = %s",
+                    (trade_date,))
+
+
 def universe_history(symbol: str) -> pd.DataFrame:
-    with connect() as conn:
-        return pd.read_sql(
-            "SELECT * FROM universe WHERE symbol = %s ORDER BY trade_date",
-            conn, params=(symbol.upper(),))
+    return read_sql(
+        "SELECT * FROM universe WHERE symbol = %s ORDER BY trade_date",
+        (symbol.upper(),))
 
 
 def metrics_wide(trade_date: date) -> pd.DataFrame:
     """daily_metrics pivoted to one row per symbol. The shared read path for
     rank.py, calibrate.py and the dashboard."""
-    with connect() as conn:
-        long = pd.read_sql(
-            "SELECT symbol, metric, value FROM daily_metrics "
-            "WHERE trade_date = %s", conn, params=(trade_date,))
+    long = read_sql(
+        "SELECT symbol, metric, value FROM daily_metrics "
+        "WHERE trade_date = %s", (trade_date,))
     if long.empty:
         return long
     return long.pivot(index="symbol", columns="metric", values="value")
@@ -348,6 +370,4 @@ def metric_history(metric: str, symbols: list[str] | None = None
     if symbols:
         sql += " AND symbol = ANY(%s)"
         params.append([s.upper() for s in symbols])
-    with connect() as conn:
-        return pd.read_sql(sql + " ORDER BY trade_date, symbol", conn,
-                           params=tuple(params))
+    return read_sql(sql + " ORDER BY trade_date, symbol", tuple(params))

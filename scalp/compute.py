@@ -43,6 +43,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
 
 import pandas as pd
@@ -50,6 +53,21 @@ import pandas as pd
 from scalp import config, db, metrics, schema, store
 
 log = logging.getLogger(__name__)
+
+
+def _compute_unit(unit: tuple[str, date]):
+    """Worker entry point. Module-level so it pickles.
+
+    Returns (daily, buckets, provenance, error) rather than raising: an
+    exception crossing a process boundary loses its traceback and can fail to
+    pickle at all, which turns one bad symbol-day into a dead pool.
+    """
+    symbol, day = unit
+    try:
+        daily, buckets, prov = compute_symbol_day(symbol, day)
+        return daily, buckets, prov, None
+    except Exception as exc:
+        return None, [], {}, f"{type(exc).__name__}: {exc}"
 
 
 def session_bounds(day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -125,10 +143,26 @@ def main() -> None:
                          "on (date, symbol, metric) — but an upsert cannot "
                          "remove a metric that no longer exists. Use this "
                          "after renaming or deleting one.")
+    ap.add_argument("--workers", type=int, default=None,
+                    help=f"process pool size (default {config.COMPUTE_WORKERS}; "
+                         "deliberately below the core count, since the "
+                         "ThetaData terminal and Postgres share this box). "
+                         "1 runs in-process, which is what to use when "
+                         "debugging a traceback.")
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="print the daily metrics instead of writing Postgres")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # An upsert cannot remove what no longer exists, which is the whole point
+    # of --replace; combining it with --no-intraday would delete the intraday
+    # rows and then not rewrite them, silently emptying the table.
+    if args.replace and args.no_intraday:
+        raise SystemExit(
+            "--replace with --no-intraday would delete each symbol-day's "
+            "intraday rows and not rewrite them. Run them separately, or drop "
+            "--no-intraday."
+        )
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -145,47 +179,85 @@ def main() -> None:
     if not args.do_print:
         db.init_schema()
 
+    units = [(symbol, day) for day in days for symbol in symbols
+             if store.has_day(symbol, day)]
+    skipped = len(days) * len(symbols) - len(units)
+    if not units:
+        raise SystemExit("no symbol-days on disk for that range")
+
+    workers = args.workers or config.COMPUTE_WORKERS
+    log.info("%d symbol-days on disk, %d skipped (no parquet), %d worker(s)",
+             len(units), skipped, workers)
+    if workers > (os.cpu_count() or 1):
+        log.warning("workers=%d exceeds the %d cores on this box; the "
+                    "ThetaData terminal and Postgres run here too",
+                    workers, os.cpu_count())
+
     rows_written = 0
-    computed = skipped = failed = 0
+    computed = failed = 0
     printed: list[dict] = []
+    t0 = time.monotonic()
 
-    for day in days:
-        for symbol in symbols:
-            if not store.has_day(symbol, day):
-                skipped += 1
-                continue
-            try:
-                daily, buckets, prov = compute_symbol_day(symbol, day)
-            except Exception as exc:
-                failed += 1
-                log.warning("  %s %s: %s: %s", symbol, day,
-                            type(exc).__name__, exc)
-                continue
-            if daily is None:
-                skipped += 1
-                continue
-            computed += 1
+    def handle(symbol: str, day: date, payload) -> None:
+        """Write one finished unit. Runs in the PARENT — one DB connection."""
+        nonlocal rows_written, computed, failed
+        daily, buckets, prov, err = payload
+        if err:
+            failed += 1
+            log.warning("  %s %s: %s", symbol, day, err)
+            return
+        if daily is None:
+            return
+        computed += 1
+        if args.do_print:
+            printed.append({"symbol": symbol, "trade_date": day, **daily})
+            if prov:
+                log.info("  %s provenance: %.1f%% of the tape retained, "
+                         "%d records lost to collapsing, %.0f min trimmed",
+                         symbol,
+                         100 * prov.get("trade_retained_share", float("nan")),
+                         int(prov.get("records_lost_to_collapse", 0)),
+                         prov.get("auction_minutes_trimmed", 0.0))
+            return
+        if args.replace:
+            db.delete_symbol_day(day, symbol)
+        rows_written += db.write_daily_metrics(day, symbol, daily)
+        rows_written += db.write_provenance(day, symbol, prov)
+        if not args.no_intraday:
+            rows_written += db.write_intraday_metrics(day, symbol, buckets)
 
-            if args.do_print:
-                printed.append({"symbol": symbol, "trade_date": day, **daily})
-                if prov:
-                    log.info("  %s provenance: %.1f%% of the tape retained, "
-                             "%d records lost to collapsing, %.0f min trimmed",
-                             symbol,
-                             100 * prov.get("trade_retained_share", float("nan")),
-                             int(prov.get("records_lost_to_collapse", 0)),
-                             prov.get("auction_minutes_trimmed", 0.0))
-                continue
+    def progress(done: int) -> None:
+        if done % 25 and done != len(units):
+            return
+        elapsed = time.monotonic() - t0
+        rate = done / max(elapsed, 1e-9)
+        log.info("  %d/%d  %.2f symbol-days/s  eta %.0fs  (%d failed)",
+                 done, len(units), rate,
+                 (len(units) - done) / max(rate, 1e-9), failed)
 
-            if args.replace:
-                db.delete_symbol_day(day, symbol)
-            rows_written += db.write_daily_metrics(day, symbol, daily)
-            rows_written += db.write_provenance(day, symbol, prov)
-            if not args.no_intraday:
-                rows_written += db.write_intraday_metrics(day, symbol, buckets)
+    if workers <= 1:
+        for i, (symbol, day) in enumerate(units, 1):
+            handle(symbol, day, _compute_unit((symbol, day)))
+            progress(i)
+    else:
+        # Metric computation is CPU-bound, so this is processes rather than
+        # threads — the GIL would serialise a thread pool exactly where the
+        # time is being spent.
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_compute_unit, u): u for u in units}
+            for i, fut in enumerate(as_completed(futures), 1):
+                symbol, day = futures[fut]
+                try:
+                    payload = fut.result()
+                except Exception as exc:          # worker died outright
+                    payload = (None, [], {}, f"{type(exc).__name__}: {exc}")
+                handle(symbol, day, payload)
+                progress(i)
 
-        log.info("%s: %d computed, %d skipped, %d failed",
-                 day, computed, skipped, failed)
+    elapsed = time.monotonic() - t0
+    log.info("%d computed, %d skipped, %d failed in %.1f min (%.2f s/symbol-day)",
+             computed, skipped, failed, elapsed / 60,
+             elapsed / max(computed, 1))
 
     if args.do_print and printed:
         frame = pd.DataFrame(printed)

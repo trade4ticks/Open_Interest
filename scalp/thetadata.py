@@ -385,6 +385,29 @@ EP_SYMBOLS      = "/v3/stock/list/symbols"
 EP_SNAPSHOT_OHLC = "/v3/stock/snapshot/ohlc"
 EP_TRADE_QUOTE  = "/v3/stock/history/trade_quote"
 EP_QUOTE        = "/v3/stock/history/quote"
+EP_HISTORY_EOD  = "/v3/stock/history/eod"
+
+
+def history_eod(symbol: str, start_date: date | str,
+                end_date: date | str, **kw) -> RawResponse:
+    """Settled OHLC + volume for one symbol over a date range.
+
+    THE HISTORICAL COUNTERPART TO snapshot/ohlc. The snapshot endpoint is
+    "now" — it cannot retrieve a past session, and asking it for one silently
+    returns the current partial day. This one is keyed by date, so it is the
+    only way to reconstruct a universe for a session that has already closed.
+
+    Per-symbol; there is no wildcard here, unlike the snapshot. That makes
+    rebuilding a past universe a loop over the roster rather than one call.
+    """
+    params: dict[str, Any] = {
+        "symbol":     symbol.upper(),
+        "start_date": ymd(start_date),
+        "end_date":   ymd(end_date),
+    }
+    return request(EP_HISTORY_EOD, params,
+                   label=f"history/eod {symbol} {params['start_date']}",
+                   **kw)
 
 
 def list_symbols(**kw) -> RawResponse:

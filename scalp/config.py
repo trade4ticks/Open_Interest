@@ -36,6 +36,19 @@ THETADATA_BASE_URL = os.environ.get(
 # rather than clean rejections, which is much harder to diagnose.
 MAX_CONNECTIONS = int(os.environ.get("SCALP_MAX_CONNECTIONS", "4"))
 
+# --- compute parallelism -----------------------------------------------------
+# Deliberately BELOW the core count. nproc is 8, and the ThetaData terminal and
+# Postgres run on the same box — saturating every core with metric computation
+# starves the two services the pipeline depends on, and a starved terminal
+# fails as timeouts rather than as anything legible.
+#
+# Metric computation is CPU-bound and independent per symbol-day, so a process
+# pool should scale close to linearly up to this cap. Database writes stay in
+# the parent process: the workers return dicts of a few thousand floats, which
+# are cheap to pickle, and one writer means one connection and no transaction
+# contention against a Postgres that is also serving the dashboard.
+COMPUTE_WORKERS = int(os.environ.get("SCALP_COMPUTE_WORKERS", "6"))
+
 # requests' scalar `timeout=` is a connect and INTER-BYTE read timeout, not a
 # cap on total duration: every chunk resets the read clock, so a slow-trickle
 # response never trips it and can hold a worker indefinitely. The client
@@ -84,6 +97,13 @@ VENUE_BY_ENDPOINT: dict[str, str | None] = {
 
     # Roster endpoint; venue is not meaningful.
     "/v3/stock/list/symbols":        None,
+
+    # Historical counterpart to snapshot/ohlc, used to rebuild a past
+    # universe. UNVERIFIED: it is a history endpoint, and every history
+    # endpoint tested so far ignores the parameter, so it sends nothing on the
+    # same reasoning. If a rebuilt universe ever disagrees with a
+    # same-day-built one, this is the first thing to check.
+    "/v3/stock/history/eod":         None,
 }
 
 # s1 has run and the table above reflects its findings. The fetch scripts
