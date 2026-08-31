@@ -164,7 +164,7 @@ def main() -> None:
     print("mean-based figure will understate a universe that contains many")
     print("liquid names.")
     print()
-    print(f"free on block 3 now         : {config.free_space_gb():7.2f} GB")
+    c.print_free_space("free on block 3")
 
     # --- 2. tick vs 1s ------------------------------------------------------
     cmp_symbol = (args.compare_symbol or symbols[0]).upper()
@@ -233,9 +233,17 @@ def main() -> None:
 
     # --- 3. does compute-and-discard become necessary? ---------------------
     c.banner("DOES COMPUTE-AND-DISCARD BECOME NECESSARY?")
-    free = config.free_space_gb()
+    free = c.free_space_gb_or_none()
     tick_gb = mean_mb * n / 1024
     print(f"projected (tick, mean basis) : {tick_gb:.2f} GB")
+    if free is None:
+        c.print_free_space("free on block 3")
+        print()
+        print("Cannot compare against free space here. The projection above")
+        print("is the finding; set SCALP_DATA_DIR and re-check with `df -h`.")
+        print()
+        print(f"Scratch parquet written under {config.STEP0_DIR} — safe to delete.")
+        return
     print(f"free on block 3              : {free:.2f} GB")
     print()
     if tick_gb + config.FREE_SPACE_MARGIN_GB > free:

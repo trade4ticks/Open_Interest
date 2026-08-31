@@ -26,21 +26,33 @@ a quote that appeared and vanished between two trades is invisible.
 | `bbo_change_without_trade_share` | Every record here has a trade by construction. "BBO changed without a trade" cannot be observed at all. |
 | true best-bid / best-offer lifetime | Needs the quote stream. What is available is persistence across trade samples, published under the honest name `bid_persist_ms_median_tradesampled`. |
 
-⚠️ **Open decision — `s7_quote_sizing.py` measures it.** Making those two real
-needs a second pull from `history/quote`. The size is genuinely unknown: any
-figure extrapolated from a 30-minute sample is unreliable, because quote
-traffic is not uniform across the session and the open and close carry far more
-of it than a mid-morning half hour. s7 pulls whole days for FDX, LLY, LITE and
-DLTR and extrapolates to 544 × `QUOTE_LOOKBACK_DAYS`.
+✅ **Settled by `s7_quote_sizing.py`: tick resolution, full retention.**
 
-Live options, in order:
+Those two metrics need a second pull from `history/quote`, and s7 measured
+both the size and the cost of coarsening it.
 
-1. **interval=1s** — if the change counts survive it. s7 computes the flicker
-   metrics both ways so this is measured, not guessed.
-2. **compute-and-discard at tick** — pull per symbol, compute, write metrics,
-   delete the raw parquet. Peak disk is one symbol-day; raw quote ticks have
-   no use beyond producing these metrics, and a re-pull is ~20 minutes.
-3. **free space on block 3.**
+**Why tick, not 1s.** Sampling at 1s doesn't merely coarsen the flicker
+metrics, it corrupts them:
+
+| | tick | 1s | retained |
+|---|---|---|---|
+| `nbbo_changes_per_min` | 22.26 | 8.98 | 40% |
+| `two_sided_change_share` | 0.06 | 0.18 | **inflated 3×** |
+
+The second row is the disqualifying one. A second is long enough to contain a
+bid move and an ask move that happened separately, and collapsing them into
+one record turns two one-sided events into a single two-sided one. That
+directly attacks the **1,266:1** one-sided ratio s5 measured — the entire
+justification for computing bid-side and ask-side noise separately. 1s would
+manufacture two-sided repricing that never happened.
+
+**Why retain, not compute-and-discard.** 2.92 GB projected against 21.50 GB
+free. It fits with room, so the raw ticks stay: keeping them costs nothing and
+re-pulling costs a run.
+
+Measured full-day zstd parquet per symbol-day (recorded in config so it is
+never re-derived from a partial-session sample): FDX 0.56 MB, LLY 1.00,
+LITE 2.14, DLTR 0.70 — mean 1.10 MB × 544 × 5 days = 2.92 GB.
 
 **Not an option: a smaller symbol list.** Flicker is an *input* to the ranking,
 not a refinement applied afterwards. Measuring it only on names a
@@ -148,6 +160,37 @@ Those may rank tickers very differently. Both are computed; calibration
 decides. The sign is unknown either way — high flicker might be bad
 (can't hold queue position) or good (a book that keeps re-forming is one to
 keep inserting into).
+
+⚠️ `quote_records_per_min` is **genuine at tick and meaningless at 1s**, where
+it is at most one record per second by construction and measures the sampler
+rather than the book. The pipeline runs at tick so it is kept;
+`config.flicker_variants(interval)` drops it automatically if the interval
+ever changes, so it cannot survive into the ranking as a constant.
+
+### `quotes_per_trade` — a ranking candidate
+
+Quote records ÷ trades, per symbol-day. Both inputs are already in the pull,
+so it costs nothing.
+
+| | quotes_per_trade | realised $/round trip |
+|---|---|---|
+| LLY | 2.66 | 4.23 |
+| FDX | 3.57 | 4.78 |
+| DLTR | 4.07 | negative |
+| LITE | 4.81 | 0.99 |
+
+Monotonic apart from the FDX/LLY swap at the top. The mechanism is plausible:
+high churn per execution is a book moving without trading — the "I sat there
+re-pricing and nothing filled" case.
+
+⚠️ **Units differ.** Those are dollars per *round trip*, not the $/minute
+figures used everywhere else in calibration. The two orderings are not the
+same and must not be compared across.
+
+n = 4, so it enters calibration as a candidate on the same footing as the
+noise variants. Computed by `metrics.cross_source_metrics`, which returns
+nothing at all when the quote pull is missing rather than substituting a
+value.
 
 ## Flow
 

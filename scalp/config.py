@@ -514,10 +514,22 @@ FREE_SPACE_MARGIN_GB = float(os.environ.get("SCALP_FREE_SPACE_MARGIN_GB", "3.0")
 
 
 def free_space_gb(path: Path | None = None) -> float:
-    """Free space on the filesystem holding `path` (defaults to the data dir)."""
+    """Free space on the filesystem holding `path` (defaults to the data dir).
+
+    Walks up to the nearest EXISTING ancestor rather than failing when the
+    target does not exist yet. On a fresh install the store directory has not
+    been created — the pipeline creates it on first write — and a reporting
+    call should not crash on a directory it is about to make.
+
+    It walks up rather than calling mkdir because reporting free space must
+    not have side effects. Creating directories is `store.write_day`'s job, at
+    the point something is actually being written.
+    """
     import shutil
-    target = path or data_dir()
-    return shutil.disk_usage(target).free / (1024 ** 3)
+    probe = path or data_dir()
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / (1024 ** 3)
 
 
 def projected_write_gb(n_symbols: int, n_days: int) -> float:
@@ -536,6 +548,48 @@ def projected_write_gb(n_symbols: int, n_days: int) -> float:
 # the sensitivity is visible rather than assumed.
 EXCLUDE_OPEN_MINUTES  = float(os.environ.get("SCALP_EXCLUDE_OPEN_MINUTES", "1"))
 EXCLUDE_CLOSE_MINUTES = float(os.environ.get("SCALP_EXCLUDE_CLOSE_MINUTES", "1"))
+
+
+# --- quote-stream resolution: SETTLED at tick, retained ----------------------
+# Measured by s7_quote_sizing.py. Both halves of the decision have evidence,
+# so neither gets re-argued from first principles later.
+#
+# WHY TICK, NOT 1s. Sampling at 1s does not merely coarsen the flicker
+# metrics, it corrupts them:
+#
+#   nbbo_changes_per_min      22.26 -> 8.98     only 40% retained
+#   two_sided_change_share     0.06 -> 0.18     inflated 3x
+#
+# The second number is the disqualifying one. A second is long enough to
+# contain a bid move and an ask move that happened separately, and collapsing
+# them into one record turns two one-sided events into a single two-sided one.
+# That is a direct attack on the 1,266:1 one-sided ratio s5 measured, which is
+# the whole justification for computing bid-side and ask-side noise
+# separately. 1s would manufacture two-sided repricing that did not happen.
+#
+# WHY RETAIN, NOT COMPUTE-AND-DISCARD. 2.92 GB projected against 21.50 GB
+# free. It fits with room, so the raw ticks stay: keeping them costs nothing
+# and re-pulling them costs a run.
+QUOTE_INTERVAL = os.environ.get("SCALP_QUOTE_INTERVAL", "tick")
+
+# Measured full-day zstd parquet, one symbol-day each, 2026-08-28. Recorded so
+# the estimate is never re-derived from a partial-session sample — quote
+# traffic is not uniform across the day and a 30-minute window understates it.
+QUOTE_MB_PER_SYMBOL_DAY_MEASURED = {
+    "FDX":  0.56,
+    "LLY":  1.00,
+    "LITE": 2.14,
+    "DLTR": 0.70,
+}
+# Mean 1.10 MB x 544 symbols x 5 days = 2.92 GB.
+QUOTE_MB_PER_SYMBOL_DAY = float(os.environ.get(
+    "SCALP_QUOTE_MB_PER_SYMBOL_DAY",
+    str(sum(QUOTE_MB_PER_SYMBOL_DAY_MEASURED.values())
+        / len(QUOTE_MB_PER_SYMBOL_DAY_MEASURED))))
+
+
+def projected_quote_write_gb(n_symbols: int, n_days: int) -> float:
+    return n_symbols * n_days * QUOTE_MB_PER_SYMBOL_DAY / 1024
 
 
 # --- flicker variants --------------------------------------------------------
@@ -560,6 +614,51 @@ FLICKER_VARIANTS = (
     "bid_changes_per_min",     # one-sided, given the 1,266:1 asymmetry
     "ask_changes_per_min",
 )
+
+# quote_records_per_min IS GENUINE AT TICK AND MEANINGLESS AT 1s.
+#
+# At tick resolution it is a real count of book activity. At 1s it is at most
+# one record per second by construction, so it measures the sampling interval
+# and nothing about the book. It is dropped rather than stored under a name
+# that implies it means something.
+#
+# The pipeline runs at tick, so it is kept. This guard exists so that if the
+# interval is ever changed the variant does not silently survive into the
+# ranking as a constant.
+FLICKER_VARIANTS_TICK_ONLY = ("quote_records_per_min",)
+
+
+def flicker_variants(interval: str | None = None) -> tuple[str, ...]:
+    """Flicker metrics that are meaningful at the given quote interval."""
+    interval = interval or QUOTE_INTERVAL
+    if interval == "tick":
+        return FLICKER_VARIANTS
+    return tuple(v for v in FLICKER_VARIANTS
+                 if v not in FLICKER_VARIANTS_TICK_ONLY)
+
+
+# --- quotes_per_trade: a ranking candidate -----------------------------------
+# Quote records divided by trades, per symbol-day. Both inputs are already in
+# the pull, so it costs nothing to compute.
+#
+# The mechanism is plausible: high churn per execution is a book moving
+# without trading, which is the "I sat there re-pricing and nothing filled"
+# experience the strategy is trying to avoid.
+#
+#   symbol   quotes_per_trade   realised $/round trip
+#   LLY                  2.66                   4.23
+#   FDX                  3.57                   4.78
+#   DLTR                 4.07                   negative
+#   LITE                 4.81                   0.99
+#
+# Monotonic apart from the FDX/LLY swap at the top. NOTE the units: those are
+# dollars per ROUND TRIP, not the $/minute figures used everywhere else in
+# calibration — the two orderings are not the same and must not be compared
+# across.
+#
+# n = 4. A candidate, on the same footing as the noise variants: it goes into
+# calibration and the comparison decides.
+COMPUTE_QUOTES_PER_TRADE = True
 
 
 # --- Postgres (derived metrics only — no tick data ever) ---------------------

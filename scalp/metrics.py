@@ -350,6 +350,7 @@ def flicker_metrics(q_raw: pd.DataFrame, q: pd.DataFrame, *,
     if q_raw.empty:
         return out
 
+    out["quote_records"] = int(len(q_raw))
     out["quote_records_per_min"] = len(q_raw) / minutes
     out["same_instant_share"] = float(1.0 - len(q) / len(q_raw))
 
@@ -555,6 +556,43 @@ def ranking_ratios(m: dict) -> dict:
         out[f"ratio_{name}"] = (spread / val
                                 if val and np.isfinite(val) and val > 0
                                 else float("nan"))
+    return out
+
+
+def cross_source_metrics(trade_metrics: dict,
+                         quote_metrics: dict | None) -> dict:
+    """Metrics that need BOTH the trade tape and the quote stream.
+
+    Kept separate from compute_window because that function takes one frame.
+    These combine a trade_quote result with a history/quote result for the
+    same symbol-day, and are simply absent when the quote pull is missing
+    rather than being filled with a substitute.
+
+    quotes_per_trade — quote records divided by trades. High churn per
+    execution is a book moving without trading, which is the "I sat there
+    re-pricing and nothing filled" case. Both inputs are already in the pull,
+    so it is free.
+
+    A ranking candidate on the same footing as the noise variants: n = 4 in
+    the calibration evidence, monotonic against realised results apart from
+    the FDX/LLY swap. Calibration decides.
+    """
+    out: dict[str, float] = {}
+    if not quote_metrics:
+        return out
+
+    trades = trade_metrics.get("trades")
+    records = quote_metrics.get("quote_records")
+    if records is None:
+        rpm = quote_metrics.get("quote_records_per_min")
+        minutes = quote_metrics.get("window_minutes")
+        if rpm is not None and minutes:
+            records = rpm * minutes
+
+    if trades and records is not None and trades > 0:
+        out["quotes_per_trade"] = float(records) / float(trades)
+    else:
+        out["quotes_per_trade"] = float("nan")
     return out
 
 

@@ -54,6 +54,36 @@ def fmt_bytes(n: float) -> str:
     return f"{n:,.1f} PB"
 
 
+def free_space_gb_or_none() -> float | None:
+    """Free space, or None when the store is not configured or not present.
+
+    SPACE REPORTING MUST NEVER KILL A DIAGNOSTIC. Every script in step 0 is
+    read-only with respect to the production store, and two of them crashed on
+    an unconfigured SCALP_DATA_DIR *after* printing everything they had been
+    run to find out — the findings were on screen and the process still exited
+    non-zero, which reads as "the probe failed".
+
+    Hard failure on a misconfigured store belongs in fetch.py, before a write.
+    Here it is a note.
+    """
+    try:
+        return config.free_space_gb()
+    except (config.ConfigError, FileNotFoundError, OSError):
+        return None
+
+
+def print_free_space(label: str = "free on volume") -> None:
+    free = free_space_gb_or_none()
+    if free is None:
+        print(f"{label:<15s}: unavailable — SCALP_DATA_DIR is unset or its "
+              f"volume is not mounted.")
+        print(f"{'':<15s}  Not a problem for this script, which writes only to "
+              f"STEP0_DIR.")
+        print(f"{'':<15s}  fetch.py will refuse to run until it is set.")
+    else:
+        print(f"{label:<15s}: {free:.2f} GB")
+
+
 def env_summary() -> None:
     """Print exactly what this run is pointed at, before it does anything.
 
