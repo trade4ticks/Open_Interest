@@ -6,6 +6,16 @@ leave the options pipeline untouched.
 
 POSTGRES HOLDS DERIVED METRICS ONLY. No tick data ever. Parquet is the record.
 
+ITS OWN DATABASE, NOT ITS OWN TABLES IN A SHARED ONE. `SCALP_PG_DB` defaults
+to `equities_scalp` and deliberately does NOT fall back to `POSTGRES_DB` — the
+host, port, user and password do fall back, so this reuses the same server and
+role but never the same database.
+
+Two reasons. The table names here are generic (universe, daily_metrics,
+rankings) and would be poor neighbours in a database something else owns. And
+if the strategy does not pan out, `DROP DATABASE equities_scalp` removes the
+whole project without touching the factor-analysis or IV work.
+
 WHY THE METRIC TABLES ARE LONG, NOT WIDE. `daily_metrics` is
 (trade_date, symbol, metric, value) rather than one column per metric. The
 metric set is explicitly unsettled — five noise variants at three horizons,
@@ -32,12 +42,48 @@ from scalp import config
 log = logging.getLogger(__name__)
 
 
+# Databases belonging to the other projects on this server. Pointing the scalp
+# pipeline at one of them would put ~30 tables' worth of derived metrics into a
+# schema that something else owns, and the tables it creates have generic names
+# (universe, daily_metrics, rankings) that are exactly the kind to collide.
+#
+# The separation is the point: this project gets its own database so it can be
+# dropped whole if the strategy does not pan out, without touching anything
+# else.
+FOREIGN_DATABASES = frozenset({"spx_interpolated", "open_interest", "postgres"})
+
+
 @contextmanager
 def connect():
-    conn = psycopg2.connect(
-        host=config.PG_HOST, port=config.PG_PORT, dbname=config.PG_DB,
-        user=config.PG_USER, password=config.PG_PASSWORD,
-    )
+    if config.PG_DB in FOREIGN_DATABASES:
+        raise RuntimeError(
+            f"SCALP_PG_DB is set to {config.PG_DB!r}, which belongs to another "
+            f"project.\nThe scalp pipeline creates tables named universe, "
+            f"daily_metrics, intraday_metrics, provenance and rankings — "
+            f"generic enough to collide.\nPoint SCALP_PG_DB at its own "
+            f"database (default: equities_scalp)."
+        )
+    try:
+        conn = psycopg2.connect(
+            host=config.PG_HOST, port=config.PG_PORT, dbname=config.PG_DB,
+            user=config.PG_USER, password=config.PG_PASSWORD,
+        )
+    except psycopg2.OperationalError as exc:
+        if "does not exist" in str(exc):
+            raise RuntimeError(
+                f"Database {config.PG_DB!r} does not exist on "
+                f"{config.PG_HOST}:{config.PG_PORT}.\n\n"
+                f"This project deliberately uses its own database rather than "
+                f"adding tables to an existing one, so it can be dropped whole "
+                f"if the strategy does not work out. Create it once:\n\n"
+                f"    createdb -h {config.PG_HOST} -p {config.PG_PORT} "
+                f"-U {config.PG_USER} {config.PG_DB}\n\n"
+                f"or, from psql:  CREATE DATABASE {config.PG_DB} "
+                f"OWNER {config.PG_USER};\n\n"
+                f"Then any scalp script will create its own tables on first "
+                f"run."
+            ) from exc
+        raise
     try:
         yield conn
         conn.commit()

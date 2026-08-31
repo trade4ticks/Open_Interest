@@ -340,7 +340,27 @@ prune.py             Manual retention. Dry-run by default.
 
 Supporting modules: `metrics.py` (all computation, arbitrary bounds),
 `schema.py` (column resolution), `store.py` (parquet layout), `db.py`
-(Postgres), `quality.py` (restatement guard).
+(Postgres), `quality.py` (restatement guard), `metric_docs.py` (metric →
+definition, for dashboard column links).
+
+### Its own database
+
+```bash
+createdb -h localhost -U portfolio equities_scalp
+```
+
+`SCALP_PG_DB` defaults to `equities_scalp` and deliberately does **not** fall
+back to `POSTGRES_DB`. Host, port, user and password *do* fall back, so this
+reuses the same server and the `portfolio` role but never the same database as
+the factor-analysis and IV work.
+
+The table names here are generic — `universe`, `daily_metrics`, `rankings` —
+and would be poor neighbours in a database something else owns. And if the
+strategy doesn't pan out, `DROP DATABASE equities_scalp` removes the whole
+project without touching anything else.
+
+`db.connect()` refuses to run against `spx_interpolated`, `open_interest` or
+`postgres`, and gives the `createdb` line if the database doesn't exist yet.
 
 **Read [`METRICS.md`](METRICS.md) before the backfill runs.** It defines every
 metric, names the two that are *not* computable from `trade_quote` and return
