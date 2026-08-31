@@ -56,6 +56,11 @@ SCRIPTS = [
 
 SESSION = date(2026, 8, 28)
 
+# A size that lands between the tiered round lot (40 at ~$330) and a fixed 100.
+# The odd-lot assertions are meaningless without one.
+TIER_PROBE_SIZE = 60
+TIER_PROBE_PRICE = 330.13
+
 
 def rule(title: str) -> None:
     print()
@@ -139,6 +144,13 @@ def synthetic_trade_quote():
     # An odd lot under the 40-share tiered round lot.
     add(840_000, 330.13, 5, 330.08, 330.18)
 
+    # THE TIER PROBE. At ~$330 the round lot is 40, so 60 shares is a ROUND
+    # lot under the tiered rule and an ODD lot under a fixed 100. Without a
+    # print in the 40-99 band the two rules are arithmetically identical on
+    # this fixture and the assertion below cannot fail, whatever the code
+    # does. That is exactly how it passed vacuously the first time.
+    add(870_000, 330.13, TIER_PROBE_SIZE, 330.08, 330.18)
+
     # A TRF print, for off_exchange_share.
     add(900_000, 330.14, 150, 330.09, 330.19, exch=57)
 
@@ -196,9 +208,42 @@ def tier_metrics() -> int:
     check("trades_per_min > 0", daily.get("trades_per_min", 0) > 0)
     check("round lot resolved to 40 at ~$330",
           daily.get("round_lot_size") == 40, str(daily.get("round_lot_size")))
-    check("tiered odd lot differs from fixed sub-100",
-          daily.get("odd_lot_share") != daily.get("sub_100_share"),
-          "tiered and fixed-100 gave the same answer")
+    # --- odd lot: prove the metric consumes the tier ----------------------
+    # Three separate checks, so a failure says WHICH thing broke rather than
+    # only that two numbers matched.
+    window = metrics.slice_window(df, cols.time, start, end)
+    kept = window[~metrics.excluded_mask(window, cols.condition_cols)]
+    kept_sizes = kept[cols.size]
+    lot = daily.get("round_lot_size")
+    band = kept_sizes[(kept_sizes >= lot) & (kept_sizes < 100)]
+
+    check(f"FIXTURE exercises the tier: a print in the {lot:.0f}-99 band",
+          len(band) > 0,
+          f"no size between {lot:.0f} and 99 in the fixture, so size<{lot:.0f} "
+          f"and size<100 select the same rows and the checks below cannot "
+          f"fail whatever the code does")
+
+    expected_tiered = float((kept_sizes < lot).mean())
+    expected_sub100 = float((kept_sizes < 100).mean())
+
+    check(f"odd_lot_share counts size<{lot:.0f}, the tiered round lot",
+          abs(daily.get("odd_lot_share", -1) - expected_tiered) < 1e-9,
+          f"got {daily.get('odd_lot_share')}, tier-based expects "
+          f"{expected_tiered:.6f}; a fixed-100 rule would give "
+          f"{expected_sub100:.6f} — if it matches the latter the metric is "
+          f"ignoring round_lot_size")
+
+    check("sub_100_share counts size<100, unchanged",
+          abs(daily.get("sub_100_share", -1) - expected_sub100) < 1e-9,
+          f"got {daily.get('sub_100_share')}, expected {expected_sub100:.6f}")
+
+    check(f"the {TIER_PROBE_SIZE}-share print is a ROUND lot at "
+          f"${TIER_PROBE_PRICE:.2f} but sub-100",
+          daily.get("odd_lot_share") < daily.get("sub_100_share"),
+          f"odd_lot_share={daily.get('odd_lot_share')} is not below "
+          f"sub_100_share={daily.get('sub_100_share')}; the "
+          f"{TIER_PROBE_SIZE}-share print should be excluded from the first "
+          f"and included in the second")
     check("off_exchange_share > 0 (TRF print present)",
           daily.get("off_exchange_share", 0) > 0)
     check("excluded prints were dropped", daily.get("rows_excluded", 0) >= 2,
