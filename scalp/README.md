@@ -183,9 +183,18 @@ on a code that drives an exclusion decision is worse than no label.
 
 ## Storage goes to block 3, not the VPS root
 
+```bash
+export SCALP_DATA_DIR=/mnt/trading_volume_3/equities_scalp
+```
+
 The brief said `/data/equities_scalp/`. That was wrong — that is the main VPS
-disk. Parquet goes to **volume storage block 3**, the mount already holding
-`equity_1min` and the other equity parquet stores.
+disk.
+
+⚠️ **Do not follow `equity_1min`'s example.** It is *not* on a volume:
+`readlink -f` returns `/data/equity_1min` unchanged and `df` puts it on
+`/dev/vda1`, the root disk — which is at **89% with 8.7 GB free**. The existing
+equity store is sitting on root. That is a pre-existing problem worth
+addressing separately; this pipeline does not repeat it.
 
 `SCALP_DATA_DIR` has **no default**. It must be set in `.env` beside the other
 `*_DIR` entries, and `config.data_dir()` validates it before anything is
@@ -202,6 +211,32 @@ Comparing device ids catches it; comparing path strings does not.
 
 Step 0 scratch (`STEP0_DIR`) is exempt and stays where it is — small and
 disposable.
+
+### Retention is designed in, not bolted on
+
+Space is the binding constraint, so the policy exists before the first
+backfill rather than after the disk fills.
+
+| | |
+|---|---|
+| block 3 | 100 GB, 78% used, **~22 GB available** |
+| backfill (544 × 10 days) | 3.1 GB |
+| ongoing | ~310 MB per session |
+| headroom | **~60 sessions** |
+| overflow | none comfortable — volume 1 has 20 GB free, volume 2 has 11 GB |
+
+- `RAW_RETENTION_DAYS` defaults to **45**.
+- **`prune.py` is run by hand and is dry-run by default.** Nothing else in the
+  pipeline deletes anything.
+- **`fetch.py` checks free space before starting** and refuses when the
+  projected write plus a 3 GB margin doesn't fit. It will *never* delete to
+  make room — an automatic deleter racing an automatic writer is how a store
+  loses days nobody noticed were gone.
+
+What pruning costs: Postgres holds computed metrics permanently, so deleting
+raw parquet only removes the ability to *recompute a changed formula* over old
+days. That's a re-pull, not a loss — and a month is minutes at the measured
+5.2 min / 544 symbols / 10 days.
 
 ## Emission mode: gap structure outranks repeat rate
 
@@ -291,19 +326,72 @@ DLTR sit 0.04 bps apart at opposite ends of the realised results, so this
 separates the worst name and not the best from the worst. It goes into
 calibration beside the four noise variants as a candidate, not a conclusion.
 
+## The pipeline
+
+Step 0 is complete. Availability confirmed, tape consolidated, 5.2 min and
+3.1 GB for the backfill, conditions set, emission understood.
+
+```
+update_universe.py   1 API call. Candidate list with hysteresis + stickiness.
+fetch.py             The loop. Incremental, resumable, refuses on low space.
+compute.py           Parquet -> metrics -> Postgres. Daily + 15-minute.
+prune.py             Manual retention. Dry-run by default.
+```
+
+Supporting modules: `metrics.py` (all computation, arbitrary bounds),
+`schema.py` (column resolution), `store.py` (parquet layout), `db.py`
+(Postgres), `quality.py` (restatement guard).
+
+**Read [`METRICS.md`](METRICS.md) before the backfill runs.** It defines every
+metric, names the two that are *not* computable from `trade_quote` and return
+`NaN` rather than a substitute, and flags one open decision about whether to
+pull the quote stream separately.
+
+```bash
+python -m scalp.tests.test_timestamp_collapse    # no network, no database
+python -m scalp.quality --selftest               # no network
+python -m scalp.update_universe --dry-run
+python -m scalp.fetch --start 2026-08-28 --end 2026-08-28 --plan
+python -m scalp.compute --start ... --end ... --symbols FDX --print
+```
+
+Each script is independently runnable, idempotent and resumable. Nothing runs
+on a schedule unless it's added to cron by hand.
+
+### One function computes everything
+
+`metrics.compute_window(df, cols, start, end)` — the daily row, each
+15-minute row and the future intraday re-rank all call it with different
+bounds. There is no separate daily code path, which is what keeps the Phase 2
+intraday re-rank honest rather than a rewrite.
+
+### Same-timestamp collapsing is mandatory
+
+49.8% of records share an instant with another. Records at one instant
+collapse to the **last** *before* any duration weighting, and each survivor's
+weight is the gap **forward** to the next distinct instant.
+
+Get the order or the direction wrong and half the observations carry zero
+weight and vanish from every time-weighted number — with no error, no change
+in row count, and a result that looks entirely normal.
+`tests/test_timestamp_collapse.py` asserts the failure mode directly, with a
+case constructed so the right answer (300.0) and the wrong answer (350.0) are
+numerically distinguishable.
+
 ## Decided, not yet built
 
-Recorded here so it isn't lost between now and the metric layer.
+- **`rank.py` and `calibrate.py`** — the ranking output and the 15-ticker
+  comparison. Calibration must report every metric **both with and without**
+  the auction-edge exclusion, so the sensitivity is visible rather than
+  assumed.
+- **The dashboard** — FastAPI or a regenerated static page, one sortable row
+  per ticker, with a flag column marking traded tickers and their realised
+  $/min so the calibration check stays permanently visible.
+- **The backfill itself** — held until the metric definitions are reviewed.
 
-- **Exclude auction-period quotes from all spread and noise metrics.** The
-  opening quote on FDX was bid 330.45 / ask 336.15 — a $5.70 spread that is an
-  auction artifact and would wreck a daily average. Exclude the first and last
-  minute of the session; the exclusion window is a config value, not a
-  constant. The calibration output reports every metric **both with and without
-  the exclusion** so the sensitivity is visible rather than assumed.
-- **`off_exchange_share` joins the flow metrics**, computed via
-  `config.is_off_exchange`. The lookup exists; the metric lands with the metric
-  code.
+Done and no longer pending: auction-edge exclusion
+(`config.EXCLUDE_OPEN_MINUTES` / `_CLOSE_MINUTES`, applied to spread and noise
+only) and `off_exchange_share` (in `metrics.flow_metrics`).
 
 ## Design constraints carried forward
 

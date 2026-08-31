@@ -478,8 +478,88 @@ def data_dir(*, require_separate_volume: bool = True) -> Path:
 
 
 def raw_dir() -> Path:
-    """Raw pulls, partitioned symbol=X/date=YYYY-MM-DD. Never deleted."""
+    """Raw pulls, partitioned symbol=X/date=YYYY-MM-DD."""
     return data_dir() / "raw"
+
+
+# --- retention ---------------------------------------------------------------
+#
+# THE SPACE BUDGET IS THE BINDING CONSTRAINT, so retention is designed in now
+# rather than added after the disk fills.
+#
+#   block 3 (/mnt/trading_volume_3)  100 GB, 78% used, ~22 GB available
+#   backfill (544 symbols x 10 days)  3.1 GB
+#   ongoing                          ~310 MB per trading day
+#
+# That is roughly 60 sessions before it gets tight, and there is no comfortable
+# overflow: volume 1 has 20 GB free and volume 2 has 11 GB.
+#
+# What pruning actually costs: Postgres holds the computed metrics
+# permanently, so deleting old raw parquet only removes the ability to
+# RECOMPUTE a changed formula over old days. That is a re-pull, not a loss —
+# and a re-pull of a month is minutes, per the s3 timing.
+#
+# DELETION IS NEVER AUTOMATIC. prune.py is run by hand. fetch.py will refuse
+# to start when the projected write does not fit, but it will not free space
+# to make room — an automated deleter racing an automated writer is how a
+# store loses days nobody noticed were gone.
+RAW_RETENTION_DAYS = int(os.environ.get("SCALP_RAW_RETENTION_DAYS", "45"))
+
+# Measured from s2/s3: 3.1 GB for 544 symbols x 10 sessions.
+ESTIMATED_MB_PER_SYMBOL_DAY = float(
+    os.environ.get("SCALP_MB_PER_SYMBOL_DAY", "0.6"))
+
+# fetch.py refuses to start unless the projected write plus this margin fits.
+FREE_SPACE_MARGIN_GB = float(os.environ.get("SCALP_FREE_SPACE_MARGIN_GB", "3.0"))
+
+
+def free_space_gb(path: Path | None = None) -> float:
+    """Free space on the filesystem holding `path` (defaults to the data dir)."""
+    import shutil
+    target = path or data_dir()
+    return shutil.disk_usage(target).free / (1024 ** 3)
+
+
+def projected_write_gb(n_symbols: int, n_days: int) -> float:
+    return n_symbols * n_days * ESTIMATED_MB_PER_SYMBOL_DAY / 1024
+
+
+# --- auction exclusion -------------------------------------------------------
+# Auction prints and the quotes around them are not tradeable conditions. The
+# FDX opening quote was bid 330.45 / ask 336.15 — a $5.70 spread that is an
+# auction artifact, and one such observation distorts a daily average.
+#
+# Excluded from SPREAD and NOISE only. Trade counts and volume keep the full
+# RTH window, because an arrival is an arrival.
+#
+# Calibration reports every metric BOTH with and without this exclusion, so
+# the sensitivity is visible rather than assumed.
+EXCLUDE_OPEN_MINUTES  = float(os.environ.get("SCALP_EXCLUDE_OPEN_MINUTES", "1"))
+EXCLUDE_CLOSE_MINUTES = float(os.environ.get("SCALP_EXCLUDE_CLOSE_MINUTES", "1"))
+
+
+# --- flicker variants --------------------------------------------------------
+# Both computed, neither assumed. s5 found 78.4% of records identical on
+# price, size AND venue — venue turnover explained only 1.7 points of the
+# 80.1%, so the repeats remain largely unexplained.
+#
+# The likely cause is that the NBBO is recomputed on every participant's quote
+# update rather than only when the best changes: a venue behind the inside
+# adjusting its quote fires a record while the NBBO itself is unchanged. The
+# endpoint returns the NBBO, so that cause is not visible in the columns we
+# get and cannot be confirmed from this data.
+#
+# If it is right, the raw record count measures TOTAL QUOTE TRAFFIC across all
+# venues, not inside-market instability. Still book activity, still possibly
+# predictive — but a different quantity from the flicker metric as intended.
+# So both are computed and calibration decides, exactly as with the noise
+# variants.
+FLICKER_VARIANTS = (
+    "quote_records_per_min",   # raw record count — total quote traffic
+    "nbbo_changes_per_min",    # records where bid or ask price actually moved
+    "bid_changes_per_min",     # one-sided, given the 1,266:1 asymmetry
+    "ask_changes_per_min",
+)
 
 
 # --- Postgres (derived metrics only — no tick data ever) ---------------------

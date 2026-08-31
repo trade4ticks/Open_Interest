@@ -33,12 +33,26 @@ opposite: p50 1 ms, p90 448 ms, max 21,523 ms, mean 175 ms. A sampler produces
 near-constant gaps. Four orders of magnitude between median and maximum is not
 a clock, and no repeat rate outweighs that.
 
-The repeat rate was high because the comparison omitted `bid_exchange` and
-`ask_exchange`. NBBO records fire when any participant updates, so a different
-venue taking over at the same price and size is a genuinely new record in which
-every compared field is unchanged. The comparison below is therefore
-progressive — price, then size, then venue — and the drop at the venue step is
-the measurement that matters.
+THE VENUE HYPOTHESIS WAS TESTED AND MOSTLY REJECTED. The proposed explanation
+was that the comparison omitted `bid_exchange` and `ask_exchange`, so a
+different venue taking over at the same price and size would look like a
+duplicate. Measured, venue turnover accounts for only 1.7 points: 80.1% ->
+78.4%. So 78.4% of records are identical on price, size AND venue, and that
+remains unexplained.
+
+The verdict is unaffected — it rests on the gap structure, not on the repeats.
+
+Most likely remaining cause: the NBBO is recomputed on every participant's
+quote update, not only when the best changes. A venue behind the inside
+adjusting its quote fires a record while the NBBO is unchanged. This endpoint
+returns the NBBO, so that cause is not visible in the columns available and
+cannot be confirmed from this data.
+
+If that is right, the raw record count measures TOTAL QUOTE TRAFFIC across all
+venues rather than inside-market instability. Still book activity, still
+possibly useful — but a different quantity from the flicker metric as
+intended, which is why both are computed (config.FLICKER_VARIANTS) and
+calibration decides.
 
 This decides whether the flicker metric survives:
 
