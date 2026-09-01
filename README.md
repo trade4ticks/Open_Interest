@@ -20,9 +20,10 @@ a clean superset first (more rows for every ticker, an extra year of history,
 and four more months at the recent end). It is gone from `sql/01_schema.sql`
 so `init_db.py` cannot recreate it empty.
 
-`option_oi_surface` still exists and is **also unpopulated**. It has not been
-dropped because nine views in `sql/02_views.sql` read from it — see
-"Unpopulated tables" below.
+`option_oi_surface` was **also dropped on 2026-09-01**, together with the five
+views that read it. It was not empty — 15,303,161 rows — but it was derived,
+and the filter that produced it is recorded in `migrations/README.md` so it can
+be rebuilt from parquet if the per-node surface is ever wanted back.
 
 ## Project layout
 
@@ -59,28 +60,15 @@ psql -U postgres -f sql/00_create_database.sql   # one-time
 python init_db.py                                # creates tables + views, idempotent
 ```
 
-## Unpopulated tables
+## Tables no longer written
 
-Nothing writes to these. They survive because dropping them has a
+Nothing writes to these, though they may still hold rows. They survive because dropping them has a
 dependency or a decision attached, not because they are in use.
 
-| table | size | blocked on |
-|---|---|---|
-| `option_oi_surface` | ~2.5 GB | nine views in `sql/02_views.sql` read it |
-| `option_volume_daily` | — | still written by `fetch_volume_eod.py`, which the chain-parquet runbook retires |
-| `option_iv_daily` | — | still written by `fetch_iv_chain.py`, same |
-
-**`option_oi_surface`.** These views select from it and would break on use if
-it were dropped — they would still exist, and error when queried:
-
-`v_oi_surface_latest`, `v_oi_top_nodes_latest`, `v_oi_changes_daily`,
-`v_oi_concentration`, `v_pin_candidates`
-
-No Python in this repo queries any of them. Dropping the table means dropping
-or rewriting those five views in the same change.
-
-(`v_features_with_returns`, the sixth view in that file, reads
-`daily_features` and is unaffected.)
+| table | blocked on |
+|---|---|
+| `option_volume_daily` | still written by `fetch_volume_eod.py`, which the chain-parquet runbook retires |
+| `option_iv_daily` | still written by `fetch_iv_chain.py`, same |
 
 **`option_volume_daily` / `option_iv_daily`.** Superseded by the chain-parquet
 migration — `build_features.py` computes vol and IV from `chain_adj` and does

@@ -1,118 +1,35 @@
 -- =============================================================================
 -- Helper views for AI Explorer / ad-hoc queries.
 --
--- These views read from the filtered surface (option_oi_surface) so the AI
--- only sees meaningful nodes. Drop and recreate is fine — they hold no state.
---
 -- We DROP IF EXISTS up front because CREATE OR REPLACE VIEW in Postgres
 -- cannot change a view's column NAMES (only types/positions). Whenever the
 -- underlying tables get a column rename or `f.*` resolves differently,
 -- CREATE OR REPLACE fails with "cannot change name of view column ..." —
 -- DROP+CREATE sidesteps that.
+--
+-- REMOVED 2026-09-01, together with option_oi_surface: v_oi_surface_latest,
+-- v_oi_top_nodes_latest, v_oi_changes_daily, v_oi_concentration and
+-- v_pin_candidates. All five read the surface table and would have errored on
+-- use once it was dropped.
+--
+-- That was a CAPABILITY, not only storage. Those five were the per-node view
+-- of the OI surface, and daily_features holds derived metrics rather than
+-- nodes, so nothing currently replaces them. Rebuilding means pointing them
+-- at the parquet store through DuckDB; the filter that produced the surface
+-- is recorded verbatim in migrations/README.md so that stays possible.
+--
+-- v_features_with_returns reads daily_features and is unaffected.
 -- =============================================================================
 
-DROP VIEW IF EXISTS v_pin_candidates        CASCADE;
 DROP VIEW IF EXISTS v_features_with_returns CASCADE;
-DROP VIEW IF EXISTS v_oi_concentration      CASCADE;
-DROP VIEW IF EXISTS v_oi_changes_daily      CASCADE;
-DROP VIEW IF EXISTS v_oi_top_nodes_latest   CASCADE;
-DROP VIEW IF EXISTS v_oi_surface_latest     CASCADE;
 
--- ---------------------------------------------------------------------------
--- v_oi_surface_latest
--- The full filtered surface for the most recent trade_date per ticker.
--- This is the table the AI should look at first to "see" the current OI surface.
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_oi_surface_latest AS
-WITH latest AS (
-    SELECT ticker, MAX(trade_date) AS trade_date
-    FROM option_oi_surface
-    GROUP BY ticker
-)
-SELECT s.*
-FROM option_oi_surface s
-JOIN latest l USING (ticker, trade_date)
-ORDER BY ticker, expiration, strike, option_type;
-
--- ---------------------------------------------------------------------------
--- v_oi_top_nodes_latest
--- Top 25 OI nodes per ticker on the most recent trade_date, with rank.
--- "Where is the volume concentrated right now?"
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_oi_top_nodes_latest AS
-WITH latest AS (
-    SELECT ticker, MAX(trade_date) AS trade_date
-    FROM option_oi_surface
-    GROUP BY ticker
-),
-ranked AS (
-    SELECT
-        s.*,
-        ROW_NUMBER() OVER (
-            PARTITION BY s.ticker
-            ORDER BY s.open_interest DESC
-        ) AS oi_rank
-    FROM option_oi_surface s
-    JOIN latest l USING (ticker, trade_date)
-)
-SELECT *
-FROM ranked
-WHERE oi_rank <= 25
-ORDER BY ticker, oi_rank;
-
--- ---------------------------------------------------------------------------
--- v_oi_changes_daily
--- Per (ticker, expiration, strike, option_type): OI today vs prior available
--- trade_date for that contract. Helps spot accumulation / unwinds.
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_oi_changes_daily AS
-SELECT
-    s.ticker,
-    s.trade_date,
-    s.expiration,
-    s.dte,
-    s.strike,
-    s.option_type,
-    s.open_interest                                                            AS oi_today,
-    LAG(s.open_interest) OVER w                                                AS oi_prev,
-    s.open_interest - LAG(s.open_interest) OVER w                              AS oi_change,
-    CASE
-        WHEN LAG(s.open_interest) OVER w > 0 THEN
-            (s.open_interest - LAG(s.open_interest) OVER w)::DOUBLE PRECISION
-            / LAG(s.open_interest) OVER w
-        ELSE NULL
-    END                                                                        AS oi_pct_change,
-    s.spot_close,
-    s.moneyness
-FROM option_oi_surface s
-WINDOW w AS (
-    PARTITION BY s.ticker, s.expiration, s.strike, s.option_type
-    ORDER BY s.trade_date
-);
-
--- ---------------------------------------------------------------------------
--- v_oi_concentration
--- Per (ticker, trade_date, expiration): what fraction of OI is on calls vs
--- puts, and how concentrated is the surface? Useful for clustering analysis.
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_oi_concentration AS
-SELECT
-    ticker,
-    trade_date,
-    expiration,
-    dte,
-    SUM(open_interest)                                                      AS total_oi,
-    SUM(CASE WHEN option_type = 'C' THEN open_interest ELSE 0 END)          AS call_oi,
-    SUM(CASE WHEN option_type = 'P' THEN open_interest ELSE 0 END)          AS put_oi,
-    COUNT(*)                                                                AS n_strikes,
-    MIN(strike)                                                             AS min_strike,
-    MAX(strike)                                                             AS max_strike,
-    AVG(spot_close)                                                         AS spot_close,
-    -- OI-weighted average strike
-    SUM(strike * open_interest)::DOUBLE PRECISION
-        / NULLIF(SUM(open_interest), 0)                                     AS oi_weighted_strike
-FROM option_oi_surface
-GROUP BY ticker, trade_date, expiration, dte;
+-- Dropped alongside option_oi_surface. Kept as statements so re-running this
+-- file also cleans a database created before 2026-09-01.
+DROP VIEW IF EXISTS v_pin_candidates      CASCADE;
+DROP VIEW IF EXISTS v_oi_concentration    CASCADE;
+DROP VIEW IF EXISTS v_oi_changes_daily    CASCADE;
+DROP VIEW IF EXISTS v_oi_top_nodes_latest CASCADE;
+DROP VIEW IF EXISTS v_oi_surface_latest   CASCADE;
 
 -- ---------------------------------------------------------------------------
 -- v_features_with_returns
@@ -129,37 +46,3 @@ SELECT
 FROM daily_features f
 LEFT JOIN underlying_ohlc o USING (ticker, trade_date)
 ORDER BY f.ticker, f.trade_date;
-
--- ---------------------------------------------------------------------------
--- v_pin_candidates
--- Strikes near spot for the front (nearest-DTE) expiration, ranked by OI.
--- "Where might this thing pin into expiry?"
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_pin_candidates AS
-WITH front_expiry AS (
-    SELECT ticker, trade_date, MIN(expiration) AS front_expiration
-    FROM option_oi_surface
-    WHERE dte >= 0
-    GROUP BY ticker, trade_date
-)
-SELECT
-    s.ticker,
-    s.trade_date,
-    s.expiration,
-    s.dte,
-    s.strike,
-    s.option_type,
-    s.open_interest,
-    s.spot_close,
-    s.moneyness,
-    ROW_NUMBER() OVER (
-        PARTITION BY s.ticker, s.trade_date
-        ORDER BY s.open_interest DESC
-    ) AS rank_in_front
-FROM option_oi_surface s
-JOIN front_expiry f
-  ON  f.ticker     = s.ticker
-  AND f.trade_date = s.trade_date
-  AND f.front_expiration = s.expiration
-WHERE ABS(s.moneyness) <= 0.05
-ORDER BY s.ticker, s.trade_date, s.open_interest DESC;

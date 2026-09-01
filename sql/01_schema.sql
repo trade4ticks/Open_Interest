@@ -3,20 +3,26 @@
 --
 -- Tables:
 --   underlying_ohlc      daily OHLC per ticker (yfinance)
---   option_oi_surface    filtered OI nodes joined to spot/moneyness/DTE
 --   daily_features       per (ticker, trade_date) feature row for AI/stat analysis
 --
--- DROPPED 2026-09-01: option_oi_raw. Raw OI moved to parquet at
+-- DROPPED 2026-09-01: option_oi_raw AND option_oi_surface. Raw OI moved to
+-- parquet at
 -- {OI_RAW_DIR}/{ticker}/{year}.parquet, which build_features.py reads directly
 -- via DuckDB. The parquet store was verified a clean superset before the drop
 -- — more rows for every ticker, starting 2019-01-02 against Postgres'
 -- 2020-01-02 and running to 2026-08-31 against 2026-04-24 — and nothing was
 -- in Postgres that was not in parquet. Recovered 5.1 GB.
 --
--- The definition is removed rather than left in place because CREATE TABLE IF
--- NOT EXISTS would otherwise recreate it empty on the next init_db.py run,
--- and an empty table that nothing writes to is how this one became invisible
--- for four months.
+-- option_oi_surface was NOT empty — it held 15,303,161 rows at the same grain
+-- as the raw table, filtered rather than aggregated. It is reconstructible
+-- from the parquet store: its filter predicate and the three derived columns
+-- are recorded verbatim in migrations/README.md. The five views that read it
+-- are removed from sql/02_views.sql in the same change.
+--
+-- Both definitions are removed rather than left in place because CREATE TABLE
+-- IF NOT EXISTS would otherwise recreate them empty on the next init_db.py
+-- run, and an empty table that nothing writes to is how option_oi_raw stayed
+-- invisible for four months.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -46,25 +52,9 @@ CREATE INDEX IF NOT EXISTS underlying_ohlc_date_idx
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- 3. Filtered OI surface — meaningful nodes only, denormalised with spot/DTE
+-- 3. (removed) option_oi_surface — see the header. Reconstructible from the
+--     parquet store; the filter predicate is in migrations/README.md.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS option_oi_surface (
-    ticker         TEXT             NOT NULL,
-    trade_date     DATE             NOT NULL,
-    expiration     DATE             NOT NULL,
-    dte            SMALLINT         NOT NULL,
-    strike         DOUBLE PRECISION NOT NULL,
-    option_type    CHAR(1)          NOT NULL CHECK (option_type IN ('C','P')),
-    open_interest  BIGINT           NOT NULL,
-    spot_close     DOUBLE PRECISION,
-    moneyness      DOUBLE PRECISION,
-    PRIMARY KEY (ticker, trade_date, expiration, strike, option_type)
-);
-
-CREATE INDEX IF NOT EXISTS option_oi_surface_lookup
-    ON option_oi_surface (ticker, trade_date);
-CREATE INDEX IF NOT EXISTS option_oi_surface_dte
-    ON option_oi_surface (ticker, trade_date, dte);
 
 -- ---------------------------------------------------------------------------
 -- 4. Daily features — one row per (ticker, trade_date) for stat / AI analysis
