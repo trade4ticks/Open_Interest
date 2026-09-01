@@ -18,9 +18,10 @@ written to parquet split by year. The parquet writer dedupes on
 (trade_date, expiration, strike, option_type) so re-running a date range is
 safe and overwrites any prior values for the same contract on the same day.
 
-The Postgres `option_oi_raw` and `option_oi_surface` tables are no longer
-populated by this script — derived metrics in `daily_features` are now
-computed directly from the parquet store by `build_features.py`.
+Postgres holds no raw OI. `option_oi_raw` was dropped on 2026-09-01 after the
+parquet store was verified a clean superset; `option_oi_surface` still exists
+but nothing populates it. Derived metrics in `daily_features` are computed
+directly from the parquet store by `build_features.py`.
 """
 from __future__ import annotations
 

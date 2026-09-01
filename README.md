@@ -15,9 +15,14 @@ Isolated from the main SPX project — uses its own Postgres database
 | Underlying OHLC         | Postgres `underlying_ohlc`                         |
 | Derived daily features  | Postgres `daily_features`                          |
 
-The earlier `option_oi_raw` and `option_oi_surface` Postgres tables are
-**no longer populated**. They remain in the schema as historical snapshots
-until you choose to drop them (see "Migration" below).
+`option_oi_raw` was **dropped on 2026-09-01** — the parquet store was verified
+a clean superset first (more rows for every ticker, an extra year of history,
+and four more months at the recent end). It is gone from `sql/01_schema.sql`
+so `init_db.py` cannot recreate it empty.
+
+`option_oi_surface` still exists and is **also unpopulated**. It has not been
+dropped because nine views in `sql/02_views.sql` read from it — see
+"Unpopulated tables" below.
 
 ## Project layout
 
@@ -29,7 +34,7 @@ until you choose to drop them (see "Migration" below).
 ├── fetch_ohlc.py            yfinance daily OHLC -> underlying_ohlc
 ├── fetch_oi.py              ThetaData daily OI -> data/oi_raw/{ticker}/{year}.parquet
 ├── build_features.py        parquet (OI) + Postgres (OHLC) -> daily_features (DuckDB)
-├── export_raw_to_parquet.py one-time migration: option_oi_raw -> parquet
+├── migrations/              one-time scripts, kept for the record
 ├── lib/
 │   ├── thetadata.py         v3 client (open_interest endpoint)
 │   ├── parquet_store.py     read/write per-(ticker, year) parquet files
@@ -54,18 +59,40 @@ psql -U postgres -f sql/00_create_database.sql   # one-time
 python init_db.py                                # creates tables + views, idempotent
 ```
 
-## Migration from Postgres-raw to parquet (one-time)
+## Unpopulated tables
 
-If you previously loaded data into `option_oi_raw`:
+Nothing writes to these. They survive because dropping them has a
+dependency or a decision attached, not because they are in use.
 
-```bash
-python export_raw_to_parquet.py
-# Validate the parquet files (script logs row counts vs Postgres).
-# When you're satisfied, drop the table yourself:
-psql -d open_interest -c "DROP TABLE option_oi_raw;"
-```
+| table | size | blocked on |
+|---|---|---|
+| `option_oi_surface` | ~2.5 GB | nine views in `sql/02_views.sql` read it |
+| `option_volume_daily` | — | still written by `fetch_volume_eod.py`, which the chain-parquet runbook retires |
+| `option_iv_daily` | — | still written by `fetch_iv_chain.py`, same |
 
-`option_oi_surface` can also be dropped manually if you don't plan to use it.
+**`option_oi_surface`.** These views select from it and would break on use if
+it were dropped — they would still exist, and error when queried:
+
+`v_oi_surface_latest`, `v_oi_top_nodes_latest`, `v_oi_changes_daily`,
+`v_oi_concentration`, `v_pin_candidates`
+
+No Python in this repo queries any of them. Dropping the table means dropping
+or rewriting those five views in the same change.
+
+(`v_features_with_returns`, the sixth view in that file, reads
+`daily_features` and is unaffected.)
+
+**`option_volume_daily` / `option_iv_daily`.** Superseded by the chain-parquet
+migration — `build_features.py` computes vol and IV from `chain_adj` and does
+not read either table. `run_pipeline.py` calls `fetch_chain_eod`, not the old
+fetchers. Step 6 of `MIGRATION_RUNBOOK_chain_eod.md` covers retiring the
+scripts and dropping the tables; that step was never run.
+
+## Migration from Postgres-raw to parquet (complete)
+
+Done on 2026-09-01. The script is at `migrations/export_raw_to_parquet.py`
+with the verification figures; it cannot be re-run, because its source table
+no longer exists.
 
 ## Daily workflow (interactive)
 
