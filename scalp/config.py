@@ -61,54 +61,77 @@ TOTAL_TIMEOUT   = int(os.environ.get("SCALP_TOTAL_TIMEOUT",   "900"))
 
 # --- venue ------------------------------------------------------------------
 #
-# SETTLED by scalp/step0/s1_venue_check.py. Do not change these without
-# rerunning it.
+# SEND utp_cta ON EVERYTHING. The default is feed-dependent; the parameter is
+# not.
 #
-# snapshot/ohlc — MEASURED, needs the parameter. The default `nqb` (Nasdaq
-# Basic: Nasdaq exchange plus Nasdaq TRF only) returned 44% of true volume and
-# omitted ~10,000 symbols; venue=utp_cta matched FDX's EOD figure of 956,900
-# shares exactly.
+# THE EARLIER CONCLUSION WAS WRONG AND IS KEPT HERE WITH ITS REFUTATION.
+# s1, run against 2026-08-28, found the with- and without-venue responses on
+# history/trade_quote BYTE-IDENTICAL with 20 distinct exchange codes, and
+# concluded the endpoint "accepts the parameter and ignores it". That was a
+# SAME-DATE ARTIFACT: by the time it ran, CTA/UTP was already complete for
+# Aug 28, so both paths returned the same settled tape and the comparison had
+# nothing to distinguish.
 #
-# history/trade_quote — MEASURED, does NOT need it, and the parameter has no
-# effect. s1 found the with- and without-venue responses BYTE-IDENTICAL, and
-# 20 distinct exchange codes in the tape. The endpoint accepts the parameter
-# and ignores it: it already reads the consolidated tape. This matches Theta's
-# documented feed arrangement — a 15-minute delayed feed from all three SIP
-# networks alongside the real-time Nasdaq Basic feed.
+# Re-run against 2026-08-31 roughly two hours after that session's close:
 #
-# The earlier belief that utp_cta was required everywhere was a generalisation
-# from the snapshot result, made without evidence. It was wrong for the
-# history endpoints.
+#     without venue :  623,352 rows,   5 exchange codes  (57, 1, 9, 11, 58)
+#     with utp_cta  :  826,801 rows,  21 exchange codes
+#     byte-identical:  False
 #
-# DO NOT add the parameter to the history endpoints "to be safe". An
-# unnecessary parameter on an endpoint that ignores it is harmless; an
-# unnecessary parameter on an endpoint that interprets it differently than
-# assumed is exactly how this went wrong the first time. Sending nothing is
-# the measured-correct behaviour, not an omission.
+# Five codes is Nasdaq exchange plus Nasdaq TRF and essentially nothing else —
+# Nasdaq Basic. So on a recent date the default falls back to the real-time
+# Nasdaq feed, and only settles to the consolidated tape later. A test run
+# against a date that had already settled could not see that, and the
+# generalisation from one date to all dates was the error, exactly as the
+# FIRST wrong venue conclusion generalised from one ENDPOINT to all endpoints.
+#
+# THE RULE, stated so it does not have to be rediscovered a third time: the
+# DEFAULT depends on which feed has the data at the moment of the request, so
+# it varies with how old the session is. The PARAMETER does not. Send it
+# always; it is correct on settled dates and load-bearing on recent ones.
+#
+# What this cost: a full day of Aug 31 data fetched off the Nasdaq-only tape,
+# which is 75% of the row count and looked merely surprising three hours
+# downstream in a metric rather than wrong at fetch time. MIN_EXCHANGE_CODES
+# below exists so that never happens silently again.
 VENUE_UTP_CTA = "utp_cta"
 
 VENUE_BY_ENDPOINT: dict[str, str | None] = {
     # Required. Default nqb is Nasdaq-only.
     "/v3/stock/snapshot/ohlc":       VENUE_UTP_CTA,
 
-    # Accepted and ignored — already consolidated. Send nothing.
-    "/v3/stock/history/trade_quote": None,
-    "/v3/stock/history/quote":       None,
+    # Required. The default is Nasdaq Basic on a recent date and the
+    # consolidated tape once the session has settled — see above.
+    "/v3/stock/history/trade_quote": VENUE_UTP_CTA,
+    "/v3/stock/history/quote":       VENUE_UTP_CTA,
+
+    # Historical counterpart to snapshot/ohlc, used to rebuild a past
+    # universe. Sent on the same reasoning as the others: the cost of an
+    # ignored parameter is nothing, and the cost of a missing one is a
+    # Nasdaq-only universe.
+    "/v3/stock/history/eod":         VENUE_UTP_CTA,
 
     # Roster endpoint; venue is not meaningful.
     "/v3/stock/list/symbols":        None,
-
-    # Historical counterpart to snapshot/ohlc, used to rebuild a past
-    # universe. UNVERIFIED: it is a history endpoint, and every history
-    # endpoint tested so far ignores the parameter, so it sends nothing on the
-    # same reasoning. If a rebuilt universe ever disagrees with a
-    # same-day-built one, this is the first thing to check.
-    "/v3/stock/history/eod":         None,
 }
 
-# s1 has run and the table above reflects its findings. The fetch scripts
-# refuse a bulk pull while this is False, so a multi-hour backfill cannot be
-# launched against an unverified venue assumption.
+# --- tape completeness -------------------------------------------------------
+# A consolidated US equity tape carries prints from many venues. Aug 28 showed
+# 20 distinct exchange codes; Aug 31 fetched WITHOUT the venue parameter showed
+# 5, all Nasdaq or Nasdaq TRF.
+#
+# So the code count is a direct, per-symbol-day check that the tape is
+# consolidated, and it needs no reference figure to compare against — unlike
+# share volume, which needs an EOD number nobody has per symbol.
+#
+# fetch.py refuses to write a symbol-day below this. That is deliberately
+# stricter than a warning: a thin file that lands on disk satisfies the resume
+# check and is then indistinguishable from a good one, and every metric
+# computed from it is wrong in a way that reads as merely surprising.
+MIN_EXCHANGE_CODES = int(os.environ.get("SCALP_MIN_EXCHANGE_CODES", "10"))
+
+# The table above reflects the CORRECTED finding of 2026-08-31, not the
+# original s1 run. The fetch scripts refuse a bulk pull while this is False.
 VENUE_POLICY_VERIFIED = True
 
 

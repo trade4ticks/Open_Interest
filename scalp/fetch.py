@@ -31,7 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
-from scalp import config, db, store, thetadata as td
+from scalp import config, db, schema, store, thetadata as td
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,26 @@ def plan_units(symbols: list[str], days: list[date]) -> list[tuple[str, date]]:
     return units
 
 
-def fetch_one(symbol: str, day: date) -> tuple[str, date, int, str]:
+def exchange_code_count(df) -> int:
+    """Distinct exchange codes in a symbol-day, or -1 if unreadable.
+
+    THE TAPE-COMPLETENESS CHECK. A consolidated US equity tape carries prints
+    from many venues: Aug 28 showed 20 codes. The same fetch without
+    venue=utp_cta showed 5 — Nasdaq exchange plus Nasdaq TRF and essentially
+    nothing else.
+
+    So the code count says directly whether the tape is consolidated, and
+    unlike a share-volume comparison it needs no per-symbol reference figure.
+    """
+    col = schema.find(df, schema.CAND_EXCHANGE, "exchange", required=False)
+    if col is None:
+        return -1
+    return int(df[col].nunique(dropna=True))
+
+
+def fetch_one(symbol: str, day: date,
+              min_codes: int = config.MIN_EXCHANGE_CODES
+              ) -> tuple[str, date, int, str]:
     """Fetch and write one symbol-day. Returns (symbol, day, rows, status)."""
     try:
         raw = td.trade_quote(symbol, day, day)
@@ -60,6 +79,16 @@ def fetch_one(symbol: str, day: date) -> tuple[str, date, int, str]:
         # as an empty file: an empty parquet would satisfy the resume check
         # and permanently mask a day that a later re-run could have filled.
         return symbol, day, 0, "empty"
+
+    codes = exchange_code_count(df)
+    if 0 <= codes < min_codes:
+        # NOT WRITTEN, deliberately. A thin file on disk satisfies the resume
+        # check and is then indistinguishable from a good one, so every later
+        # run skips it and every metric computed from it is wrong in a way
+        # that reads as merely surprising. Leaving it absent means a re-run
+        # picks it up.
+        return symbol, day, len(df), f"thin_tape:{codes}"
+
     store.write_day(symbol, day, df)
     return symbol, day, len(df), "ok"
 
@@ -77,6 +106,16 @@ def main() -> None:
     ap.add_argument("--yes", action="store_true",
                     help="required for runs above --confirm-threshold units")
     ap.add_argument("--confirm-threshold", type=int, default=2000)
+    ap.add_argument("--allow-today", action="store_true",
+                    help="fetch the current trading date. Off by default: the "
+                         "consolidated tape keeps filling after the close, so "
+                         "a same-day pull can be short of prints that arrive "
+                         "later, even with venue=utp_cta.")
+    ap.add_argument("--min-exchange-codes", type=int,
+                    default=config.MIN_EXCHANGE_CODES,
+                    help="refuse a symbol-day with fewer distinct exchange "
+                         "codes than this. A consolidated tape shows ~20; a "
+                         "Nasdaq-only one shows ~5. 0 disables the check.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -96,6 +135,24 @@ def main() -> None:
     days = store.trading_days(start, end)
     if not days:
         raise SystemExit(f"no trading sessions between {start} and {end}")
+
+    # SAME-DAY DATA IS NOT SETTLED. The venue default falls back to the
+    # real-time Nasdaq feed on a recent date, and the vendor's consolidated
+    # tape continues to fill in after the close. venue=utp_cta fixes the first
+    # problem and not the second, so a same-day pull can still be short of
+    # prints that arrive later.
+    today = td.today_et()
+    if today in days and not args.allow_today:
+        days = [d for d in days if d != today]
+        log.warning("skipping %s: same-day data is not settled. The tape "
+                    "continues to fill after the close, so a pull today can "
+                    "be short of prints that arrive later. Use --allow-today "
+                    "to override, and re-fetch the day afterwards.", today)
+        if not days:
+            raise SystemExit(
+                f"{today} was the only session in range and same-day fetching "
+                f"is off. Re-run tomorrow, or pass --allow-today knowing the "
+                f"tape may be incomplete.")
 
     symbols = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
                if args.symbols else db.universe_symbols())
@@ -154,8 +211,10 @@ def main() -> None:
 
     t0 = time.monotonic()
     done = rows_total = failures = empties = 0
+    thin: list[tuple[str, date, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_one, s, d): (s, d) for s, d in units}
+        futures = {pool.submit(fetch_one, s, d, args.min_exchange_codes):
+                   (s, d) for s, d in units}
         for fut in as_completed(futures):
             sym, day, rows, status = fut.result()
             done += 1
@@ -163,6 +222,11 @@ def main() -> None:
                 rows_total += rows
             elif status in ("empty", "nodata"):
                 empties += 1
+            elif status.startswith("thin_tape"):
+                thin.append((sym, day, status))
+                log.warning("  %s %s: %s codes — NOT WRITTEN. The tape looks "
+                            "Nasdaq-only rather than consolidated.",
+                            sym, day, status.split(":")[1])
             else:
                 failures += 1
                 log.warning("  %s %s: %s", sym, day, status)
@@ -177,13 +241,24 @@ def main() -> None:
     print()
     print(f"fetched {done - failures - empties:,} symbol-days, "
           f"{rows_total:,} rows in {elapsed/60:.1f} min")
-    print(f"empty/no-data: {empties:,}   failures: {failures:,}")
+    print(f"empty/no-data: {empties:,}   failures: {failures:,}   "
+          f"thin tape: {len(thin):,}")
+    if thin:
+        print()
+        print(f"{len(thin)} symbol-day(s) returned fewer than "
+              f"{args.min_exchange_codes} exchange codes and were NOT written.")
+        print("A consolidated tape shows ~20; a Nasdaq-only one shows ~5. The")
+        print("usual cause is the venue parameter not reaching the request, or")
+        print("a same-day pull against an unsettled tape. Check")
+        print("config.VENUE_BY_ENDPOINT before re-running.")
+        for sym, day, status in thin[:10]:
+            print(f"    {sym} {day}  {status}")
     print(f"store size now: {store.store_bytes() / 1024**3:.2f} GB")
     print(f"free on volume: {config.free_space_gb():.2f} GB")
-    if failures:
+    if failures or thin:
         print()
-        print("Failures are safe to re-run: the units that succeeded are on "
-              "disk and will be skipped.")
+        print("Safe to re-run: the units that succeeded are on disk and will "
+              "be skipped. Nothing thin was written, so a re-run retries it.")
         sys.exit(1)
 
 

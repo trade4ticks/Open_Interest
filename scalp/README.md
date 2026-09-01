@@ -73,6 +73,61 @@ subscription change, but it is the only first-hand evidence in the codebase and
 it disagrees with the plan. (Leave that docstring alone — it belongs to the
 options project.)
 
+### The venue question, twice wrong
+
+⚠️ **Send `venue=utp_cta` on everything.** The default is feed-dependent; the
+parameter is not.
+
+Both wrong conclusions are kept here, because the same reasoning error
+produced both:
+
+| conclusion | basis | refuted by |
+|---|---|---|
+| "`utp_cta` is needed everywhere" | one endpoint | s1 — history endpoints looked identical with and without |
+| "history endpoints ignore it" | one **date** | a re-run on a fresh session |
+
+The second test ran against 2026-08-28, whose tape had already settled, so
+both paths returned the same thing and the comparison had nothing to
+distinguish. Re-run against 2026-08-31 about two hours after that close:
+
+```
+without venue :  623,352 rows,   5 exchange codes  (57, 1, 9, 11, 58)
+with utp_cta  :  826,801 rows,  21 exchange codes
+byte-identical:  False
+```
+
+Five codes is Nasdaq exchange plus Nasdaq TRF — Nasdaq Basic. So on a recent
+date the default falls back to the real-time Nasdaq feed and only settles to
+the consolidated tape later.
+
+**The rule, so it doesn't get rediscovered a third time:** the default depends
+on which feed holds the data at the moment of the request, so it varies with
+how old the session is. The parameter does not. Send it always — harmless on
+settled dates, load-bearing on recent ones.
+
+Cost: a full day of Aug 31 fetched off the Nasdaq-only tape at 75% of the row
+count, which surfaced three hours downstream as a metric that looked merely
+surprising.
+
+### Two guards so it cannot happen silently again
+
+`fetch.py` counts distinct exchange codes per symbol-day and **refuses to
+write** below `MIN_EXCHANGE_CODES` (10). Not a warning: a thin file on disk
+satisfies the resume check, becomes indistinguishable from a good one, and
+every later run skips it. Leaving it absent means a re-run retries it.
+
+`fetch.py` also **refuses the current trading date** by default
+(`--allow-today` overrides). `utp_cta` fixes the feed fallback but not
+settlement — the consolidated tape keeps filling after the close.
+
+```bash
+python -m scalp.audit_venue --start 2026-08-17 --end 2026-08-28
+```
+
+Samples stored symbol-days across every date in range and reports distinct
+exchange codes per file, with a per-date summary so a bad *session* is visible
+rather than averaged away. Read-only.
+
 ### The venue question is settled
 
 `venue=utp_cta` is **not** hardcoded anywhere. `config.VENUE_BY_ENDPOINT` is a

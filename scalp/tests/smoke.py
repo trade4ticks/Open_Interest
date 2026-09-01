@@ -48,6 +48,7 @@ SCRIPTS = [
     "scalp.compute",
     "scalp.prune",
     "scalp.profile_compute",
+    "scalp.audit_venue",
     "scalp.quality",
     "scalp.step0.s0_availability",
     "scalp.step0.s1_venue_check",
