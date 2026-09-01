@@ -55,16 +55,58 @@ from scalp import config, db, metrics, schema, store
 log = logging.getLogger(__name__)
 
 
-def _compute_unit(unit: tuple[str, date]):
+# Linux only: ask the kernel to signal this process when its PARENT dies.
+PR_SET_PDEATHSIG = 1
+
+
+def _worker_init() -> None:
+    """Make the kernel kill this worker when the parent process dies.
+
+    A killed compute run left six orphaned workers holding 5.9 GB two days
+    later. atexit handlers and signal handlers cannot help there: the parent
+    was killed with -9, which is not catchable and runs no cleanup.
+
+    prctl(PR_SET_PDEATHSIG, SIGKILL) is handled by the KERNEL, not the
+    parent, so it fires however the parent died — including -9. It is set in
+    the child, inherited from nothing, and survives for the life of the
+    process.
+
+    Non-Linux and any failure are ignored: this is a safety net, and a pool
+    that refuses to start because prctl is unavailable would be worse than
+    one that occasionally leaks on a platform this never runs on.
+
+    See tests/test_worker_reaping.py, which kills a parent with -9 and
+    asserts the workers are gone.
+    """
+    try:
+        import ctypes
+        import signal as _signal
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, _signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+
+    # A parent that died between fork and prctl leaves this child already
+    # orphaned, and the signal will never come. Check once.
+    try:
+        import os as _os
+        if _os.getppid() == 1:
+            _os._exit(0)
+    except Exception:
+        pass
+
+
+def _compute_unit(unit: tuple[str, date, bool]):
     """Worker entry point. Module-level so it pickles.
 
     Returns (daily, buckets, provenance, error) rather than raising: an
     exception crossing a process boundary loses its traceback and can fail to
     pickle at all, which turns one bad symbol-day into a dead pool.
     """
-    symbol, day = unit
+    symbol, day, with_intraday = unit
     try:
-        daily, buckets, prov = compute_symbol_day(symbol, day)
+        daily, buckets, prov = compute_symbol_day(
+            symbol, day, with_intraday=with_intraday)
         return daily, buckets, prov, None
     except Exception as exc:
         return None, [], {}, f"{type(exc).__name__}: {exc}"
@@ -101,7 +143,7 @@ def prepare(df: pd.DataFrame, day: date) -> tuple[pd.DataFrame, metrics.Columns]
     return out, cols
 
 
-def compute_symbol_day(symbol: str, day: date
+def compute_symbol_day(symbol: str, day: date, *, with_intraday: bool = True
                        ) -> tuple[dict | None, list[dict], dict]:
     """Returns (daily metrics, 15-minute rows, provenance).
 
@@ -121,11 +163,20 @@ def compute_symbol_day(symbol: str, day: date
     daily = metrics.compute_window(df, cols, start, end)
     daily["symbol_day_rows"] = len(df)
     prov = daily.pop("_provenance", {})
-    # compute_buckets passes with_provenance=False. Provenance is a symbol-day
-    # fact and the daily row carries it; the bucket copies were built and then
-    # thrown away here, at a cost of one pass per excluded code per bucket.
-    buckets = metrics.compute_buckets(df, cols, start, end,
-                                      config.INTRADAY_BUCKET_MINUTES)
+
+    # --no-intraday SKIPS THE COMPUTATION, not just the write. It previously
+    # only guarded the INSERT, so compute_buckets still ran 26 windows per
+    # symbol-day and the result was discarded — the same pattern as the bucket
+    # provenance. Measured 0.46 symbol-days/s without the flag against 0.48
+    # with it, when the profiler had the daily row at 2.90s and the 26
+    # intraday rows at 5.40s.
+    #
+    # It has to be a parameter rather than a module-level flag because this
+    # runs in a worker PROCESS, which never sees argparse's result.
+    buckets = []
+    if with_intraday:
+        buckets = metrics.compute_buckets(df, cols, start, end,
+                                          config.INTRADAY_BUCKET_MINUTES)
     return daily, buckets, prov
 
 
@@ -176,10 +227,44 @@ def main() -> None:
     if not symbols:
         raise SystemExit("nothing in the store — run scalp.fetch first")
 
+    with_intraday = not args.no_intraday
+
     if not args.do_print:
         db.init_schema()
 
-    units = [(symbol, day) for day in days for symbol in symbols
+        # Daily partitions have to exist before the first INSERT routes to
+        # them. Cheap and idempotent, so created up front for every day in
+        # range rather than lazily per write.
+        if with_intraday:
+            for day in days:
+                db.ensure_intraday_partition(day)
+
+        # THE RIGHT FILESYSTEM. Postgres lives on the root disk; the parquet
+        # store is on block 3. config.free_space_gb() defaults to the data
+        # dir, so a check using it would have passed while root filled to
+        # 100% — which is what happened. db.postgres_free_space_gb() asks the
+        # server for its own data directory instead, so it cannot drift.
+        free = db.postgres_free_space_gb()
+        projected = config.projected_intraday_write_gb(
+            len(symbols), len(days), replace=args.replace)
+        if free is not None:
+            print(f"postgres data dir : {db.postgres_data_directory()}")
+            print(f"free there        : {free:.2f} GB")
+            print(f"projected write   : {projected:.3f} GB"
+                  f"{'  (x2 transient for --replace)' if args.replace else ''}")
+            if projected + config.PG_FREE_SPACE_MARGIN_GB > free:
+                raise SystemExit(
+                    f"\nREFUSING TO START: projected {projected:.2f} GB plus a "
+                    f"{config.PG_FREE_SPACE_MARGIN_GB:.1f} GB margin exceeds "
+                    f"the {free:.2f} GB free on the Postgres filesystem.\n"
+                    f"Run `python -m scalp.prune --intraday` to drop partitions "
+                    f"past retention, or narrow the date range."
+                )
+        else:
+            log.warning("could not read free space for the Postgres data "
+                        "directory (remote server?) — skipping the disk check")
+
+    units = [(symbol, day, with_intraday) for day in days for symbol in symbols
              if store.has_day(symbol, day)]
     skipped = len(days) * len(symbols) - len(units)
     if not units:
@@ -196,6 +281,8 @@ def main() -> None:
     rows_written = 0
     computed = failed = 0
     printed: list[dict] = []
+    months_touched: set[date] = set()
+    days_written: set[date] = set()
     t0 = time.monotonic()
 
     def handle(symbol: str, day: date, payload) -> None:
@@ -223,8 +310,10 @@ def main() -> None:
             db.delete_symbol_day(day, symbol)
         rows_written += db.write_daily_metrics(day, symbol, daily)
         rows_written += db.write_provenance(day, symbol, prov)
-        if not args.no_intraday:
+        if with_intraday:
             rows_written += db.write_intraday_metrics(day, symbol, buckets)
+            months_touched.add(db.month_start(day))
+        days_written.add(day)
 
     def progress(done: int) -> None:
         if done % 25 and done != len(units):
@@ -236,17 +325,18 @@ def main() -> None:
                  (len(units) - done) / max(rate, 1e-9), failed)
 
     if workers <= 1:
-        for i, (symbol, day) in enumerate(units, 1):
-            handle(symbol, day, _compute_unit((symbol, day)))
+        for i, unit in enumerate(units, 1):
+            handle(unit[0], unit[1], _compute_unit(unit))
             progress(i)
     else:
         # Metric computation is CPU-bound, so this is processes rather than
         # threads — the GIL would serialise a thread pool exactly where the
         # time is being spent.
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_worker_init) as pool:
             futures = {pool.submit(_compute_unit, u): u for u in units}
             for i, fut in enumerate(as_completed(futures), 1):
-                symbol, day = futures[fut]
+                symbol, day = futures[fut][0], futures[fut][1]
                 try:
                     payload = fut.result()
                 except Exception as exc:          # worker died outright
@@ -258,6 +348,45 @@ def main() -> None:
     log.info("%d computed, %d skipped, %d failed in %.1f min (%.2f s/symbol-day)",
              computed, skipped, failed, elapsed / 60,
              elapsed / max(computed, 1))
+
+    # --- monthly rollup -----------------------------------------------------
+    # Written on every run, from day one. This is the ONLY irreversible
+    # decision in the intraday design: intraday_metrics is kept 14 days, so a
+    # month not aggregated while its raw parquet is still inside
+    # RAW_RETENTION_DAYS can never be reconstructed. Added a year from now it
+    # would start empty.
+    if months_touched and not args.do_print:
+        for month in sorted(months_touched):
+            n = db.upsert_intraday_monthly(month, month)
+            log.info("intraday_monthly %s: %d (symbol, bucket) row(s)",
+                     month, n)
+
+    # --- vacuum after --replace ---------------------------------------------
+    # PLAIN VACUUM, never FULL. A --replace writes the new tuples before the
+    # old ones are reclaimable, so the day's partition carries roughly twice
+    # its own size in dead tuples afterwards. Plain VACUUM marks that space
+    # reusable in place and needs no extra room; FULL rewrites the table and
+    # needs free space equal to it, which is exactly what was unavailable when
+    # the disk filled.
+    if args.replace and days_written and not args.do_print:
+        for day in sorted(days_written):
+            name = db.partition_name(day)
+            try:
+                db.vacuum(name)
+            except Exception as exc:
+                log.warning("VACUUM %s failed: %s", name, exc)
+                continue
+            stats = db.table_stats(name)
+            if stats:
+                log.info("%s: %s live, %s dead, last_autovacuum=%s",
+                         name, stats.get("n_live_tup"), stats.get("n_dead_tup"),
+                         stats.get("last_autovacuum"))
+        db.vacuum("daily_metrics")
+        stats = db.table_stats("daily_metrics")
+        if stats:
+            log.info("daily_metrics: %s live, %s dead, last_autovacuum=%s",
+                     stats.get("n_live_tup"), stats.get("n_dead_tup"),
+                     stats.get("last_autovacuum"))
 
     if args.do_print and printed:
         frame = pd.DataFrame(printed)

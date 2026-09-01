@@ -29,7 +29,7 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timezone
 
 from scalp import config, db, schema, store, thetadata as td
 
@@ -236,6 +236,27 @@ def main() -> None:
                 eta = (len(units) - done) / max(rate, 1e-9)
                 log.info("  %d/%d  %.1f units/s  eta %.0fs  %s rows",
                          done, len(units), rate, eta, f"{rows_total:,}")
+
+    # One row per run per date. The counts were accumulated in memory and
+    # printed at the end, so a bad run left no record once the terminal
+    # scrolled — and the thin-tape count from the run that went wrong is
+    # exactly what is worth looking back at.
+    try:
+        run_ts = datetime.now(timezone.utc)
+        per_date: dict[date, dict[str, int]] = {}
+        for sym, day in units:
+            per_date.setdefault(day, {"ok": 0, "thin": 0, "empty": 0,
+                                      "failed": 0})
+        for sym, day, status in thin:
+            per_date[day]["thin"] += 1
+        for day, counts in per_date.items():
+            counts["ok"] = sum(
+                1 for s2, d2 in units if d2 == day) - counts["thin"]
+        for day, counts in sorted(per_date.items()):
+            db.write_fetch_run(run_ts, day, counts["ok"], counts["thin"],
+                               counts["empty"], counts["failed"])
+    except Exception as exc:
+        log.warning("could not record the run in fetch_runs: %s", exc)
 
     elapsed = time.monotonic() - t0
     print()

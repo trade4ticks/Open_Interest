@@ -848,6 +848,132 @@ QUOTE_LOOKBACK_DAYS = int(os.environ.get("SCALP_QUOTE_LOOKBACK_DAYS", "5"))
 # interval or compute-and-discard, NOT a smaller symbol list.
 
 
+# --- intraday storage --------------------------------------------------------
+#
+# WHY THIS IS A SUBSET, WIDE AND PARTITIONED. Eleven days of long-format
+# intraday at all 232 metrics produced 32 million rows and 5,995 MB — 96% of
+# the scalp database — against daily_metrics' 1.2M rows and 204 MB for the
+# same period. A year of nightly runs projected to ~750M rows and 130 GB on a
+# root disk that hit 100%, and VACUUM FULL could not recover the dead tuples
+# because a rewrite needs free space equal to the table.
+#
+# Three changes, each independent:
+#
+#   SUBSET   180 of the 232 metrics are the generated noise and ratio families
+#            (5 variants x 3 horizons x 6 statistics). Nothing reads most of
+#            them at bucket grain. 18 columns instead.
+#   WIDE     587 symbols x 26 buckets = 15,262 rows/day instead of 3.5M. Date,
+#            symbol and bucket are paid once per bucket, not once per metric.
+#   DAILY    PARTITION BY RANGE (trade_date), one partition per day. Retention
+#   PARTS    becomes DROP TABLE: instant, space returned to the OS, no dead
+#            tuples. It also gives a lever under disk pressure — individual
+#            days can be shed without dropping a month.
+#
+# daily_metrics stays LONG. Both of db.py's reasons for long format hold
+# there and fail here: the daily metric set is genuinely unsettled, while the
+# intraday set is whatever the built views read; and daily is the retained
+# history, while intraday is 14 days and rebuildable from parquet, so a schema
+# change here is a drop-and-rebuild rather than a migration.
+
+# --- the pinned noise definition ---------------------------------------------
+# Calibration against realised results: the top six correlations were all
+# `rms`, and the five variants landed within 0.017 of each other. So the
+# STATISTIC carries the signal and the variant barely matters.
+#
+# The pin appears in the COLUMN NAMES deliberately. An unqualified `noise_bps`
+# would change meaning silently if the pin ever moved, and every month stored
+# before the change would be incomparable to every month after — with nothing
+# in the data to show it. Full names force a rebuild instead, which is free
+# for intraday (14 days, rebuildable) and is NOT free for the monthly rollup,
+# which is kept indefinitely.
+INTRADAY_NOISE_VARIANT   = os.environ.get("SCALP_INTRADAY_NOISE_VARIANT", "tw_mid")
+INTRADAY_NOISE_HORIZON   = int(os.environ.get("SCALP_INTRADAY_NOISE_HORIZON", "5"))
+INTRADAY_NOISE_STATISTIC = os.environ.get("SCALP_INTRADAY_NOISE_STATISTIC", "rms")
+
+_V = INTRADAY_NOISE_VARIANT
+_H = INTRADAY_NOISE_HORIZON
+_S = INTRADAY_NOISE_STATISTIC
+
+INTRADAY_NOISE_COLUMN    = f"noise_bps_{_V}_{_H}s_{_S}"
+INTRADAY_RATIO_COLUMN    = f"ratio_{_V}_{_H}s_{_S}"
+INTRADAY_MOVE_RATE_COLUMN = f"move_rate_{_V}_{_H}s"
+INTRADAY_MOVE_BPS_COLUMN  = f"move_bps_{_V}_{_H}s"
+INTRADAY_COVERAGE_COLUMN  = f"quote_bucket_coverage_{_H}s"
+
+# --- the stored columns ------------------------------------------------------
+# (column name, SQL type). The column name IS the metrics-dict key, so the
+# writer is a lookup rather than a mapping table that can drift.
+#
+# `trades` is LOAD-BEARING, not bookkeeping. The monthly rollup averages
+# at_bid_share, two_sided_balance and odd_lot_share across ~21 sessions, and
+# an unweighted mean of ratios is wrong: a bucket with 4 trades would count
+# as much as one with 400. That error lands hardest in exactly the sleepy
+# midday buckets the rollup exists to measure.
+INTRADAY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("rows_raw",              "INTEGER"),
+    ("trades",                "INTEGER"),
+    ("trades_per_min",        "DOUBLE PRECISION"),
+    ("shares_per_min",        "DOUBLE PRECISION"),
+    ("trade_size_median",     "DOUBLE PRECISION"),
+    ("odd_lot_share",         "DOUBLE PRECISION"),
+    ("at_bid_share",          "DOUBLE PRECISION"),
+    ("at_ask_share",          "DOUBLE PRECISION"),
+    ("between_share",         "DOUBLE PRECISION"),
+    ("two_sided_balance",     "DOUBLE PRECISION"),
+    ("off_mid_bps",           "DOUBLE PRECISION"),
+    ("spread_cents_tw",       "DOUBLE PRECISION"),
+    ("spread_bps_tw",         "DOUBLE PRECISION"),
+    (INTRADAY_NOISE_COLUMN,     "DOUBLE PRECISION"),
+    (INTRADAY_RATIO_COLUMN,     "DOUBLE PRECISION"),
+    (INTRADAY_MOVE_RATE_COLUMN, "DOUBLE PRECISION"),
+    (INTRADAY_MOVE_BPS_COLUMN,  "DOUBLE PRECISION"),
+    (INTRADAY_COVERAGE_COLUMN,  "DOUBLE PRECISION"),
+)
+
+INTRADAY_METRIC_KEYS = tuple(name for name, _ in INTRADAY_COLUMNS)
+
+# Ratio columns need trade-weighting when rolled up to a month; counts and
+# rates are summed or averaged plainly. Anything not listed here is averaged
+# unweighted, which is correct only for a rate.
+INTRADAY_TRADE_WEIGHTED = frozenset({
+    "odd_lot_share", "at_bid_share", "at_ask_share", "between_share",
+    "two_sided_balance", "off_mid_bps", "trade_size_median",
+})
+
+# --- retention ---------------------------------------------------------------
+# 14 days. The repeatability heatmap wants 10-15 sessions, the session profile
+# averages across the window and 60 days would blur regime changes, and the
+# "vs normal" baseline uses 10 sessions. 14 sits well inside
+# RAW_RETENTION_DAYS (45), so intraday is always rebuildable from parquet.
+INTRADAY_RETENTION_DAYS = int(os.environ.get("SCALP_INTRADAY_RETENTION_DAYS", "14"))
+
+# Measured on the wide schema. Recorded rather than re-derived, the way
+# QUOTE_MB_PER_SYMBOL_DAY_MEASURED is.
+#
+# A --replace run writes the new tuples BEFORE the old ones become
+# reclaimable, so the transient requirement is roughly TWICE the day's write.
+# The estimator below accounts for that; do not remove the factor.
+INTRADAY_MB_PER_SYMBOL_DAY = float(
+    os.environ.get("SCALP_INTRADAY_MB_PER_SYMBOL_DAY", "0.0053"))
+INTRADAY_REPLACE_TRANSIENT_FACTOR = 2.0
+
+
+def projected_intraday_write_gb(n_symbols: int, n_days: int,
+                                replace: bool = False) -> float:
+    mb = n_symbols * n_days * INTRADAY_MB_PER_SYMBOL_DAY
+    if replace:
+        mb *= INTRADAY_REPLACE_TRANSIENT_FACTOR
+    return mb / 1024
+
+
+# Postgres lives on the ROOT disk, not the block-3 volume the parquet store
+# uses. A free-space check that defaulted to config.data_dir() would pass
+# while root filled — which is what happened. db.postgres_free_space_gb()
+# asks the server for its own data directory instead.
+PG_FREE_SPACE_MARGIN_GB = float(
+    os.environ.get("SCALP_PG_FREE_SPACE_MARGIN_GB", "5.0"))
+
+
 # --- filters: READ TIME ONLY -------------------------------------------------
 #
 # THE PIPELINE DOES NOT FILTER. compute.py writes a metrics row for every

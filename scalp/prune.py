@@ -2,6 +2,8 @@
 
     python -m scalp.prune                          # report only, deletes nothing
     python -m scalp.prune --older-than 45 --delete # actually delete
+    python -m scalp.prune --intraday               # intraday partitions, dry run
+    python -m scalp.prune --intraday --delete      # drop them
 
 NOTHING ELSE IN THIS PIPELINE DELETES ANYTHING. fetch.py refuses to start when
 a write will not fit, but it will never free space to make room. An automatic
@@ -32,8 +34,69 @@ from datetime import date, timedelta
 from scalp import config, store
 
 
+def prune_intraday(args) -> None:
+    """Drop intraday partitions past retention.
+
+    DROP TABLE, not DELETE. It returns the space to the OS immediately and
+    leaves no dead tuples — which is the whole reason intraday is partitioned
+    by day. VACUUM FULL could not run when the root disk hit 100%, because a
+    rewrite needs free space equal to the table.
+
+    Also drops individual days on demand, which is the lever monthly
+    partitioning would not have given: under pressure you can shed the oldest
+    days without touching the rest.
+    """
+    from scalp import db
+
+    cutoff = (date.fromisoformat(args.intraday_before) if args.intraday_before
+              else date.today() - timedelta(days=config.INTRADAY_RETENTION_DAYS))
+
+    existing = db.intraday_partitions()
+    doomed = [(name, day) for name, day in existing if day < cutoff]
+
+    print()
+    print(f"intraday retention : {config.INTRADAY_RETENTION_DAYS} days")
+    print(f"cutoff             : keep {cutoff} and later")
+    print(f"partitions present : {len(existing)}")
+    if existing:
+        print(f"date range         : {existing[0][1]} .. {existing[-1][1]}")
+    print(f"would drop         : {len(doomed)}")
+    for name, day in doomed:
+        print(f"    {name}  ({day})")
+
+    free = db.postgres_free_space_gb()
+    if free is not None:
+        print(f"free on the PG disk: {free:.2f} GB")
+
+    if not doomed:
+        print()
+        print("Nothing past retention. No action.")
+        return
+    if not args.delete:
+        print()
+        print("DRY RUN — nothing dropped. Re-run with --delete.")
+        print("Intraday is rebuildable from parquet inside RAW_RETENTION_DAYS")
+        print(f"({config.RAW_RETENTION_DAYS} days), so this costs a recompute,")
+        print("not data — EXCEPT that intraday_monthly can only be built from")
+        print("days still present. Confirm the rollup covers these months.")
+        return
+
+    dropped = db.drop_intraday_partitions_before(cutoff)
+    freed = sum(size for _, _, size in dropped)
+    print()
+    print(f"dropped {len(dropped)} partition(s), freed "
+          f"{freed / 1024**2:.1f} MB")
+    after = db.postgres_free_space_gb()
+    if after is not None:
+        print(f"free on the PG disk now: {after:.2f} GB")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--intraday", action="store_true",
+                    help="prune intraday_metrics partitions instead of parquet")
+    ap.add_argument("--intraday-before", default=None,
+                    help="absolute cutoff for --intraday (YYYY-MM-DD)")
     ap.add_argument("--older-than", type=int, default=config.RAW_RETENTION_DAYS,
                     help=f"days to keep (default {config.RAW_RETENTION_DAYS})")
     ap.add_argument("--before", default=None,
@@ -42,6 +105,10 @@ def main() -> None:
     ap.add_argument("--delete", action="store_true",
                     help="actually delete. Without this, nothing is removed.")
     args = ap.parse_args()
+
+    if args.intraday:
+        prune_intraday(args)
+        return
 
     root = config.data_dir()
     cutoff = (date.fromisoformat(args.before) if args.before

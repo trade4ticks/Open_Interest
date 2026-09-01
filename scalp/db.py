@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import psycopg2
+import psycopg2.extensions
 import psycopg2.extras
 
 from scalp import config
@@ -141,14 +142,18 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
 CREATE INDEX IF NOT EXISTS daily_metrics_metric_idx
     ON daily_metrics (metric, trade_date);
 
-CREATE TABLE IF NOT EXISTS intraday_metrics (
-    trade_date      DATE        NOT NULL,
-    symbol          TEXT        NOT NULL,
-    bucket_start    TIMESTAMP   NOT NULL,
-    metric          TEXT        NOT NULL,
-    value           DOUBLE PRECISION,
-    PRIMARY KEY (trade_date, symbol, bucket_start, metric)
-);
+-- intraday_metrics is WIDE and PARTITIONED BY DAY. See config.py for the
+-- full reasoning; the short version is that the long format produced 32M rows
+-- and 5,995 MB over eleven days, 96% of the database, on a root disk that
+-- then hit 100%. Wide plus an 18-metric subset is 15,262 rows/day and ~3 MB.
+--
+-- Daily partitions rather than monthly: retention becomes DROP TABLE, which
+-- returns space to the OS instantly and leaves no dead tuples, and individual
+-- days can be shed under disk pressure. Monthly would have retained up to 44
+-- days against a 14-day policy and offered no lever mid-month.
+--
+-- The columns are generated from config.INTRADAY_COLUMNS so the pinned noise
+-- definition cannot drift between the schema and the writer.
 
 -- What was dropped, by what rule, getting from raw tape to each metrics row.
 -- Condition-code exclusions, auction-edge trimming, crossed/locked quotes and
@@ -181,9 +186,135 @@ CREATE INDEX IF NOT EXISTS rankings_date_idx ON rankings (trade_date, variant);
 """
 
 
+def _intraday_column_ddl() -> str:
+    return ",\n".join(f"    {name:<28s} {sql_type}"
+                       for name, sql_type in config.INTRADAY_COLUMNS)
+
+
+def intraday_ddl() -> str:
+    """CREATE TABLE for the partitioned parent, built from the config column set."""
+    return f"""
+CREATE TABLE IF NOT EXISTS intraday_metrics (
+    trade_date   DATE      NOT NULL,
+    symbol       TEXT      NOT NULL,
+    bucket_start TIMESTAMP NOT NULL,
+    bucket_time  TIME      NOT NULL,
+{_intraday_column_ddl()},
+    PRIMARY KEY (trade_date, symbol, bucket_start)
+) PARTITION BY RANGE (trade_date);
+"""
+
+
+def intraday_monthly_ddl() -> str:
+    """The rollup. Same metric subset, one row per (symbol, clock bucket, month).
+
+    ~587 x 26 x 12 = 183k rows a year, tens of MB, KEPT INDEFINITELY.
+
+    This is the only irreversible decision in the intraday design: a month not
+    aggregated while its raw parquet is still inside RAW_RETENTION_DAYS can
+    never be reconstructed. Written from day one for that reason.
+
+    `sessions` records how many trading days contributed, so a partial month
+    reads as partial rather than looking like a quiet one. A month with 3
+    sessions and a month with 21 must not be presented alike.
+    """
+    return f"""
+CREATE TABLE IF NOT EXISTS intraday_monthly (
+    month        DATE   NOT NULL,
+    symbol       TEXT   NOT NULL,
+    bucket_time  TIME   NOT NULL,
+    sessions     INTEGER NOT NULL,
+    trades_total BIGINT  NOT NULL,
+{_intraday_column_ddl()},
+    PRIMARY KEY (month, symbol, bucket_time)
+);
+CREATE INDEX IF NOT EXISTS intraday_monthly_symbol_idx
+    ON intraday_monthly (symbol, bucket_time, month);
+"""
+
+
+FETCH_RUNS_DDL = """
+-- One row per fetch run per date. fetch.py accumulated thin/empty/failed
+-- counts in memory and printed them at the end, so a bad run left no record
+-- once the terminal scrolled.
+--
+-- Keyed on run_ts as well as trade_date so a re-fetch APPENDS rather than
+-- overwriting the first attempt — the thin-tape count from the run that went
+-- wrong is exactly the thing worth looking back at.
+CREATE TABLE IF NOT EXISTS fetch_runs (
+    run_ts     TIMESTAMPTZ NOT NULL,
+    trade_date DATE        NOT NULL,
+    ok         INTEGER     NOT NULL DEFAULT 0,
+    thin       INTEGER     NOT NULL DEFAULT 0,
+    empty      INTEGER     NOT NULL DEFAULT 0,
+    failed     INTEGER     NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_ts, trade_date)
+);
+CREATE INDEX IF NOT EXISTS fetch_runs_date_idx ON fetch_runs (trade_date);
+"""
+
+
+def partition_name(day: date) -> str:
+    return f"intraday_metrics_{day.strftime('%Y%m%d')}"
+
+
+def ensure_intraday_partition(day: date) -> str:
+    """Create the partition for one day if it does not exist. Idempotent."""
+    name = partition_name(day)
+    sql = (f"CREATE TABLE IF NOT EXISTS {name} PARTITION OF intraday_metrics "
+           f"FOR VALUES FROM (%s) TO (%s)")
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, (day, day + timedelta(days=1)))
+    return name
+
+
+def intraday_partitions() -> list[tuple[str, date]]:
+    """Existing partitions as (table name, the day it holds), oldest first."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.relname
+              FROM pg_class c
+              JOIN pg_inherits i ON i.inhrelid = c.oid
+              JOIN pg_class p ON p.oid = i.inhparent
+             WHERE p.relname = 'intraday_metrics'
+             ORDER BY c.relname
+        """)
+        names = [r[0] for r in cur.fetchall()]
+    out = []
+    for name in names:
+        stamp = name.rsplit("_", 1)[-1]
+        try:
+            out.append((name, datetime.strptime(stamp, "%Y%m%d").date()))
+        except ValueError:
+            continue
+    return sorted(out, key=lambda x: x[1])
+
+
+def drop_intraday_partitions_before(cutoff: date) -> list[tuple[str, date, int]]:
+    """DROP every partition holding a day before `cutoff`.
+
+    Returns (name, day, bytes) for each. DROP TABLE returns the space to the
+    OS immediately and leaves no dead tuples — which is the whole reason for
+    partitioning, since VACUUM FULL could not run when the disk was full.
+    """
+    dropped = []
+    for name, day in intraday_partitions():
+        if day >= cutoff:
+            continue
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_total_relation_size(%s)", (name,))
+            size = int(cur.fetchone()[0] or 0)
+            cur.execute(f"DROP TABLE IF EXISTS {name}")
+        dropped.append((name, day, size))
+    return dropped
+
+
 def init_schema() -> None:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(SCHEMA_SQL)
+        cur.execute(intraday_ddl())
+        cur.execute(intraday_monthly_ddl())
+        cur.execute(FETCH_RUNS_DDL)
     log.info("schema ensured on %s/%s", config.PG_HOST, config.PG_DB)
 
 
@@ -248,17 +379,217 @@ def provenance_wide(trade_date: date) -> pd.DataFrame:
 
 def write_intraday_metrics(trade_date: date, symbol: str,
                            buckets: list[dict]) -> int:
+    """One WIDE row per bucket. Assumes the day's partition exists.
+
+    Only config.INTRADAY_METRIC_KEYS are stored — 18 of the 232 a bucket
+    carries. The rest are not read at bucket grain and cost 96% of the
+    database; see config.py.
+    """
+    if not buckets:
+        return 0
+    keys = config.INTRADAY_METRIC_KEYS
     rows = []
     for b in buckets:
         start = b.get("window_start")
         if start is None:
             continue
-        for k, v in b.items():
-            if _storable(v):
-                rows.append((trade_date, symbol.upper(),
-                             pd.Timestamp(start).to_pydatetime(), k, _num(v)))
-    return _upsert_long("intraday_metrics",
-                        ["trade_date", "symbol", "bucket_start", "metric"], rows)
+        stamp = pd.Timestamp(start).to_pydatetime()
+        rows.append((trade_date, symbol.upper(), stamp, stamp.time(),
+                     *(_num_or_none(b.get(k)) for k in keys)))
+    if not rows:
+        return 0
+
+    cols = ", ".join(("trade_date", "symbol", "bucket_start", "bucket_time",
+                      *keys))
+    updates = ", ".join(f"{k} = EXCLUDED.{k}" for k in keys)
+    sql = (f"INSERT INTO intraday_metrics ({cols}) VALUES %s "
+           f"ON CONFLICT (trade_date, symbol, bucket_start) DO UPDATE SET "
+           f"bucket_time = EXCLUDED.bucket_time, {updates}")
+    with connect() as conn, conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
+    return len(rows)
+
+
+def _num_or_none(v):
+    """Numeric for storage, or None. Booleans become 1/0, NaN becomes NULL."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return None if pd.isna(f) else f
+
+
+def upsert_intraday_monthly(month: date, trade_date: date) -> int:
+    """Recompute one month's rollup from the intraday rows currently stored.
+
+    RATIOS ARE TRADE-WEIGHTED. Averaging at_bid_share or two_sided_balance
+    unweighted across ~21 sessions would let a bucket with 4 trades count as
+    much as one with 400, and that error lands hardest in exactly the sleepy
+    midday buckets the rollup exists to measure. config.INTRADAY_TRADE_WEIGHTED
+    names the columns that need it; rates and counts are summed or averaged
+    plainly.
+
+    Recomputed rather than incremented, so a --replace of one day produces a
+    correct month rather than one that drifts. It only sees days still inside
+    INTRADAY_RETENTION_DAYS — which is why this must run from day one. A month
+    whose raw parquet has aged past RAW_RETENTION_DAYS can never be rebuilt.
+    """
+    weighted = config.INTRADAY_TRADE_WEIGHTED
+    parts = []
+    for key in config.INTRADAY_METRIC_KEYS:
+        if key in ("rows_raw", "trades"):
+            parts.append(f"SUM({key})::double precision AS {key}")
+        elif key in weighted:
+            # NULLIF guards a bucket with no trades: it contributes nothing
+            # rather than turning the whole average into NULL.
+            parts.append(
+                f"CASE WHEN SUM(CASE WHEN {key} IS NULL THEN 0 ELSE trades END) > 0 "
+                f"THEN SUM({key} * trades) / SUM(CASE WHEN {key} IS NULL "
+                f"THEN 0 ELSE trades END) ELSE NULL END AS {key}")
+        else:
+            parts.append(f"AVG({key}) AS {key}")
+
+    cols = ", ".join(config.INTRADAY_METRIC_KEYS)
+    updates = ", ".join(f"{k} = EXCLUDED.{k}"
+                        for k in config.INTRADAY_METRIC_KEYS)
+    sql = f"""
+        INSERT INTO intraday_monthly
+            (month, symbol, bucket_time, sessions, trades_total, {cols})
+        SELECT
+            %s::date                              AS month,
+            symbol,
+            bucket_time,
+            COUNT(DISTINCT trade_date)            AS sessions,
+            COALESCE(SUM(trades), 0)::bigint      AS trades_total,
+            {', '.join(parts)}
+        FROM intraday_metrics
+        WHERE trade_date >= %s::date
+          AND trade_date <  (%s::date + INTERVAL '1 month')
+        GROUP BY symbol, bucket_time
+        ON CONFLICT (month, symbol, bucket_time) DO UPDATE SET
+            sessions = EXCLUDED.sessions,
+            trades_total = EXCLUDED.trades_total,
+            {updates}
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, (month, month, month))
+        return cur.rowcount
+
+
+def month_start(day: date) -> date:
+    return day.replace(day=1)
+
+
+# --- fetch_runs --------------------------------------------------------------
+
+def write_fetch_run(run_ts, trade_date: date, ok: int, thin: int,
+                    empty: int, failed: int) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fetch_runs (run_ts, trade_date, ok, thin, empty, failed)"
+            " VALUES (%s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (run_ts, trade_date) DO UPDATE SET"
+            " ok = EXCLUDED.ok, thin = EXCLUDED.thin,"
+            " empty = EXCLUDED.empty, failed = EXCLUDED.failed",
+            (run_ts, trade_date, ok, thin, empty, failed))
+
+
+def fetch_run_history(limit: int = 50) -> pd.DataFrame:
+    return read_sql(
+        "SELECT run_ts, trade_date, ok, thin, empty, failed FROM fetch_runs"
+        " ORDER BY run_ts DESC, trade_date DESC LIMIT %s", (limit,))
+
+
+# --- maintenance -------------------------------------------------------------
+
+@contextmanager
+def connect_autocommit():
+    """VACUUM cannot run inside a transaction block."""
+    with connect() as conn:
+        old_level = conn.isolation_level
+        conn.set_isolation_level(
+            psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        try:
+            yield conn
+        finally:
+            conn.set_isolation_level(old_level)
+
+
+def vacuum(table: str) -> None:
+    """Plain VACUUM. NEVER FULL.
+
+    FULL rewrites the table and needs free space equal to it, which is exactly
+    what was unavailable when the root disk hit 100% — the dead tuples could
+    not be reclaimed by the one command that would have reclaimed them. Plain
+    VACUUM marks space reusable in place, needs no extra room, and is enough
+    after a --replace that touched a single day's partition.
+    """
+    with connect_autocommit() as conn, conn.cursor() as cur:
+        cur.execute(f"VACUUM {table}")
+
+
+def table_stats(table: str) -> dict:
+    """Dead-tuple and autovacuum state, for reporting after a --replace."""
+    df = read_sql(
+        "SELECT relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum,"
+        " last_analyze, last_autoanalyze"
+        " FROM pg_stat_user_tables WHERE relname = %s", (table,))
+    return {} if df.empty else df.iloc[0].to_dict()
+
+
+def postgres_data_directory() -> str:
+    """Where the server actually keeps its files.
+
+    Asked of the server rather than read from config. Postgres lives on the
+    ROOT disk while the parquet store is on block 3, so a free-space check
+    against config.data_dir() passes while root fills — which is what
+    happened. A configurable path could drift again; this cannot.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SHOW data_directory")
+        return cur.fetchone()[0]
+
+
+def postgres_free_space_gb() -> float | None:
+    """Free space on the filesystem holding the Postgres data directory.
+
+    Returns None when the server is not local — the path it reports is then
+    meaningless here, and a number derived from the wrong filesystem is worse
+    than no number.
+    """
+    import shutil
+    from pathlib import Path
+
+    if config.PG_HOST not in ("localhost", "127.0.0.1", "::1", ""):
+        return None
+    try:
+        path = Path(postgres_data_directory())
+    except Exception:
+        return None
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError:
+        return None
+
+
+def database_size_report() -> pd.DataFrame:
+    """Every table with its size, largest first."""
+    return read_sql("""
+        SELECT relname AS table_name,
+               pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
+               pg_total_relation_size(c.oid) AS bytes,
+               n_live_tup AS live_rows, n_dead_tup AS dead_rows
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+         ORDER BY pg_total_relation_size(c.oid) DESC
+    """)
 
 
 def _storable(v) -> bool:

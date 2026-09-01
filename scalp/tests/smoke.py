@@ -404,6 +404,21 @@ def tier_metrics() -> int:
     return failures
 
 
+def tier_reaping() -> int:
+    """Workers must die with a -9'd parent. Linux only; skips elsewhere."""
+    rule("5. worker reaping under kill -9")
+    proc = subprocess.run(
+        [sys.executable, "-m", "scalp.tests.test_worker_reaping"],
+        capture_output=True, text=True, timeout=180)
+    for line in (proc.stdout or "").strip().splitlines():
+        print(f"  {line}")
+    if proc.returncode != 0:
+        for line in (proc.stderr or "").strip().splitlines()[-4:]:
+            print(f"  {line}")
+        return 1
+    return 0
+
+
 def main() -> None:
     failures = tier_references()
 
@@ -420,6 +435,7 @@ def main() -> None:
     failures += tier_help()
     failures += tier_metrics()
     failures += tier_sparse_noise()
+    failures += tier_reaping()
 
     print()
     if failures:
