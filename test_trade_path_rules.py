@@ -14,8 +14,9 @@ import sys
 import numpy as np
 
 from lib.trade_path_rules import (
-    BY_KEY, NEVER, REGISTRY, HORIZON_RULE_KEY, build_combine_sql,
-    CombineError, evaluate,
+    BY_KEY, MAX_HORIZON_SESSIONS, NEVER, REGISTRY, HORIZON_RULE_KEY,
+    build_combine_sql, CombineError, compute_features, evaluate,
+    _rule_atr_trail, _rule_trail,
 )
 
 PASS, FAIL = [], []
@@ -39,7 +40,9 @@ def mkpath(bars, n_sessions=1, bars_per_session=None):
         "close": a[:, 3][None, :].copy(),
     }
     bps = bars_per_session or B
-    sess_end = np.full((1, 20), -1, dtype=np.int64)
+    # Sized from the horizon, not a literal 20: max_days__40 indexes column 39
+    # and would raise on a fixed-width 20 here.
+    sess_end = np.full((1, MAX_HORIZON_SESSIONS), -1, dtype=np.int64)
     for k in range(n_sessions):
         sess_end[0, k] = min((k + 1) * bps - 1, B - 1)
     ctx = {
@@ -50,8 +53,8 @@ def mkpath(bars, n_sessions=1, bars_per_session=None):
         "swing_low_5": np.array([95.0]),
         "session_end_idx": sess_end,
         "path_len": np.array([B]),
-        "_ma_below_10": np.zeros((1, 20), dtype=bool),
-        "_ma_below_20": np.zeros((1, 20), dtype=bool),
+        "_ma_below_10": np.zeros((1, MAX_HORIZON_SESSIONS), dtype=bool),
+        "_ma_below_20": np.zeros((1, MAX_HORIZON_SESSIONS), dtype=bool),
     }
     return path, ctx
 
@@ -232,22 +235,37 @@ i_tgt = sql3.index("xb_fixed_target__3 = w.exit_bar")
 check("stop precedes target in tie-break", i_stop < i_tgt, True)
 
 print("\n=== 12. registry shape ===")
-check("rule count", len(REGISTRY), 59)
-check("column count (2 per rule)", len(REGISTRY) * 2, 118)
-check("all keys unique", len({r.key for r in REGISTRY}), 59)
+check("rule count", len(REGISTRY), 143)
+check("column count (2 per rule)", len(REGISTRY) * 2, 286)
+check("all keys unique", len({r.key for r in REGISTRY}), 143)
+_toolong = [r.ret_col for r in REGISTRY if len(r.ret_col) > 63]
+check("every column name inside Postgres's 63-char limit", _toolong, [])
+check("longest column name", max(len(r.ret_col) for r in REGISTRY) <= 63, True)
+# Percent and ATR parameters must stay distinguishable by NAME -- the unit is
+# inferred from it downstream, so an ATR multiple in a field called
+# `activation` would render as a percent.
+_mixed = [r.key for r in REGISTRY
+          if "activation" in r.params and r.family.startswith("atr_")]
+check("no ATR family uses the percent `activation` name", _mixed, [])
 bad = [r.key for r in REGISTRY if not r.key.replace("_", "").replace("p", "").isalnum()]
 check("all keys SQL-safe", bad, [])
 
-print("\n=== 13. per-horizon resolution == path_status, on the build itself ===")
-# The combine filter moved off the global path_status flag onto the horizon
-# rule's own exit_bar. That is only safe if the two agree TODAY, so this runs
-# the real build_ticker over synthetic bars and compares them row by row --
-# rather than re-deriving the build's arithmetic here, which would just be a
-# restatement of the code under test.
+print("\n=== 13. per-horizon resolution vs path_status, on the build itself ===")
+# When the catalog topped out at max_days__20 these two agreed exactly, and an
+# earlier revision of this test asserted that. They no longer agree, and the
+# divergence is the entire point of the change: path_status is stamped against
+# the BUILD WIDTH (now 40 sessions), so it marks the trailing 39 entries
+# unresolved for every policy alike, while each time rule's own exit_bar knows
+# only about the sessions that rule actually needs.
+#
+# So the equivalence now holds against the LONGEST rule -- the one whose
+# horizon equals the build width -- and every shorter rule resolves strictly
+# more entries. Both halves are asserted, because the first is what makes the
+# filter sound and the second is what makes it worth having.
 import pandas as pd
 import build_trade_paths as btp
 
-N_SESS, BARS_PER = 40, 4
+N_SESS, BARS_PER = MAX_HORIZON_SESSIONS + 20, 4
 _rows, _day = [], pd.Timestamp("2024-01-02 09:30")
 for si_ in range(N_SESS):
     base = 100.0 + si_ * 0.10          # drifts up; no stop or target is hit
@@ -268,24 +286,173 @@ try:
 finally:
     btp.load_bars = _orig_load
 
-_hcol = BY_KEY[HORIZON_RULE_KEY].bar_col
+_longest = max((r for r in REGISTRY if r.family == "max_days"),
+               key=lambda r: r.params["n"])
+check("longest rule equals the build width", _longest.params["n"],
+      btp.MAX_HORIZON_SESSIONS)
+
 _mismatch = [r["trade_date"] for r in _out
-             if (r["path_status"] == "ok") != (r[_hcol] is not None)]
-check("path_status == (horizon exit_bar IS NOT NULL), all rows", _mismatch, [])
+             if (r["path_status"] == "ok") != (r[_longest.bar_col] is not None)]
+check("path_status == (longest rule's exit_bar IS NOT NULL)", _mismatch, [])
 check("rows built", len(_out), N_SESS)
 
 _n_ok = sum(1 for r in _out if r["path_status"] == "ok")
-check("ok rows = sessions - (horizon - 1)", _n_ok,
+check("ok rows = sessions - (build width - 1)", _n_ok,
       N_SESS - (btp.MAX_HORIZON_SESSIONS - 1))
-check("horizon col non-null on exactly the ok rows",
-      sum(1 for r in _out if r[_hcol] is not None), _n_ok)
 
-# The payload of the change: a one-session rule resolves on every entry,
-# including the trailing ones the global flag marks truncated. This is what
-# stops a longer catalog horizon from shrinking short-horizon populations.
-_n_d1 = sum(1 for r in _out if r["xb_max_days__1"] is not None)
-check("max_days__1 resolves on every entry", _n_d1, N_SESS)
-check("...strictly more than the global flag allows", _n_d1 > _n_ok, True)
+# The payload: every shorter horizon resolves strictly more entries than the
+# global flag admits, which is what stops a longer catalog horizon from
+# shrinking the eligible population of a short policy.
+def _n_res(key):
+    return sum(1 for r in _out if r[BY_KEY[key].bar_col] is not None)
+
+check("max_days__20 resolves more than path_status admits",
+      _n_res("max_days__20"), N_SESS - 19)
+check("max_days__1 resolves every entry", _n_res("max_days__1"), N_SESS)
+check("...and all three are strictly ordered",
+      _n_res("max_days__1") > _n_res("max_days__20") > _n_ok, True)
+check("the trailing window the old global filter would have cost the 1-day "
+      "policy", _n_res("max_days__1") - _n_ok,
+      btp.MAX_HORIZON_SESSIONS - 1)
+
+print("\n=== 14. atr_trail: ATR distance and ATR arming, hand-checked ===")
+# entry 100, atr 2.0 (mkpath). k=1 -> the stop rests 2.0 below hwm_prev.
+#   bar  hwm_prev  level  low     fires?
+#   0    100       98     99.5    no
+#   1    101       99     100     no
+#   2    102       100    100.5   no
+#   3    103       101    99.8    YES -- opens at 102, so fills AT 101
+path, ctx = mkpath([
+    (100, 101, 99.5, 100.5),
+    (100.5, 102, 100, 101),
+    (101, 103, 100.5, 102),
+    (102, 102.5, 99.8, 100),
+])
+r = evaluate(path, ctx, [BY_KEY["atr_trail__1_act0"]])
+check("atr_trail k=1 trigger bar", int(r["atr_trail__1_act0"][0][0]), 3)
+check("atr_trail k=1 return (fill at level 101)",
+      float(r["atr_trail__1_act0"][1][0]), 0.01)
+
+# Same bars, armed at 2 ATRs = entry + 4 = 104. The high-water mark tops out
+# at 103, so the stop is never live and the dip below it is not an exit.
+path, ctx = mkpath([
+    (100, 101, 99.5, 100.5), (100.5, 102, 100, 101),
+    (101, 103, 100.5, 102), (102, 102.5, 99.8, 100),
+])
+r = evaluate(path, ctx, [BY_KEY["atr_trail__1_act2"]])
+check("atr_trail unarmed never fires", int(r["atr_trail__1_act2"][0][0]), NEVER)
+
+print("\n=== 15. the trail caches are namespaced by family ===")
+# trail=2.0 (percent) and atr_trail k=2.0 (ATR multiples) are different rules
+# that share a numeric level. On a bare cache key they would hand each other
+# the wrong crossing array and return entirely plausible numbers.
+#   bar  hwm_prev  trail@2%  atr@k=2 (-4)  low
+#   0    100       98        96            99.5   neither
+#   1    101       98.98     97            97.5   trail only
+#   2    101       98.98     97            96.0   atr
+BARS = [(100, 101, 99.5, 100.5), (100.5, 101, 97.5, 98), (98, 98.5, 96.0, 96.5)]
+p1, c1 = mkpath(list(BARS))
+solo_pct = evaluate(p1, c1, [BY_KEY["trail__2_act0"]])["trail__2_act0"]
+p2, c2 = mkpath(list(BARS))
+solo_atr = evaluate(p2, c2, [BY_KEY["atr_trail__2_act0"]])["atr_trail__2_act0"]
+p3, c3 = mkpath(list(BARS))
+both = evaluate(p3, c3, [BY_KEY["trail__2_act0"], BY_KEY["atr_trail__2_act0"]])
+
+check("percent trail alone fires bar 1", int(solo_pct[0][0]), 1)
+check("atr trail alone fires bar 2", int(solo_atr[0][0]), 2)
+check("percent trail unchanged when evaluated together",
+      int(both["trail__2_act0"][0][0]), int(solo_pct[0][0]))
+check("atr trail unchanged when evaluated together",
+      int(both["atr_trail__2_act0"][0][0]), int(solo_atr[0][0]))
+check("returns unchanged too (percent)",
+      float(both["trail__2_act0"][1][0]), float(solo_pct[1][0]))
+check("returns unchanged too (atr)",
+      float(both["atr_trail__2_act0"][1][0]), float(solo_atr[1][0]))
+# evaluate() shallow-copies ctx before adding _low/_close, so the cache it
+# fills is not the caller's dict. Drive the rule functions directly to inspect
+# the cache they actually share.
+p5, c5 = mkpath(list(BARS))
+c5["_low"], c5["_close"] = p5["low"], p5["close"]
+F5 = compute_features(p5, {"hwm_prev", "trail_abs"}, c5)
+_rule_trail(F5, c5, trail=2.0, activation=0.0)
+_rule_atr_trail(F5, c5, k=2.0, activation_atr=0.0)
+check("both cache entries coexist under one numeric level",
+      len(c5["_nxt"]), 2)
+check("cache keys are namespaced by family", sorted(c5["_nxt"]),
+      [("atr_trail", 2.0), ("trail", 2.0)])
+
+print("\n=== 16. crossing caches are int32, activation cached by value ===")
+check("cached crossing arrays are int32",
+      {str(v.dtype) for v in c5["_nxt"].values()}, {"int32"})
+check("int32 covers the widest supported path (extended hours)",
+      MAX_HORIZON_SESSIONS * 960 < np.iinfo(np.int32).max, True)
+check("SMALLINT does NOT cover it -- hence the build guard",
+      MAX_HORIZON_SESSIONS * 960 <= 32767, False)
+check("SMALLINT does cover the regular session at this horizon",
+      MAX_HORIZON_SESSIONS * 390 <= 32767, True)
+
+# Seven distinct activations across 56 trail rules must cost seven crossings.
+_acts = sorted({r.params["activation"] for r in REGISTRY
+                if r.family == "trail" and r.params["activation"] != 0})
+for _a in _acts:
+    _rule_trail(F5, c5, trail=2.0, activation=_a)
+check("activation cached by value, not per rule", len(c5["_act_pct"]), len(_acts))
+check("...covering every non-zero threshold", sorted(c5["_act_pct"]), _acts)
+
+print("\n=== 17. the backstop is a function of the SELECTION ===")
+sql, meta = build_combine_sql(["fixed_stop__1"])
+check("no time rule -> default backstop", meta["backstop_rule"], HORIZON_RULE_KEY)
+check("default backstop is 20 sessions", meta["backstop_sessions"], 20)
+
+sql, meta = build_combine_sql(["fixed_stop__1", "max_days__40"])
+check("longest selected horizon becomes the backstop",
+      meta["backstop_rule"], "max_days__40")
+check("...and nothing shorter is appended over it",
+      HORIZON_RULE_KEY in meta["rules"], False)
+check("...and the filter demands its 40 sessions",
+      "WHERE xb_max_days__40 IS NOT NULL" in sql, True)
+
+sql, meta = build_combine_sql(["max_days__1", "max_days__40"])
+check("SHORTEST selected horizon wins -- it is what fires first",
+      meta["backstop_rule"], "max_days__1")
+check("...so a 1-session policy needs only 1 session",
+      "WHERE xb_max_days__1 IS NOT NULL" in sql, True)
+
+sql, meta = build_combine_sql(["max_days__5"])
+check("a short horizon is its own backstop", meta["backstop_rule"], "max_days__5")
+check("no default appended over it", meta["horizon_auto_added"], False)
+
+print("\n=== 18. generated SQL compiles and every name resolves ===")
+# No Postgres here by design. sqlite3 is stdlib and will parse the CTE, the
+# CASE and the WHERE, and -- the part a regex could not do -- verify that
+# every column the outer SELECT references is actually projected by the CTE.
+# LEAST is spelled MIN in sqlite; that one substitution is the only dialect
+# concession, and it does not change the shape being checked.
+import sqlite3
+
+_cols = ["ticker TEXT", "trade_date TEXT", "entry_anchor TEXT",
+         "path_status TEXT"]
+for _r in REGISTRY:
+    _cols += [f"{_r.bar_col} INTEGER", f"{_r.ret_col} REAL"]
+_db = sqlite3.connect(":memory:")
+_db.execute(f"CREATE TABLE trade_paths ({', '.join(_cols)})")
+
+_sel = [r.key for r in REGISTRY]
+for _n, _rules in ((1, _sel[:1]), (2, _sel[:2]), (10, _sel[:10]),
+                   (len(_sel), _sel)):
+    _sql, _m = build_combine_sql(_rules)
+    try:
+        _db.execute("EXPLAIN " + _sql.replace("LEAST(", "MIN("))
+        _ok, _err = True, ""
+    except sqlite3.Error as e:
+        _ok, _err = False, str(e)
+    check(f"SQL compiles at {_n} rule(s){(' — ' + _err) if not _ok else ''}",
+          _ok, True)
+    check(f"...exactly one resolution filter at {_n}",
+          _sql.count("WHERE"), 1)
+    check(f"...LEAST covers every selected rule at {_n}",
+          _sql[_sql.index("LEAST("):].split(")")[0].count(",") + 1,
+          len(_m["rules"]))
 
 print(f"\n{'=' * 60}")
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}")

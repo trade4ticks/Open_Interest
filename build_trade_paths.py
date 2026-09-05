@@ -18,8 +18,12 @@ daily_features` and then that ticker's trade_dates, so daily_features is the
 spine here too. Building the universe from whatever happens to exist in
 equity_1min would silently drop rows out of heatmap cells.
 
-Entries with no minute data still get a row, with NULL exits and
-path_status = 'no_minute_data'. Visible, never dropped.
+A ticker with no minute data writes NO trade_paths rows at all -- it is
+recorded in trade_paths_manifest with status 'no_minute_data' and nothing
+else. The path_status column therefore only ever holds 'ok' or 'truncated'
+in practice, despite what the CHECK-free schema permits. If per-entry
+visibility is wanted, build_ticker is where the empty rows would be
+synthesised; it currently returns early instead.
 
 --- Price basis -------------------------------------------------------------
 
@@ -271,6 +275,21 @@ def build_ticker(conn, ticker: str, entries: pd.DataFrame, anchor: str,
         j = min(i + MAX_HORIZON_SESSIONS - 1, len(sess_dates) - 1)
         B = max(B, int(sess_last[j]) - int(sess_range[sess_dates[i]][0]) + 1)
     B = max(B, 1)
+
+    # exit_bar columns are SMALLINT (see lib/trade_path_schema.py). At the
+    # 40-session horizon a regular-session path is 15,600 bars, comfortably
+    # inside int2 -- but --session-filter all is ~960 bars a session, which
+    # reaches 38,400 and overflows it. That would surface hours into a rebuild
+    # as a COPY failure on whichever ticker first produced a late exit, so it
+    # is checked here, before any work, rather than discovered then.
+    if B > 32767:
+        raise ValueError(
+            f"{ticker}: path width {B} bars ({MAX_HORIZON_SESSIONS} sessions, "
+            f"session_filter={session_filter!r}) exceeds the SMALLINT range of "
+            f"the xb_* columns. Either keep the default regular-session filter "
+            f"or widen those columns to INTEGER first "
+            f"(+2 bytes x {len(REGISTRY)} rules per row)."
+        )
 
     ent_dates = [d for d in entries["trade_date"].tolist() if d in anchor_idx]
     rows: list = []

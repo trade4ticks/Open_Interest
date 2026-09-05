@@ -8,17 +8,18 @@ implementation that could disagree with this one.
 
 --- Why this is fast -------------------------------------------------------
 
-Naively, 59 rules x 450k paths x 7,800 bars is ~200 billion comparisons. It is
+Naively, 143 rules x 450k paths x 15,600 bars is ~1 trillion comparisons. It is
 nothing like that, because almost every rule is a threshold crossing on a
 MONOTONE running extremum:
 
     a long stop at level L fires at the first bar where cummin(low) <= L
 
 cummin is non-increasing, so "first bar at or below L" is a binary search, not
-a scan. All 7 fixed_stop levels, all 5 atr_stop levels and all 3 swing_low
+a scan. All 7 fixed_stop levels, all 7 atr_stop levels and all 3 swing_low
 levels therefore share ONE cummin(low) pass and cost a searchsorted each.
-Targets share one cummax(high). Trailing stops share a cummin of
-low/cummax(high).
+Targets share one cummax(high). The percent trails share one low/hwm_prev
+ratio; the ATR trails share one low-minus-hwm_prev difference, since an ATR
+offset is not a constant ratio of the mark.
 
 Rules declare what they consume via `needs`; the evaluator computes each
 feature once per block and passes it in. That is what keeps "one function per
@@ -47,6 +48,11 @@ level alone.
 
 Long only. Every rule assumes a long position entered at `entry_price`; a
 short book would be a `direction` column and a sign flip, not new rules.
+
+Percent parameters are named `pct`, `trail` and `activation`; ATR multiples
+are named `k` and `activation_atr`. The unit lives in the PARAMETER NAME, and
+the dashboard infers the label from it, so a new rule that puts an ATR
+multiple in a field called `activation` would silently render as a percent.
 
 Day counting matches the _oc forward returns in daily_features:
 max_days = N exits at the close of the (N-1)th session AFTER entry, so
@@ -136,11 +142,21 @@ def _first_at_or_after(cond: np.ndarray) -> np.ndarray:
 
     The sequential-looking recurrence nxt[i] = i if cond[i] else nxt[i+1]
     vectorises as a reverse running minimum over masked indices. This is what
-    lets the 16 trail x activation combinations come from 4 scans instead of
-    16 passes.
+    lets the 56 trail x activation combinations come from 8 scans instead of
+    56 passes.
+
+    int32, not int64. One of these (E, B) arrays is cached per distinct trail
+    and atr_trail level, so at 8 + 5 + 1 caches they are the single largest
+    consumer in the block -- measured at 1.67 of 3.03 MB per entry before this
+    change, more than the path and feature arrays combined. The values are bar
+    indices in [0, B], and B is 15,600 regular-session bars at a 40-session
+    horizon (38,400 with extended hours), so int32 has four orders of
+    magnitude of headroom. int16 would also hold, but only just, and the
+    saving over int32 is not worth sitting that close to the wall.
     """
     B = cond.shape[1]
-    idx = np.where(cond, np.arange(B, dtype=np.int64)[None, :], B)
+    assert B < np.iinfo(np.int32).max, f"path width {B} exceeds int32 indices"
+    idx = np.where(cond, np.arange(B, dtype=np.int32)[None, :], np.int32(B))
     return np.minimum.accumulate(idx[:, ::-1], axis=1)[:, ::-1]
 
 
@@ -186,6 +202,13 @@ def compute_features(path: dict, needs: set, ctx: dict) -> dict:
         # elementwise ratio serves every trail level.
         with np.errstate(divide="ignore", invalid="ignore"):
             F["trail_raw"] = path["low"] / F["hwm_prev"]
+    if "trail_abs" in needs:
+        # low MINUS the resting high-water mark, for the ATR-denominated
+        # trail. atr_trail's level is hwm_prev - k*ATR, which is not a
+        # constant RATIO of the high-water mark, so trail_raw cannot serve it:
+        # a ratio test would be a different rule at every price level. One
+        # subtraction here gives every k level a single shared array.
+        F["trail_abs"] = path["low"] - F["hwm_prev"]
     return F
 
 
@@ -229,15 +252,44 @@ def _activation_idx(F, ctx, act_pct):
 
     act = 0 arms at bar 0, which is what makes trail x activation=0 the plain
     trailing stop rather than a separate rule.
+
+    Cached by threshold value. Seven distinct activations are shared across 56
+    trail rules, so without the cache this ran 56 times to produce 7 distinct
+    answers.
     """
     E, B = F["hwm_prev"].shape
     if act_pct == 0:
         return np.zeros(E, dtype=np.int64)
-    level = ctx["entry_price"] * (1.0 + act_pct / 100.0)
-    idx = _first_at_or_before(F["hwm_prev"], level, decreasing=False)
-    # Never armed -> never fires; B is the "none" sentinel _first_at_or_after
-    # uses, so map NEVER onto it.
-    return np.where(idx == NEVER, B, idx)
+    cache = ctx.setdefault("_act_pct", {})
+    if act_pct not in cache:
+        level = ctx["entry_price"] * (1.0 + act_pct / 100.0)
+        idx = _first_at_or_before(F["hwm_prev"], level, decreasing=False)
+        # Never armed -> never fires; B is the "none" sentinel
+        # _first_at_or_after uses, so map NEVER onto it.
+        cache[act_pct] = np.where(idx == NEVER, B, idx)
+    return cache[act_pct]
+
+
+def _activation_idx_atr(F, ctx, act_k):
+    """Arming in ATR units: the first bar whose resting high-water mark has
+    gained `act_k` ATRs over entry.
+
+    A percent threshold here would leave atr_trail half-normalised -- an
+    arming gate that means something different on a calm name than a volatile
+    one, which is the exact inconsistency the ATR family exists to remove. So
+    both halves of the rule are denominated the same way.
+
+    Cached by value for the same reason as the percent variant.
+    """
+    E, B = F["hwm_prev"].shape
+    if act_k == 0:
+        return np.zeros(E, dtype=np.int64)
+    cache = ctx.setdefault("_act_atr", {})
+    if act_k not in cache:
+        level = ctx["entry_price"] + act_k * ctx["atr"]
+        idx = _first_at_or_before(F["hwm_prev"], level, decreasing=False)
+        cache[act_k] = np.where(idx == NEVER, B, idx)
+    return cache[act_k]
 
 
 def _gated_trigger(nxt, t_act):
@@ -259,10 +311,16 @@ def _rule_trail(F, ctx, trail, activation):
     activation) is also defensible and silently changes results.
     """
     thresh = 1.0 - trail / 100.0
-    cache = ctx.setdefault("_trail_nxt", {})
-    if trail not in cache:
-        cache[trail] = _first_at_or_after(F["trail_raw"] <= thresh)
-    trigger = _gated_trigger(cache[trail], _activation_idx(F, ctx, activation))
+    # Keyed by (family, level), not by the bare number. Both this and
+    # atr_trail cache a crossing array per level, and their levels share a
+    # numeric range: a percent trail of 2.0 and an atr_trail of k=2.0 would
+    # collide on a bare key and silently hand each other the wrong crossing
+    # array -- producing entirely plausible numbers for the wrong rule.
+    cache = ctx.setdefault("_nxt", {})
+    ck = ("trail", trail)
+    if ck not in cache:
+        cache[ck] = _first_at_or_after(F["trail_raw"] <= thresh)
+    trigger = _gated_trigger(cache[ck], _activation_idx(F, ctx, activation))
     E, B = F["hwm_prev"].shape
     level = np.where(
         trigger >= 0,
@@ -280,10 +338,42 @@ def _rule_breakeven(F, ctx, activation):
     the first low below entry.
     """
     entry = ctx["entry_price"]
-    if "_be_nxt" not in ctx:
-        ctx["_be_nxt"] = _first_at_or_after(ctx["_low"] <= entry[:, None])
-    trigger = _gated_trigger(ctx["_be_nxt"], _activation_idx(F, ctx, activation))
+    cache = ctx.setdefault("_nxt", {})
+    ck = ("breakeven", 0.0)
+    if ck not in cache:
+        cache[ck] = _first_at_or_after(ctx["_low"] <= entry[:, None])
+    trigger = _gated_trigger(cache[ck], _activation_idx(F, ctx, activation))
     return trigger, entry
+
+
+def _rule_atr_trail(F, ctx, k, activation_atr):
+    """Trailing stop `k` ATRs below the resting high-water mark, armed once the
+    mark has gained `activation_atr` ATRs.
+
+    Fully ATR-denominated: distance AND arming. A percent trail means a
+    different thing on a 15-vol name than a 60-vol one, which is what this
+    family exists to fix; leaving the arming gate in percent would normalise
+    one half of the rule and not the other.
+
+    Otherwise identical in structure to _rule_trail -- same hwm_prev (the mark
+    resting when the bar opened, never the same bar's high), same shared
+    gap-through resolver, same high-water mark running from ENTRY throughout
+    rather than restarting at activation.
+    """
+    off = k * ctx["atr"]
+    cache = ctx.setdefault("_nxt", {})
+    ck = ("atr_trail", k)
+    if ck not in cache:
+        cache[ck] = _first_at_or_after(F["trail_abs"] <= -off[:, None])
+    trigger = _gated_trigger(cache[ck],
+                             _activation_idx_atr(F, ctx, activation_atr))
+    E, B = F["hwm_prev"].shape
+    level = np.where(
+        trigger >= 0,
+        F["hwm_prev"][np.arange(E), np.clip(trigger, 0, B - 1)] - off,
+        np.nan,
+    )
+    return trigger, level
 
 
 def _rule_max_days(F, ctx, n):
@@ -341,7 +431,7 @@ def _build_registry() -> list:
                       FILL_STOP, {"pct": pct}, ("cummin_low",),
                       _rule_fixed_stop))
 
-    for k in (0.5, 1.0, 1.5, 2.0, 2.5):
+    for k in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0):
         R.append(Rule(f"atr_stop__{_slug(k)}", "atr_stop", "stop",
                       FILL_STOP, {"k": k}, ("cummin_low",), _rule_atr_stop))
 
@@ -349,29 +439,39 @@ def _build_registry() -> list:
         R.append(Rule(f"swing_low__{n}", "swing_low", "stop",
                       FILL_STOP, {"n": n}, ("cummin_low",), _rule_swing_low))
 
-    for trail in (1.0, 2.0, 3.0, 4.0):
-        for act in (0.0, 1.0, 2.0, 3.0):
+    for trail in (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0):
+        for act in (0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0):
             R.append(Rule(
                 f"trail__{_slug(trail)}_act{_slug(act)}", "trail", "stop",
                 FILL_STOP, {"trail": trail, "activation": act},
                 ("hwm_prev",), _rule_trail))
+
+    # Fully ATR-denominated trail. The parameter is named activation_atr, not
+    # activation, so its unit is legible without a lookup -- the dashboard
+    # infers "multiples of ATR" from the name and labels the control itself.
+    for k in (1.0, 1.5, 2.0, 3.0, 4.0):
+        for act in (0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0):
+            R.append(Rule(
+                f"atr_trail__{_slug(k)}_act{_slug(act)}", "atr_trail", "stop",
+                FILL_STOP, {"k": k, "activation_atr": act},
+                ("hwm_prev", "trail_abs"), _rule_atr_trail))
 
     for act in (1.0, 1.5, 2.0, 2.5):
         R.append(Rule(f"breakeven__{_slug(act)}", "breakeven", "stop",
                       FILL_STOP, {"activation": act}, ("hwm_prev",),
                       _rule_breakeven))
 
-    for pct in (2, 3, 4, 5, 7, 10):
+    for pct in (2, 3, 4, 5, 7, 10, 15, 20):
         R.append(Rule(f"fixed_target__{_slug(pct)}", "fixed_target", "target",
                       FILL_TARGET, {"pct": float(pct)}, ("cummax_high",),
                       _rule_fixed_target))
 
-    for k in (1, 2, 3, 4, 5):
+    for k in (1, 2, 3, 4, 5, 6, 8, 10):
         R.append(Rule(f"atr_target__{_slug(k)}", "atr_target", "target",
                       FILL_TARGET, {"k": float(k)}, ("cummax_high",),
                       _rule_atr_target))
 
-    for n in (1, 3, 5, 7, 10, 15, 20):
+    for n in (1, 3, 5, 7, 10, 15, 20, 30, 40):
         R.append(Rule(f"max_days__{n}", "max_days", "time",
                       FILL_CLOSE, {"n": n}, (), _rule_max_days))
 
@@ -392,14 +492,26 @@ def _build_registry() -> list:
 REGISTRY: list = _build_registry()
 BY_KEY: dict = {r.key: r for r in REGISTRY}
 
-# The path horizon. Every path is computed to 20 sessions, so this rule always
-# fires for a fully-resolved path — which is what makes it usable as a
-# structural backstop in build_combine_sql rather than a convention the UI has
-# to remember.
+# The DEFAULT backstop: the exit assumed when a selection contains no time
+# rule of its own. It is deliberately NOT the longest horizon in the catalog.
+#
+# Promoting it to max_days__40 would make every combine -- including a
+# one-session one -- demand 40 resolvable sessions, re-creating through the
+# back door the exact tail truncation that moving off path_status removed.
+# build_combine_sql instead derives the backstop from the selection: the
+# SHORTEST max_days selected is the rule guaranteed to fire first, and this
+# constant is only the fallback when none was selected.
 HORIZON_RULE_KEY = "max_days__20"
 assert HORIZON_RULE_KEY in BY_KEY, "the horizon backstop must exist in the registry"
 
-MAX_HORIZON_SESSIONS = 20
+# The build width: every path is computed out to this many sessions, so it
+# must be at least the longest max_days in the catalog or that rule could
+# never fire. This is the path array's second dimension, and doubling it
+# doubles the block's memory -- see build_trade_paths.BLOCK_ENTRIES.
+MAX_HORIZON_SESSIONS = 40
+assert MAX_HORIZON_SESSIONS >= max(
+    r.params["n"] for r in REGISTRY if r.family == "max_days"), (
+    "the build width must cover the longest max_days rule")
 
 
 # --- Evaluation -------------------------------------------------------------
@@ -508,29 +620,27 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
         )
 
     keys = list(dict.fromkeys(rule_keys))
-    horizon_added = HORIZON_RULE_KEY not in keys
+
+    # The backstop is the rule guaranteed to fire, and it is a function of the
+    # SELECTION, not a constant.
+    #
+    # Under LEAST, the shortest max_days selected is the one that decides every
+    # otherwise-unresolved trade -- a 5-session cap fires at session 5 whether
+    # or not a 40 is also selected. So that rule, not the catalog's longest and
+    # not a fixed default, is what the trade actually waits on, and it is what
+    # the resolution filter must be written against.
+    #
+    # Appending a fixed max_days__20 here instead would be wrong in both
+    # directions once the catalog runs past it: it would truncate a selected
+    # max_days__40 to the backstop's earlier exit, and it would demand 20
+    # resolvable sessions from a selection that only ever needed 5.
+    selected_time = [k for k in keys if BY_KEY[k].family == "max_days"]
+    horizon_added = not selected_time
     if horizon_added:
         keys.append(HORIZON_RULE_KEY)
-
-    # The backstop is the rule GUARANTEED to fire, and the resolution filter
-    # below is written against its column, so it must never be shorter than a
-    # selected time rule. If it were, the damage would not stop at the filter:
-    # LEAST would return the backstop's earlier bar and silently truncate the
-    # selection to the backstop's horizon, answering a different question than
-    # the one asked. Unreachable while max_days__20 is the longest rule in the
-    # catalog -- it becomes reachable the moment a longer horizon is added,
-    # which is exactly when it must fail loudly instead of quietly.
-    h_n = BY_KEY[HORIZON_RULE_KEY].params["n"]
-    longer = [k for k in keys if BY_KEY[k].family == "max_days"
-              and BY_KEY[k].params["n"] > h_n]
-    if longer:
-        raise CombineError(
-            f"selected time rule(s) {longer} run past the horizon backstop "
-            f"{HORIZON_RULE_KEY} ({h_n} sessions). LEAST would truncate them "
-            f"to the backstop's exit, and the resolution filter would "
-            f"understate the sessions they need. Make the backstop a function "
-            f"of the selection before adding horizons longer than {h_n}."
-        )
+        backstop = HORIZON_RULE_KEY
+    else:
+        backstop = min(selected_time, key=lambda k: BY_KEY[k].params["n"])
 
     # Stop before target before trend before time, so a same-bar tie resolves
     # to the stop. Within a side, order is stable on the caller's selection.
@@ -564,7 +674,7 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
     # predicate that sets sess_end_rel[:, H-1] to NEVER for the horizon rule.
     # Test 13 verifies that equivalence against the build's own arithmetic
     # rather than assuming it.
-    backstop_col = BY_KEY[HORIZON_RULE_KEY].bar_col
+    backstop_col = BY_KEY[backstop].bar_col
     where = ("" if include_unresolved
              else f"\n    WHERE {backstop_col} IS NOT NULL")
 
@@ -587,7 +697,8 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
         "horizon_auto_added": horizon_added,
         "tie_break_order": [BY_KEY[k].side for k in ordered],
         "excludes_unresolved": not include_unresolved,
-        "backstop_rule": HORIZON_RULE_KEY,
+        "backstop_rule": backstop,
+        "backstop_sessions": BY_KEY[backstop].params["n"],
         "resolution_column": backstop_col,
     }
     return sql, meta

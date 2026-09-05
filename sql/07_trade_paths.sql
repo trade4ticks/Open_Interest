@@ -13,7 +13,7 @@
 --                   an anchor later is new rows rather than a migration.
 --
 -- trade_path_rules: catalog of the registry, so the dashboard builds column
---                   names from data instead of hardcoding 118 strings. The
+--                   names from data instead of hardcoding 286 strings. The
 --                   same registry drives the compute and the UI.
 --
 -- WHY BOTH xb_ AND xr_ ARE STORED
@@ -43,9 +43,17 @@ CREATE TABLE IF NOT EXISTS trade_paths (
     swing_low_3   REAL,
     swing_low_5   REAL,
 
-    -- Path extent. A path whose 20-session horizon runs past the end of
-    -- available data is NOT resolved; its horizon exit is genuinely unknown
-    -- and must not be mixed into realised statistics.
+    -- Path extent. n_sessions is how many sessions were actually reachable
+    -- from the entry, capped at the build width (lib.trade_path_rules
+    -- .MAX_HORIZON_SESSIONS, currently 40).
+    --
+    -- path_status is stamped against that FULL width, so 'truncated' means
+    -- "the longest rule in the catalog could not resolve here" -- it does NOT
+    -- mean the row is unusable. A one-session policy resolves fine on a row
+    -- marked truncated. Combines therefore filter on the selected backstop's
+    -- own exit_bar column rather than on this flag; see
+    -- lib.trade_path_rules.build_combine_sql. The flag is kept for the build's
+    -- own bookkeeping and coverage reporting.
     n_bars        INTEGER,
     n_sessions    SMALLINT,
     path_status   TEXT     NOT NULL DEFAULT 'ok',   -- ok | truncated | no_minute_data

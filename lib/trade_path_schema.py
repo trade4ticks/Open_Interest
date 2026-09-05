@@ -6,11 +6,19 @@ column pairs are added idempotently from a registry. That is what makes "add a
 rule = write one function, re-run" true end to end — no hand-written ALTER
 TABLE, and no chance of the table and the registry drifting apart.
 
-Column types are deliberately narrow. exit_bar is SMALLINT: the widest path is
-20 sessions x 390 regular bars = 7,800, and 19,200 even with extended hours,
-both inside int2's 32,767. exit_return is REAL. Six bytes per rule x 59 rules
-x 450k rows is ~160 MB; DOUBLE PRECISION and INTEGER would double that for
-precision no return needs.
+Column types are deliberately narrow. exit_bar is SMALLINT and exit_return is
+REAL: six bytes per rule x 143 rules x 450k rows is ~386 MB, where DOUBLE
+PRECISION and INTEGER would double that for precision no return needs.
+
+The SMALLINT bound is no longer comfortable, and is now load-bearing rather
+than incidental. At the 40-session horizon a regular-session path is
+40 x 390 = 15,600 bars, still well inside int2's 32,767 -- but the same
+horizon with extended hours is 40 x 960 = 38,400, which overflows it. The
+20-session horizon had headroom for both; this one does not. build_ticker
+therefore refuses a path wider than 32,767 bars up front instead of failing
+in the COPY hours later. Widening these to INTEGER is the fix if extended
+hours ever has to be supported at this horizon, at +2 bytes per rule per
+row (~129 MB) and a full table rewrite.
 """
 from __future__ import annotations
 
