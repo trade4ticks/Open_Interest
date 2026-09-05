@@ -512,6 +512,26 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
     if horizon_added:
         keys.append(HORIZON_RULE_KEY)
 
+    # The backstop is the rule GUARANTEED to fire, and the resolution filter
+    # below is written against its column, so it must never be shorter than a
+    # selected time rule. If it were, the damage would not stop at the filter:
+    # LEAST would return the backstop's earlier bar and silently truncate the
+    # selection to the backstop's horizon, answering a different question than
+    # the one asked. Unreachable while max_days__20 is the longest rule in the
+    # catalog -- it becomes reachable the moment a longer horizon is added,
+    # which is exactly when it must fail loudly instead of quietly.
+    h_n = BY_KEY[HORIZON_RULE_KEY].params["n"]
+    longer = [k for k in keys if BY_KEY[k].family == "max_days"
+              and BY_KEY[k].params["n"] > h_n]
+    if longer:
+        raise CombineError(
+            f"selected time rule(s) {longer} run past the horizon backstop "
+            f"{HORIZON_RULE_KEY} ({h_n} sessions). LEAST would truncate them "
+            f"to the backstop's exit, and the resolution filter would "
+            f"understate the sessions they need. Make the backstop a function "
+            f"of the selection before adding horizons longer than {h_n}."
+        )
+
     # Stop before target before trend before time, so a same-bar tie resolves
     # to the stop. Within a side, order is stable on the caller's selection.
     ordered = sorted(keys, key=lambda k: SIDE_PRIORITY[BY_KEY[k].side])
@@ -523,7 +543,30 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
         f"        WHEN {BY_KEY[k].bar_col} = w.exit_bar THEN {BY_KEY[k].ret_col}"
         for k in ordered
     )
-    where = "" if include_unresolved else "\n    WHERE path_status = 'ok'"
+    # Resolution is per-rule data, not a table-wide flag.
+    #
+    # path_status is a GLOBAL boolean, stamped by build_trade_paths against the
+    # build's single longest horizon (MAX_HORIZON_SESSIONS). Filtering on it
+    # makes EVERY combine inherit that longest horizon's tail truncation: a
+    # one-session policy is denied the same trailing entries as a twenty-
+    # session one, for a reason that has nothing to do with the one session it
+    # actually needs. Extending the catalog's horizon would therefore silently
+    # shrink the eligible population of every existing combination -- including
+    # the short ones -- which is the failure this filter exists to prevent.
+    #
+    # The horizon rule's own exit_bar already carries the same fact per
+    # horizon: it is NULL exactly when that rule's final session was not
+    # reachable in the available data.
+    #
+    # This is EQUIVALENT to path_status = 'ok' while max_days__20 is the
+    # longest rule in the catalog, and deliberately so. build_trade_paths
+    # stamps `full` from (si + H - 1) <= last_session, which is the same
+    # predicate that sets sess_end_rel[:, H-1] to NEVER for the horizon rule.
+    # Test 13 verifies that equivalence against the build's own arithmetic
+    # rather than assuming it.
+    backstop_col = BY_KEY[HORIZON_RULE_KEY].bar_col
+    where = ("" if include_unresolved
+             else f"\n    WHERE {backstop_col} IS NOT NULL")
 
     sql = (
         f"WITH w AS (\n"
@@ -544,6 +587,8 @@ def build_combine_sql(rule_keys, table: str = "trade_paths",
         "horizon_auto_added": horizon_added,
         "tie_break_order": [BY_KEY[k].side for k in ordered],
         "excludes_unresolved": not include_unresolved,
+        "backstop_rule": HORIZON_RULE_KEY,
+        "resolution_column": backstop_col,
     }
     return sql, meta
 

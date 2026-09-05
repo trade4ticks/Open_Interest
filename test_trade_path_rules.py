@@ -203,7 +203,11 @@ sql, meta = build_combine_sql(["fixed_stop__1"])
 check("horizon auto-added when absent", meta["horizon_auto_added"], True)
 check("horizon present in combine", HORIZON_RULE_KEY in meta["rules"], True)
 check("horizon column in SQL", BY_KEY[HORIZON_RULE_KEY].bar_col in sql, True)
-check("unresolved excluded by default", "path_status = 'ok'" in sql, True)
+check("unresolved excluded by default",
+      f"WHERE {BY_KEY[HORIZON_RULE_KEY].bar_col} IS NOT NULL" in sql, True)
+check("global path_status flag no longer used", "path_status" in sql, False)
+check("meta names the resolution column", meta["resolution_column"],
+      BY_KEY[HORIZON_RULE_KEY].bar_col)
 
 sql2, meta2 = build_combine_sql(["fixed_stop__1", HORIZON_RULE_KEY])
 check("no duplicate when caller supplies horizon", meta2["horizon_auto_added"], False)
@@ -233,6 +237,55 @@ check("column count (2 per rule)", len(REGISTRY) * 2, 118)
 check("all keys unique", len({r.key for r in REGISTRY}), 59)
 bad = [r.key for r in REGISTRY if not r.key.replace("_", "").replace("p", "").isalnum()]
 check("all keys SQL-safe", bad, [])
+
+print("\n=== 13. per-horizon resolution == path_status, on the build itself ===")
+# The combine filter moved off the global path_status flag onto the horizon
+# rule's own exit_bar. That is only safe if the two agree TODAY, so this runs
+# the real build_ticker over synthetic bars and compares them row by row --
+# rather than re-deriving the build's arithmetic here, which would just be a
+# restatement of the code under test.
+import pandas as pd
+import build_trade_paths as btp
+
+N_SESS, BARS_PER = 40, 4
+_rows, _day = [], pd.Timestamp("2024-01-02 09:30")
+for si_ in range(N_SESS):
+    base = 100.0 + si_ * 0.10          # drifts up; no stop or target is hit
+    ts0 = _day + pd.Timedelta(days=si_)
+    for b in range(BARS_PER):
+        ts = ts0 + pd.Timedelta(minutes=b)
+        _rows.append({"trade_date": ts.date(), "session": "regular",
+                      "timestamp": ts, "open": base, "high": base + 0.05,
+                      "low": base - 0.05, "close": base})
+_bars = pd.DataFrame(_rows)
+
+_orig_load = btp.load_bars
+btp.load_bars = lambda conn, ticker, session_filter="regular": _bars.copy()
+try:
+    _entries = pd.DataFrame({"ticker": "TEST",
+                             "trade_date": sorted(_bars["trade_date"].unique())})
+    _out, _stats = btp.build_ticker(None, "TEST", _entries, "open", "regular", 400)
+finally:
+    btp.load_bars = _orig_load
+
+_hcol = BY_KEY[HORIZON_RULE_KEY].bar_col
+_mismatch = [r["trade_date"] for r in _out
+             if (r["path_status"] == "ok") != (r[_hcol] is not None)]
+check("path_status == (horizon exit_bar IS NOT NULL), all rows", _mismatch, [])
+check("rows built", len(_out), N_SESS)
+
+_n_ok = sum(1 for r in _out if r["path_status"] == "ok")
+check("ok rows = sessions - (horizon - 1)", _n_ok,
+      N_SESS - (btp.MAX_HORIZON_SESSIONS - 1))
+check("horizon col non-null on exactly the ok rows",
+      sum(1 for r in _out if r[_hcol] is not None), _n_ok)
+
+# The payload of the change: a one-session rule resolves on every entry,
+# including the trailing ones the global flag marks truncated. This is what
+# stops a longer catalog horizon from shrinking short-horizon populations.
+_n_d1 = sum(1 for r in _out if r["xb_max_days__1"] is not None)
+check("max_days__1 resolves on every entry", _n_d1, N_SESS)
+check("...strictly more than the global flag allows", _n_d1 > _n_ok, True)
 
 print(f"\n{'=' * 60}")
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}")
