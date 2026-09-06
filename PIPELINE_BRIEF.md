@@ -99,12 +99,28 @@ Write these, I'll run them, we'll design from the results.
 
 `snapshot/ohlc?symbol=*&venue=utp_cta`, run after the close.
 
-Filters: **price $100–$2,000**, **dollar volume ≥ $100M** (close × volume). Yields ~544
-symbols on 2026-08-28 data. Thresholds in config — I'll tune them and may test sub-$100
-names later.
+Filters: **price $50–$2,000**, **dollar volume ≥ $100M** (close × volume), **spread
+≥ 4 bps**. The $100–$2,000 band yielded ~544 symbols on 2026-08-28 data; the floor moved
+to $50 because the ranking is in basis points, where a 10-cent spread on a $60 stock is
+16 bps — wider than FDX at 7.6. Thresholds in config.
 
-**Hysteresis:** enter at ≥$100 and ≥$100M; exit only below $85 or $70M. Prevents boundary
-names flickering in and out and leaving ragged history.
+**Hysteresis:** enter at ≥$50 and ≥$100M; exit only below $42.50 or $70M. The exit price
+is a *ratio* of the entry floor (0.85), so the band follows the floor instead of having
+to be moved with it. Prevents boundary names flickering in and out and leaving ragged
+history.
+
+**Spread floor:** names too tight to trade are dropped before the expensive stage —
+sorted ascending the top of the list is AMZN, TSLA, MSFT, MCD, V, META at 2–3 bps, about
+five cents on a $250 stock. It reads the last stored `spread_bps_tw` and is applied as a
+veto *after* hysteresis and stickiness; folded into the entry test it would exclude
+nothing, since `retained` would carry a failing incumbent for another 30 days.
+
+Exclusion is **never permanent**. An excluded name is not fetched, so it is not measured,
+so it could never produce the number that would let it back in. Every excluded symbol is
+therefore re-measured on a 10-day cycle regardless of its last score, staggered by a
+per-symbol phase so the load is ~20 names a night rather than the whole cohort every
+tenth night. A symbol with no measurement at all is always included — a new entrant gets
+one session before being judged.
 
 **Stickiness:** once a symbol enters, keep it in the fetch list for 30 days even if it
 drops out. Costs little, preserves continuity.

@@ -713,19 +713,69 @@ PG_PASSWORD = os.environ.get("SCALP_PG_PASSWORD", os.environ.get("POSTGRES_PASSW
 
 
 # --- universe filters --------------------------------------------------------
-# Entry thresholds. Yielded ~544 symbols on 2026-08-28 data.
-UNIVERSE_MIN_PRICE      = float(os.environ.get("SCALP_MIN_PRICE", "100"))
+# Entry thresholds. The $100-$2,000 band yielded ~544 symbols on 2026-08-28.
+#
+# THE PRICE FLOOR IS $50, NOT $100. The $100 floor came from round-lot
+# reasoning, and the traded results do not support it as a hard rule: DG at
+# $128 was the third-best name, and the ranking is in BASIS POINTS, where a
+# 10-cent spread on a $60 stock is 16 bps -- wider than FDX at 7.6. Names in
+# the $50-100 band with genuinely wide relative spreads were invisible,
+# because the filter removed them before anything was computed about them.
+UNIVERSE_MIN_PRICE      = float(os.environ.get("SCALP_MIN_PRICE", "50"))
 UNIVERSE_MAX_PRICE      = float(os.environ.get("SCALP_MAX_PRICE", "2000"))
 UNIVERSE_MIN_DOLLAR_VOL = float(os.environ.get("SCALP_MIN_DOLLAR_VOL", "100e6"))
 
 # Hysteresis: a name already in the universe is only dropped below these, so
 # boundary names don't flicker in and out leaving ragged history.
-UNIVERSE_EXIT_PRICE      = float(os.environ.get("SCALP_EXIT_PRICE", "85"))
+#
+# The exit price is a RATIO of the entry price, not a constant. It was 85
+# against a 100 floor; left at 85 while the floor moved to 50 it would sit
+# ABOVE the entry threshold, and the entire $50-85 band -- the names this
+# change exists to admit -- would get no hysteresis cushion at all. They would
+# enter at 50 and be dropped on the first wobble under 85, which is precisely
+# the flicker the mechanism is meant to prevent, applied to precisely the
+# population it was just widened for.
+UNIVERSE_EXIT_PRICE_RATIO = float(os.environ.get("SCALP_EXIT_PRICE_RATIO", "0.85"))
+UNIVERSE_EXIT_PRICE      = float(os.environ.get(
+    "SCALP_EXIT_PRICE", UNIVERSE_MIN_PRICE * UNIVERSE_EXIT_PRICE_RATIO))
 UNIVERSE_EXIT_DOLLAR_VOL = float(os.environ.get("SCALP_EXIT_DOLLAR_VOL", "70e6"))
 
 # Stickiness: once a symbol enters, keep fetching it this many calendar days
 # even after it drops out. Costs little, preserves continuity.
 UNIVERSE_STICKY_DAYS = int(os.environ.get("SCALP_STICKY_DAYS", "30"))
+
+# --- the spread floor --------------------------------------------------------
+# Names too tight to trade are excluded before the expensive stage. Sorted by
+# spread ascending the top of the list is AMZN, TSLA, MSFT, MCD, V, META and a
+# long tail at 2-3 bps -- about five cents on a $250 stock. There is nothing to
+# capture there, and computing 232 metrics on them nightly is the single
+# largest avoidable cost in the pipeline: fetch is ~0.36s a symbol-day against
+# compute's ~8.3s.
+#
+# The source is yesterday's stored spread_bps_tw. That is a prediction, and it
+# is a good one -- a 2 bps name stays a 2 bps name -- but it is still a
+# prediction, which is why it is reversible.
+#
+# EXCLUSION MUST NOT BE A ONE-WAY DOOR. The naive version locks a symbol out
+# forever: excluded means not fetched, not fetched means not measured, not
+# measured means it can never produce the number that would let it back in.
+# SPY will not widen, but a $60 name that becomes interesting after a corporate
+# event would be silently unreachable, and nothing would ever surface that.
+#
+# So every excluded name is re-measured on a cycle regardless of its last
+# score. At ~200 excluded names on a 10-day cycle that is ~20 extra symbols a
+# night, which is noise against the ~544 in the universe. The re-test is what
+# makes the floor safe to set aggressively.
+#
+# A symbol with NO prior measurement is always included: a new entrant gets one
+# session before being judged.
+UNIVERSE_MIN_SPREAD_BPS     = float(os.environ.get("SCALP_MIN_SPREAD_BPS", "4"))
+UNIVERSE_SPREAD_RETEST_DAYS = int(os.environ.get("SCALP_SPREAD_RETEST_DAYS", "10"))
+
+# The metric the floor reads. Named here rather than inline because it is the
+# numerator of every ranking ratio and the one the dashboard sorts by, so a
+# rename has to move both together.
+UNIVERSE_SPREAD_METRIC = "spread_bps_tw"
 
 
 # --- metric windows ----------------------------------------------------------

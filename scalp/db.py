@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS universe (
     retained        BOOLEAN     NOT NULL,   -- held by hysteresis or stickiness
     first_entered   DATE,
     sticky_until    DATE,
+    -- The spread floor, stored rather than recomputed so a name's absence
+    -- from the fetch list is explainable from the row that caused it. The
+    -- value is the one the gate actually read (the last stored spread_bps_tw,
+    -- which is usually yesterday's), NOT a measurement taken today.
+    spread_bps      NUMERIC,
+    spread_excluded BOOLEAN     NOT NULL DEFAULT FALSE,
     PRIMARY KEY (trade_date, symbol)
 );
 
@@ -309,9 +315,21 @@ def drop_intraday_partitions_before(cutoff: date) -> list[tuple[str, date, int]]
     return dropped
 
 
+# CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+# columns added after the first deployment need this. ADD COLUMN IF NOT EXISTS
+# is idempotent and, for a nullable column with no default (or a constant
+# DEFAULT on PG 11+), is a metadata-only change rather than a table rewrite.
+UNIVERSE_MIGRATION_SQL = """
+ALTER TABLE universe ADD COLUMN IF NOT EXISTS spread_bps NUMERIC;
+ALTER TABLE universe ADD COLUMN IF NOT EXISTS spread_excluded BOOLEAN
+    NOT NULL DEFAULT FALSE;
+"""
+
+
 def init_schema() -> None:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(SCHEMA_SQL)
+        cur.execute(UNIVERSE_MIGRATION_SQL)
         cur.execute(intraday_ddl())
         cur.execute(intraday_monthly_ddl())
         cur.execute(FETCH_RUNS_DDL)
@@ -610,18 +628,23 @@ def write_universe(trade_date: date, rows: list[dict]) -> int:
         return 0
     sql = """
         INSERT INTO universe (trade_date, symbol, close, volume, dollar_volume,
-                              qualified, retained, first_entered, sticky_until)
+                              qualified, retained, first_entered, sticky_until,
+                              spread_bps, spread_excluded)
         VALUES %s
         ON CONFLICT (trade_date, symbol) DO UPDATE SET
             close = EXCLUDED.close, volume = EXCLUDED.volume,
             dollar_volume = EXCLUDED.dollar_volume,
             qualified = EXCLUDED.qualified, retained = EXCLUDED.retained,
             first_entered = EXCLUDED.first_entered,
-            sticky_until = EXCLUDED.sticky_until
+            sticky_until = EXCLUDED.sticky_until,
+            spread_bps = EXCLUDED.spread_bps,
+            spread_excluded = EXCLUDED.spread_excluded
     """
     values = [(trade_date, r["symbol"], r.get("close"), r.get("volume"),
                r.get("dollar_volume"), r["qualified"], r["retained"],
-               r.get("first_entered"), r.get("sticky_until")) for r in rows]
+               r.get("first_entered"), r.get("sticky_until"),
+               _num(r.get("spread_bps")),
+               bool(r.get("spread_excluded", False))) for r in rows]
     with connect() as conn, conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
     return len(values)
@@ -654,7 +677,15 @@ def latest_universe_date() -> date | None:
 
 
 def universe_symbols(trade_date: date | None = None) -> list[str]:
-    """The fetch list: everything qualified or retained on that date."""
+    """The fetch list: qualified or retained, MINUS the spread-excluded.
+
+    The spread floor is a veto applied after hysteresis and stickiness, not a
+    term inside `qualified`. Folding it in would have made it toothless: an
+    incumbent that fails the floor still clears the looser exit thresholds, and
+    its 30-day sticky window is still live, so `retained` would hold it in the
+    fetch list for another month -- excluding nothing at all on the night it
+    was applied.
+    """
     with connect() as conn, conn.cursor() as cur:
         if trade_date is None:
             cur.execute("SELECT max(trade_date) FROM universe")
@@ -665,6 +696,7 @@ def universe_symbols(trade_date: date | None = None) -> list[str]:
         cur.execute(
             "SELECT symbol FROM universe "
             "WHERE trade_date = %s AND (qualified OR retained) "
+            "  AND NOT spread_excluded "
             "ORDER BY symbol", (trade_date,))
         return [r[0] for r in cur.fetchall()]
 
@@ -679,6 +711,28 @@ def universe_history(symbol: str) -> pd.DataFrame:
     return read_sql(
         "SELECT * FROM universe WHERE symbol = %s ORDER BY trade_date",
         (symbol.upper(),))
+
+
+def latest_metric_by_symbol(metric: str) -> pd.DataFrame:
+    """Most recent stored value of one metric per symbol, and the date it was
+    measured. Columns: symbol, trade_date, value.
+
+    The trade_date is not incidental -- it is what makes the spread floor
+    reversible. It says when the symbol was last MEASURED, which is what the
+    re-test cycle counts against, and it is read from daily_metrics rather than
+    tracked separately in the universe table because daily_metrics is already
+    the authority on when a symbol was last computed. A second copy of that
+    fact would be one more thing able to drift.
+
+    DISTINCT ON is the index-friendly form here: daily_metrics_metric_idx is
+    (metric, trade_date), so this is one ordered scan of the metric's slice
+    rather than a self-join or a window over the whole table.
+    """
+    return read_sql(
+        "SELECT DISTINCT ON (symbol) symbol, trade_date, value "
+        "FROM daily_metrics "
+        "WHERE metric = %s AND value IS NOT NULL "
+        "ORDER BY symbol, trade_date DESC", (metric,))
 
 
 def metrics_wide(trade_date: date) -> pd.DataFrame:

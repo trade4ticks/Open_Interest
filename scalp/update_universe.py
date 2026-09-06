@@ -25,9 +25,22 @@ measured to matter. The default `nqb` returns 44% of true volume and omits
 the market. The history endpoints are the opposite case and correctly send
 nothing; see config.VENUE_BY_ENDPOINT.
 
-HYSTERESIS: a name enters at >= $100 and >= $100M but is only dropped below
-$85 or $70M. Boundary names would otherwise flicker in and out and leave
-ragged history.
+HYSTERESIS: a name enters at >= $50 and >= $100M but is only dropped below
+$42.50 or $70M. Boundary names would otherwise flicker in and out and leave
+ragged history. The exit price is a ratio of the entry price, so the band
+follows the floor rather than having to be moved with it.
+
+THE SPREAD FLOOR is a veto applied AFTER hysteresis and stickiness, not a term
+inside the entry test. Folded in, it would exclude nothing on the night it was
+applied: an incumbent that fails the floor still clears the looser exit
+thresholds and still has a live 30-day sticky window, so `retained` would carry
+it for another month.
+
+It reads the last stored spread_bps_tw, which is a prediction -- a good one,
+since a 2 bps name stays a 2 bps name, but a prediction. So it is reversible by
+construction: every excluded name is re-measured on a cycle regardless of its
+last score, and a name with no measurement at all is always included. Nothing
+can be locked out by the absence of the evidence that would free it.
 
 STICKINESS: once a symbol enters it stays in the fetch list for 30 days even
 after it stops qualifying. Costs little, preserves continuity.
@@ -42,6 +55,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
@@ -50,6 +64,61 @@ import pandas as pd
 from scalp import config, db, schema, thetadata as td
 
 log = logging.getLogger(__name__)
+
+
+def spread_gate(symbol: str, spread: dict, trade_date: date) -> tuple:
+    """(spread_bps, excluded, reason) for one symbol.
+
+    Reasons, and why each exists:
+      unmeasured  no stored spread at all. INCLUDED -- a new entrant gets one
+                  session before being judged, and this is also the state every
+                  symbol is in the first time the floor runs.
+      retest      due for re-measurement. INCLUDED regardless of its last
+                  score; this is the property that stops exclusion becoming
+                  permanent, so it is checked BEFORE the threshold, not after.
+      tight       measured below the floor and not due. EXCLUDED.
+      wide        measured at or above the floor. INCLUDED.
+
+    The re-test is staggered by a deterministic per-symbol phase rather than
+    fired on age alone. Without it the whole excluded cohort is measured on the
+    same night, excluded on the same night, and returns together every Nth
+    night -- a permanent pulse of ~200 extra symbols on one night in ten
+    instead of ~20 every night. The age check is kept as a backstop so a
+    symbol cannot be starved by a run of missed nights.
+    """
+    got = spread.get(symbol)
+    if got is None:
+        return None, False, "unmeasured"
+    value, measured = got
+    n = max(1, config.UNIVERSE_SPREAD_RETEST_DAYS)
+    phase = zlib.crc32(symbol.encode()) % n
+    age = (trade_date - measured).days
+    if age >= n or trade_date.toordinal() % n == phase:
+        return value, False, "retest"
+    if value < config.UNIVERSE_MIN_SPREAD_BPS:
+        return value, True, "tight"
+    return value, False, "wide"
+
+
+def spread_lookup() -> dict:
+    """symbol -> (last stored spread_bps_tw, the date it was measured).
+
+    Empty on a database that has never computed the metric, which is the right
+    degenerate behaviour: every symbol reads as `unmeasured` and the floor
+    admits everything until there is something to judge on.
+    """
+    try:
+        df = db.latest_metric_by_symbol(config.UNIVERSE_SPREAD_METRIC)
+    except Exception as exc:
+        log.warning("could not read %s (%s) — the spread floor admits "
+                    "everything this run", config.UNIVERSE_SPREAD_METRIC, exc)
+        return {}
+    out = {}
+    for r in df.itertuples():
+        d = r.trade_date
+        out[str(r.symbol).upper()] = (
+            float(r.value), d.date() if hasattr(d, "date") else d)
+    return out
 
 
 def _after_close() -> bool:
@@ -157,12 +226,16 @@ def _universe_from_eod(trade_date: date, args) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def classify(df: pd.DataFrame, prior: pd.DataFrame,
-             trade_date: date) -> list[dict]:
-    """Apply entry thresholds, hysteresis and stickiness. Returns universe rows.
+def classify(df: pd.DataFrame, prior: pd.DataFrame, trade_date: date,
+             spread: dict | None = None) -> list[dict]:
+    """Apply entry thresholds, hysteresis, stickiness and the spread floor.
 
     `prior` is the previous universe snapshot (may be empty on a first run).
+    `spread` is symbol -> (spread_bps, measured_date); an empty or omitted
+    mapping admits everything, which is what makes the floor inert until the
+    metric exists.
     """
+    spread = spread or {}
     prior_by_symbol = ({r["symbol"]: r for _, r in prior.iterrows()}
                        if not prior.empty else {})
 
@@ -203,6 +276,14 @@ def classify(df: pd.DataFrame, prior: pd.DataFrame,
         retained = bool(not qualified and (
             (incumbent and above_exit) or sticky_live))
 
+        # The spread floor. A veto on the fetch list, deliberately NOT a term
+        # in `qualified` -- see the module docstring. It therefore does not
+        # touch first_entered or sticky_until either: those record the
+        # price/volume story, and a name excluded for being tight has not
+        # stopped being a large, liquid name.
+        spread_bps, spread_excluded, spread_reason = spread_gate(
+            symbol, spread, trade_date)
+
         if not (qualified or retained):
             # Only carry a row for names that are in, or were in and are now
             # out — the whole market every night would bloat the table for no
@@ -215,6 +296,8 @@ def classify(df: pd.DataFrame, prior: pd.DataFrame,
             "dollar_volume": dollar_vol,
             "qualified": qualified, "retained": retained,
             "first_entered": first_entered, "sticky_until": sticky_until,
+            "spread_bps": spread_bps, "spread_excluded": spread_excluded,
+            "spread_reason": spread_reason,
         })
     return rows
 
@@ -305,9 +388,22 @@ def main() -> None:
         prior = db.universe_on(prior_date)
         log.info("  prior universe %s: %d rows", prior_date, len(prior))
 
-    rows = classify(norm, prior, trade_date)
+    spread = spread_lookup()
+    log.info("  spread floor: %d symbol(s) with a stored %s",
+             len(spread), config.UNIVERSE_SPREAD_METRIC)
+
+    rows = classify(norm, prior, trade_date, spread)
     qualified = sum(1 for r in rows if r["qualified"])
     retained = sum(1 for r in rows if r["retained"])
+
+    # The fetch list is what universe_symbols() will return, so it is counted
+    # the same way here: in on price/volume, then minus the spread veto.
+    in_universe = [r for r in rows if r["qualified"] or r["retained"]]
+    excluded = [r for r in in_universe if r["spread_excluded"]]
+    fetch_list = [r for r in in_universe if not r["spread_excluded"]]
+    by_reason = {}
+    for r in in_universe:
+        by_reason[r["spread_reason"]] = by_reason.get(r["spread_reason"], 0) + 1
 
     print()
     print(f"trade_date      : {trade_date}")
@@ -319,7 +415,26 @@ def main() -> None:
           f"(hysteresis below {config.UNIVERSE_EXIT_PRICE:g} / "
           f"{config.UNIVERSE_EXIT_DOLLAR_VOL/1e6:.0f}M, "
           f"or sticky {config.UNIVERSE_STICKY_DAYS}d)")
-    print(f"fetch list      : {qualified + retained:,}")
+    print(f"in on price/vol : {len(in_universe):,}")
+    print()
+    print(f"spread floor    : >= {config.UNIVERSE_MIN_SPREAD_BPS:g} bps "
+          f"(last stored {config.UNIVERSE_SPREAD_METRIC}, "
+          f"re-tested every {config.UNIVERSE_SPREAD_RETEST_DAYS}d)")
+    for reason, label in (
+            ("wide",       "clears the floor"),
+            ("tight",      "below the floor  -> EXCLUDED"),
+            ("retest",     "due for re-test  -> kept"),
+            ("unmeasured", "never measured   -> kept")):
+        print(f"  {label:32s}: {by_reason.get(reason, 0):,}")
+    print()
+    print(f"FETCH LIST      : {len(fetch_list):,}   "
+          f"({len(excluded):,} excluded by the spread floor)")
+
+    if excluded:
+        tightest = sorted(excluded, key=lambda r: r["spread_bps"])[:10]
+        print(f"  tightest excluded: "
+              + ", ".join(f"{r['symbol']} {r['spread_bps']:.1f}"
+                          for r in tightest))
 
     if args.dry_run:
         print()
