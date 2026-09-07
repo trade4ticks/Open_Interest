@@ -154,18 +154,29 @@ PATTERNS: list[tuple[re.Pattern, str, str]] = [
      "quiet counts threshold, and the pre-registered statistical test — it "
      "uses the whole distribution, so it has more power on a small sample of "
      "realised results."),
-    (re.compile(r"^quiet_range_cents_(?P<w>\d+)s$"),
+    (re.compile(r"^quiet_range_iqr_cents_(?P<w>\d+)s$"),
      "noise",
      "Median interquartile range of trade prices, in CENTS, across {w}-second "
      "windows that were quiet at the 1.0 threshold. Cents rather than bps "
      "because size is set by what the book absorbs, not by capital: profit is "
      "range-in-cents times shares available, and a bps figure penalises an "
      "expensive name for an expense that is not the binding constraint."),
-    (re.compile(r"^quiet_range_bps_(?P<w>\d+)s$"),
+    (re.compile(r"^quiet_range_iqr_bps_(?P<w>\d+)s$"),
      "noise",
      "The same interquartile range in bps of the level. Kept beside the cents "
      "figure because the two rank names differently, and which one is right "
      "depends on whether capital or liquidity is binding."),
+    (re.compile(r"^quiet_range_p10p90_cents_(?P<w>\d+)s$"),
+     "noise",
+     "Median 10th-to-90th percentile span of trade prices, in CENTS, across "
+     "quiet {w}-second windows. The middle 80% rather than the middle 50%, "
+     "stored beside the IQR to test whether the IQR understates the area "
+     "actually worked. Caution at {w}=15: near the 10-trade guard a single odd "
+     "lot is 10% of the sample and lands on the p90 boundary, so a wide value "
+     "there can be one stray print rather than a wide market."),
+    (re.compile(r"^quiet_range_p10p90_bps_(?P<w>\d+)s$"),
+     "noise",
+     "The 10th-to-90th percentile span in bps of the level."),
     (re.compile(r"^quiet_dollar_vol_per_min_(?P<w>\d+)s$"),
      "noise",
      "Median dollar volume per minute inside quiet {w}-second windows. Per "

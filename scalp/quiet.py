@@ -27,11 +27,32 @@ regimes. Everything here is in service of computing that ratio honestly.
 
 For a window of trades:
 
-    range   interquartile spread of trade prices (p75 - p25). The middle 50%,
-            so one stray print does not define it. Reported in cents AND bps.
+    range   the spread of trade prices in the window, measured TWO ways and
+            both stored, in cents and bps:
+
+              iqr      p75 - p25, the middle 50%
+              p10p90   p90 - p10, the middle 80%
+
+            The IQR cannot be defined by a stray print, which matters on a
+            tape where 91% of trades are odd lots and a single 1-share print
+            30 cents away is ordinary. But it may be TIGHTER than the area
+            actually worked: 10-15 cents is a routine capture on LLY and 20 in
+            good conditions, and if the middle 50% reports less than that the
+            metric understates the opportunity it exists to measure.
+
+            Which is right is an empirical question about a specific book, so
+            both are computed and compared against remembered sessions. Only
+            the IQR feeds the ratio -- see below.
     level   volume-weighted mean trade price.
     shift   |level(this window) - level(previous window)|.
-    ratio   shift / range, both in cents so the units cancel.
+    ratio   shift / IQR, both in cents so the units cancel.
+
+            THE RATIO USES THE IQR, not the p10-p90 span, and therefore so do
+            the thresholds, the quiet counts and the episodes. That keeps the
+            pre-registered primary fixed while the two range measures are
+            compared. If p10p90 wins that comparison the denominator should
+            change too -- and that is a second recompute, not a config flip,
+            because every count downstream of the ratio moves with it.
 
 RANGE IS REPORTED IN CENTS AS WELL AS BPS, and the cents figure is the one
 that matches the constraint. A bps normalisation assumes fixed capital:
@@ -122,6 +143,21 @@ PRIMARY_THRESHOLD_KEY: str = "10"
 # arrivals, a 15s window needs ~40 trades/min before half its windows qualify;
 # at 30 trades/min only 22% do. That is why the eligible count is stored
 # alongside every quiet count -- see quiet_eligible_windows_*.
+#
+# THE GUARD IS SIZED FOR THE IQR, AND THE p10-p90 SPAN IS EXPOSED AT IT.
+# Measured: p10-p90 actually has LOWER sampling error than the IQR at every n
+# (18.2% against 25.5% at n=10), because it spans more of the distribution.
+# But a single stray print is 10% of a 10-trade window, which lands exactly on
+# the p90 boundary and defines it -- one print 30 cents out doubles the span,
+# 5.31c to 10.39c. At n=15 the same print is 7% of the sample, inside the
+# tail, and the span moves 3.50c to 4.80c; by n=30 it barely moves at all.
+#
+# The guard is NOT raised for p10p90, because the two measures have to cover
+# the same windows or the comparison is between different populations rather
+# than between measures. The consequence is an interpretation rule instead:
+# on 15s windows, where n sits near the guard, a wide p10p90 may be one odd
+# lot rather than a wide market. On 60s windows, where n is typically 30+, it
+# is trustworthy.
 MIN_TRADES: int = 10
 
 # Cents per dollar. Named because it appears in both the range and the shift,
@@ -147,8 +183,10 @@ def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
         w_start    window start, seconds, same origin as t_sec
         n          trades in the window
         level      volume-weighted mean trade price
-        range_c    IQR in cents
-        range_bps  IQR in bps of the level
+        iqr_c      p75 - p25 in cents
+        iqr_bps    p75 - p25 in bps of the level
+        pp_c       p90 - p10 in cents
+        pp_bps     p90 - p10 in bps of the level
         dollar     dollar volume traded in the window
         shift_c    |level - previous level| in cents
         ratio      shift_c / range_c
@@ -187,17 +225,22 @@ def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
         level = np.where(shares > 0, dollar / np.where(shares > 0, shares, 1.0),
                          np.nan)
 
-    # The IQR needs an order statistic per window, so it is the one quantity
-    # that cannot come from a prefix sum. Only dense windows are visited.
-    range_c = np.full(n_win, np.nan)
+    # The spans need order statistics per window, so they are the one quantity
+    # that cannot come from a prefix sum. Only dense windows are visited, and
+    # both spans come from ONE sort per window rather than two passes.
+    iqr_c = np.full(n_win, np.nan)
+    pp_c = np.full(n_win, np.nan)
     dense = np.flatnonzero(n >= min_trades)
     for i in dense:
         seg = p[lo[i]:hi[i]]
-        q75, q25 = np.percentile(seg, (75.0, 25.0))
-        range_c[i] = (q75 - q25) * _CENTS
+        q10, q25, q75, q90 = np.percentile(seg, (10.0, 25.0, 75.0, 90.0))
+        iqr_c[i] = (q75 - q25) * _CENTS
+        pp_c[i] = (q90 - q10) * _CENTS
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        range_bps = np.where(level > 0, (range_c / _CENTS) / level * 1e4, np.nan)
+        scale = np.where(level > 0, 1e4 / (level * _CENTS), np.nan)
+        iqr_bps = iqr_c * scale
+        pp_bps = pp_c * scale
 
     shift_c = np.full(n_win, np.nan)
     shift_c[1:] = np.abs(level[1:] - level[:-1]) * _CENTS
@@ -206,12 +249,16 @@ def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
     eligible = np.zeros(n_win, dtype=bool)
     eligible[1:] = dense_now[1:] & dense_now[:-1]
 
-    ratio = _ratio(shift_c, range_c)
+    # The IQR is the denominator. See the module docstring: the thresholds and
+    # every count below them are defined against it, so swapping in the wider
+    # span here would silently redefine what "quiet" means.
+    ratio = _ratio(shift_c, iqr_c)
     ratio[~eligible] = np.nan
 
-    return {"w_start": w_start, "n": n, "level": level, "range_c": range_c,
-            "range_bps": range_bps, "dollar": dollar, "shift_c": shift_c,
-            "ratio": ratio, "eligible": eligible, "window_s": float(window_s)}
+    return {"w_start": w_start, "n": n, "level": level, "iqr_c": iqr_c,
+            "iqr_bps": iqr_bps, "pp_c": pp_c, "pp_bps": pp_bps,
+            "dollar": dollar, "shift_c": shift_c, "ratio": ratio,
+            "eligible": eligible, "window_s": float(window_s)}
 
 
 def _ratio(shift_c: np.ndarray, range_c: np.ndarray) -> np.ndarray:
@@ -243,9 +290,9 @@ def _ratio(shift_c: np.ndarray, range_c: np.ndarray) -> np.ndarray:
 
 def _empty_series() -> dict:
     z = np.zeros(0)
-    return {"w_start": z, "n": z.astype("int64"), "level": z, "range_c": z,
-            "range_bps": z, "dollar": z, "shift_c": z, "ratio": z,
-            "eligible": np.zeros(0, dtype=bool), "window_s": 0.0}
+    return {"w_start": z, "n": z.astype("int64"), "level": z, "iqr_c": z,
+            "iqr_bps": z, "pp_c": z, "pp_bps": z, "dollar": z, "shift_c": z,
+            "ratio": z, "eligible": np.zeros(0, dtype=bool), "window_s": 0.0}
 
 
 def session_series(t_sec, price, size, *, start_s: float, end_s: float,
@@ -314,8 +361,12 @@ def daily_metrics(series: dict, *, thresholds=THRESHOLDS,
 
         thr_primary = dict(thresholds)[primary_key]
         sel = elig & np.isfinite(ratio) & (ratio < thr_primary)
-        out[f"quiet_range_cents_{w}s"] = _median(ser["range_c"][sel])
-        out[f"quiet_range_bps_{w}s"] = _median(ser["range_bps"][sel])
+        # Both span measures, over the same windows, so the comparison is
+        # about the MEASURE and nothing else.
+        out[f"quiet_range_iqr_cents_{w}s"] = _median(ser["iqr_c"][sel])
+        out[f"quiet_range_iqr_bps_{w}s"] = _median(ser["iqr_bps"][sel])
+        out[f"quiet_range_p10p90_cents_{w}s"] = _median(ser["pp_c"][sel])
+        out[f"quiet_range_p10p90_bps_{w}s"] = _median(ser["pp_bps"][sel])
         # Dollar flow per MINUTE, so the three window lengths are comparable.
         per_min = ser["dollar"][sel] / (ser["window_s"] / 60.0) if sel.any() \
             else np.zeros(0)
@@ -363,8 +414,11 @@ def metric_names(windows=WINDOWS_SEC, thresholds=THRESHOLDS,
     for w in windows:
         names.append(f"quiet_eligible_windows_{w}s")
         names += [f"quiet_windows_{w}s_{k}" for k, _ in thresholds]
-        names += [f"shift_over_range_median_{w}s", f"quiet_range_cents_{w}s",
-                  f"quiet_range_bps_{w}s", f"quiet_dollar_vol_per_min_{w}s"]
+        names += [f"shift_over_range_median_{w}s",
+                  f"quiet_range_iqr_cents_{w}s", f"quiet_range_iqr_bps_{w}s",
+                  f"quiet_range_p10p90_cents_{w}s",
+                  f"quiet_range_p10p90_bps_{w}s",
+                  f"quiet_dollar_vol_per_min_{w}s"]
     names.append(f"quiet_episodes_{primary_window}s_{primary_key}")
     return tuple(names)
 

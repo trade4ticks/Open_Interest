@@ -134,10 +134,34 @@ def test_zero_weight_count_matches_duplicate_count():
     assert len(collapsed) == 100
     assert len(raw) - len(collapsed) == 100
 
+    # TWO SEPARATE CAUSES OF A ZERO WEIGHT, and this test previously conflated
+    # them and failed on the sum (expected 100, got 101). Settled 2026-09-07:
+    # the fixture and the production code were both correct; the ASSERTION was
+    # wrong.
+    #
+    #   rows 1..n-1   one zero per duplicated instant. 100 of them, and this
+    #                 is the harm the test is named for.
+    #   row 0         .diff() has no predecessor, so fillna(0.0) makes the
+    #                 first weight zero whether or not anything is duplicated.
+    #                 A control frame with NO duplicates produces exactly this
+    #                 one zero and no others.
+    #
+    # They are asserted apart so the count cannot drift back into one number
+    # that is right for the wrong reason. Note also that nothing here calls
+    # production code -- `naive_weights` is a deliberate reconstruction of the
+    # WRONG approach, computed inline, so this assertion could never have been
+    # detecting a bug in durations_seconds. The production path is checked in
+    # test_durations_are_forward_gaps_and_cover_the_window.
     naive_weights = raw["t"].diff().dt.total_seconds().fillna(0.0)
-    zero_weighted = int((naive_weights == 0).sum())
-    assert zero_weighted == 100, (
-        f"expected 100 observations silently zero-weighted, got {zero_weighted}")
+    from_duplicates = int((naive_weights.iloc[1:] == 0).sum())
+    assert from_duplicates == 100, (
+        f"expected one silently zero-weighted record per duplicated instant "
+        f"(100), got {from_duplicates}")
+    assert naive_weights.iloc[0] == 0.0, (
+        "the first record should be zero-weighted by fillna, independently of "
+        "duplication")
+    assert int((naive_weights == 0).sum()) == 101, (
+        "100 duplicate-induced zeros plus the one first-row artifact")
 
     # After collapsing, nothing is zero-weighted.
     end = BASE + pd.Timedelta(seconds=100)

@@ -51,7 +51,7 @@ print("=== 1. level, range and shift, hand-checked ===")
 s = series([[99.99, 100.01], [100.09, 100.11]])
 check("window 0 level", float(s["level"][0]), 100.00, 1e-9)
 check("window 1 level", float(s["level"][1]), 100.10, 1e-9)
-check("window 0 range (cents)", float(s["range_c"][0]), 2.0, 1e-9)
+check("window 0 range (cents)", float(s["iqr_c"][0]), 2.0, 1e-9)
 check("window 1 shift (cents)", float(s["shift_c"][1]), 10.0, 1e-7)
 check("window 1 ratio = shift/range", float(s["ratio"][1]), 5.0, 1e-7)
 check("window 0 has no predecessor, so no ratio",
@@ -62,7 +62,7 @@ check("window 1 is eligible", bool(s["eligible"][1]), True)
 # The ratio must use the CURRENT window's range. Widen window 1 only: the
 # shift is unchanged, so a ratio built on window 0's range would not move.
 s2 = series([[99.99, 100.01], [100.05, 100.15]])
-check("window 1 range widens to 10c", float(s2["range_c"][1]), 10.0, 1e-7)
+check("window 1 range widens to 10c", float(s2["iqr_c"][1]), 10.0, 1e-7)
 check("...and the ratio uses it, not the predecessor's",
       float(s2["ratio"][1]), 1.0, 1e-7)
 
@@ -72,10 +72,68 @@ print("\n=== 2. bps and cents are the same measurement, differently scaled ===")
 # is what differs, and that is the whole reason both are stored.
 cheap = series([[69.925, 70.075], [69.925, 70.075]])
 dear = series([[699.925, 700.075], [699.925, 700.075]])
-check("cheap name range (cents)", round(float(cheap["range_c"][1]), 6), 15.0)
-check("expensive name range (cents)", round(float(dear["range_c"][1]), 6), 15.0)
+check("cheap name range (cents)", round(float(cheap["iqr_c"][1]), 6), 15.0)
+check("expensive name range (cents)", round(float(dear["iqr_c"][1]), 6), 15.0)
 check("cheap name range (bps) is ~10x the expensive one's",
-      round(float(cheap["range_bps"][1]) / float(dear["range_bps"][1])), 10)
+      round(float(cheap["iqr_bps"][1]) / float(dear["iqr_bps"][1])), 10)
+
+
+print("\n=== 2b. the two span measures ===")
+# 20 prints: 10 at 100.00 and 10 spread from 99.80 to 100.20. The IQR sees the
+# middle 50%; the p10-p90 span sees the middle 80% and therefore more of the
+# tails. Both are computed from ONE sort, so they cannot disagree about which
+# prints were in the window.
+import numpy as _np
+_p = _np.concatenate([_np.full(10, 100.00),
+                      _np.linspace(99.80, 100.20, 10)])
+_t = _np.arange(20, dtype="float64")
+_s = quiet.window_series(_t, _p, _np.ones(20), window_s=20.0, step_s=20.0,
+                         start_s=0.0, end_s=20.0, min_trades=10)
+_iqr, _pp = float(_s["iqr_c"][0]), float(_s["pp_c"][0])
+check("p10-p90 is wider than the IQR on a tailed window", _pp > _iqr, True)
+check("both are finite", bool(_np.isfinite(_iqr) and _np.isfinite(_pp)), True)
+
+# On a window with no tails they coincide, which is the sanity check that the
+# difference above is the distribution and not an arithmetic slip.
+_flat = _np.concatenate([_np.full(10, 99.95), _np.full(10, 100.05)])
+_s2 = quiet.window_series(_t, _flat, _np.ones(20), window_s=20.0, step_s=20.0,
+                          start_s=0.0, end_s=20.0, min_trades=10)
+check("with no tails the two measures agree",
+      round(float(_s2["iqr_c"][0]), 6), round(float(_s2["pp_c"][0]), 6))
+
+# Both spans are the same measurement in two units, so the cents/bps ratio has
+# to be the level, identically for each.
+_lvl = float(_s["level"][0])
+check("iqr bps = iqr cents scaled by the level",
+      round(float(_s["iqr_bps"][0]), 6),
+      round(_iqr / 100.0 / _lvl * 1e4, 6))
+check("p10p90 bps uses the SAME level scaling",
+      round(float(_s["pp_bps"][0]), 6),
+      round(_pp / 100.0 / _lvl * 1e4, 6))
+
+# The stray-print case, which is the whole reason both are stored. One print
+# 30 cents away in a 10-trade window is 10% of the sample and lands on the p90
+# boundary; the IQR does not move, the span roughly doubles.
+_core = _np.full(9, 100.00)
+_with = _np.concatenate([_core, [100.30]])
+_without = _np.concatenate([_core, [100.00]])
+_ta = _np.arange(10, dtype="float64")
+_a = quiet.window_series(_ta, _with, _np.ones(10), window_s=10.0, step_s=10.0,
+                         start_s=0.0, end_s=10.0, min_trades=10)
+_b = quiet.window_series(_ta, _without, _np.ones(10), window_s=10.0,
+                         step_s=10.0, start_s=0.0, end_s=10.0, min_trades=10)
+check("one stray print leaves the IQR alone",
+      round(float(_a["iqr_c"][0]), 6), round(float(_b["iqr_c"][0]), 6))
+check("...but moves the p10-p90 span at the guard",
+      float(_a["pp_c"][0]) > float(_b["pp_c"][0]), True)
+
+# The ratio must stay on the IQR: the thresholds, the counts and the episodes
+# are all defined against it, and swapping the denominator would silently
+# redefine what "quiet" means.
+_r = quiet._ratio(_s["shift_c"], _s["iqr_c"])
+check("the ratio is computed against the IQR, not the wider span",
+      bool(_np.array_equal(_np.nan_to_num(_r, nan=-1.0),
+                           _np.nan_to_num(_s["ratio"], nan=-1.0))), True)
 
 
 print("\n=== 3. the degenerate range is handled, not dropped ===")
@@ -83,7 +141,7 @@ print("\n=== 3. the degenerate range is handled, not dropped ===")
 # data, and plain division would make the quietest windows in the session
 # vanish from the count as 0/0 = NaN.
 still = series([[100.00], [100.00]])
-check("range is zero", float(still["range_c"][1]), 0.0)
+check("range is zero", float(still["iqr_c"][1]), 0.0)
 check("no shift either -> ratio 0, the quietest possible",
       float(still["ratio"][1]), 0.0)
 jump = series([[100.00], [100.10]])
@@ -156,7 +214,7 @@ check("...and zero ELIGIBLE windows, which is how you tell why",
 
 
 print("\n=== 7. the metric set ===")
-check("quiet metrics produced", len(quiet.metric_names()), 25)
+check("quiet metrics produced", len(quiet.metric_names()), 31)
 check("every declared name is actually computed",
       sorted(dm) == sorted(quiet.metric_names()), True)
 check("the primary is pre-registered as 30s / 1.0",
@@ -213,7 +271,7 @@ check("kept metrics after the cut", len(kept), 60)
 qs = metrics.quiet_session(df, cols, day, end)
 daily.update(quiet.daily_metrics(qs))
 stored = [k for k, v in daily.items() if db._storable(v)]
-check("total stored daily metrics", len(stored), 85)
+check("total stored daily metrics", len(stored), 91)
 
 dead = [k for k in stored if "_rms" in k or "_p90" in k or "_mean" in k
         and k.startswith("noise_bps")]

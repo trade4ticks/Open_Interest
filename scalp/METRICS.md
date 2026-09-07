@@ -191,10 +191,10 @@ For a window of trades:
 
 | | |
 |---|---|
-| `range` | interquartile spread of trade prices (p75 − p25). The middle 50%, so one stray print does not define it. |
+| `range` | the spread of trade prices, measured **two ways** and both stored: `iqr` (p75 − p25, the middle 50%) and `p10p90` (p90 − p10, the middle 80%). |
 | `level` | volume-weighted mean trade price. |
 | `shift` | \|level(this window) − level(previous window)\| |
-| `ratio` | shift ÷ range, both in cents so the units cancel. |
+| `ratio` | shift ÷ **IQR**, both in cents so the units cancel. |
 
 Thresholds on the ratio are 0.5, 1.0 and 2.0, and they are the three regimes
 rather than a sweep: a shift **smaller** than the capture is a scratch, a shift
@@ -208,6 +208,35 @@ and the next level down became the best bid. The stock barely moved. On books
 this thin the midpoint reports order flicker as price movement, and that
 contaminates every quote-derived noise variant. A trade price means somebody
 paid it.
+
+### ⚠️ Two range measures, and only one of them feeds the ratio
+
+The IQR cannot be defined by a stray print — which matters on a tape where 91%
+of trades are odd lots and a single 1-share print 30 cents away is ordinary.
+But it may be **tighter than the area actually worked**: 10–15 cents is a
+routine capture on LLY and 20 in good conditions, and if the middle 50% reports
+less than that, the metric understates the opportunity it exists to measure.
+
+That is an empirical question about a specific book, so both are computed over
+the same windows and compared against remembered sessions.
+
+**The ratio, the thresholds, the quiet counts and the episodes all use the
+IQR.** That keeps the pre-registered primary fixed while the two measures are
+compared. If `p10p90` wins, the denominator should change too — and that is a
+second recompute, not a config flip, because every count downstream of the
+ratio moves with it.
+
+**Caution at 15s.** The 10-trade guard was sized for the IQR. Measured, the
+p10–p90 span actually has *lower* sampling error at every n (18.2% against
+25.5% at n=10) because it spans more of the distribution — but a single stray
+print is 10% of a 10-trade window, which lands exactly on the p90 boundary and
+defines it: one print 30 cents out takes the span from 5.31c to 10.39c. At
+n=15 the same print is 7% of the sample, inside the tail, and the span moves
+3.50c to 4.80c; by n=30 it barely moves. The guard is deliberately *not* raised
+for `p10p90` — the two measures must cover the same windows or the comparison
+is between populations rather than between measures — so this is an
+interpretation rule instead: on 15s windows a wide `p10p90` may be one odd lot
+rather than a wide market; on 60s windows it is trustworthy.
 
 ### Range is stored in cents AND bps, and the cents figure is the operative one
 
