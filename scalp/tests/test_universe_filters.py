@@ -70,6 +70,48 @@ check("$60M dollar volume still fails", rows, [])
 
 check("exit price is below the entry floor",
       config.UNIVERSE_EXIT_PRICE < config.UNIVERSE_MIN_PRICE, True)
+check("exit dollar volume is below the entry floor",
+      config.UNIVERSE_EXIT_DOLLAR_VOL < config.UNIVERSE_MIN_DOLLAR_VOL, True)
+
+# $200M x 1M shares = $200M, exactly at the floor: in.
+rows = classify(market(mkrow("EDGE", 200.0, 1_000_000)), pd.DataFrame(), TODAY)
+check("a name exactly at the dollar-volume floor qualifies",
+      rows[0]["qualified"], True)
+rows = classify(market(mkrow("EDGE", 199.0, 1_000_000)), pd.DataFrame(), TODAY)
+check("...and just under it does not", rows, [])
+
+
+print("\n=== 1b. the exit thresholds must track the entry floors ===")
+# Retention by hysteresis is INDEFINITE: `incumbent` is (qualified OR
+# retained), so a retained name is an incumbent again the next night, forever,
+# with stickiness playing no part. That makes a stale exit constant not merely
+# inconsistent but load-bearing -- it silently neuters a raised entry floor,
+# because every existing member between the old exit and the new floor is
+# carried indefinitely and the floor only ever blocks new entrants.
+#
+# Guarded as a RATIO rather than a pair of numbers so this still holds after
+# the next threshold change.
+check("exit price ratio is sane", 0.5 <= config.UNIVERSE_EXIT_PRICE_RATIO < 1.0,
+      True)
+check("exit dollar volume ratio is sane",
+      0.5 <= config.UNIVERSE_EXIT_DOLLAR_VOL_RATIO < 1.0, True)
+
+# The behavioural form: a name doing half the entry floor must eventually
+# leave, and must not be carried forever by its own retained status.
+half = config.UNIVERSE_MIN_DOLLAR_VOL / 2.0
+px = max(config.UNIVERSE_MIN_PRICE, 60.0)
+_prior = pd.DataFrame([{
+    "symbol": "TAIL", "qualified": True, "retained": False,
+    "first_entered": TODAY - timedelta(days=200),
+    "sticky_until": TODAY - timedelta(days=100)}])     # sticky long expired
+_mkt = market(mkrow("TAIL", px, half / px))
+_in = []
+_day = TODAY
+for _ in range(5):
+    _r = classify(_mkt, _prior, _day)[0]
+    _in.append(bool(_r["qualified"] or _r["retained"]))
+    _prior, _day = pd.DataFrame([_r]), _day + timedelta(days=1)
+check("a name at half the dollar-volume floor is dropped", any(_in), False)
 
 # The hysteresis cushion has to protect the band the floor just admitted. At
 # the old constant 85 an incumbent at $55 would have been dropped instantly --

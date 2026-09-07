@@ -713,7 +713,10 @@ PG_PASSWORD = os.environ.get("SCALP_PG_PASSWORD", os.environ.get("POSTGRES_PASSW
 
 
 # --- universe filters --------------------------------------------------------
-# Entry thresholds. The $100-$2,000 band yielded ~544 symbols on 2026-08-28.
+# Entry thresholds. Measured counts, same snapshot lineage:
+#   $100-$2,000, $100M   ~544  (the original band)
+#   $50-$2,000,  $100M    777  (dry run after the price floor dropped to $50)
+#   $50-$2,000,  $200M    ???  run --dry-run; the tail below $200M is the cut
 #
 # THE PRICE FLOOR IS $50, NOT $100. The $100 floor came from round-lot
 # reasoning, and the traded results do not support it as a hard rule: DG at
@@ -723,7 +726,13 @@ PG_PASSWORD = os.environ.get("SCALP_PG_PASSWORD", os.environ.get("POSTGRES_PASSW
 # because the filter removed them before anything was computed about them.
 UNIVERSE_MIN_PRICE      = float(os.environ.get("SCALP_MIN_PRICE", "50"))
 UNIVERSE_MAX_PRICE      = float(os.environ.get("SCALP_MAX_PRICE", "2000"))
-UNIVERSE_MIN_DOLLAR_VOL = float(os.environ.get("SCALP_MIN_DOLLAR_VOL", "100e6"))
+# THE DOLLAR VOLUME FLOOR IS $200M, NOT $100M. Dropping the price floor to $50
+# took the universe to 777 symbols, and compute is the slow stage (~8.3s a
+# symbol-day against fetch's ~0.36s). $200M cuts the tail without reaching the
+# traded names: FDX $317M, DDOG and DG all clear it comfortably. $300M was
+# considered and rejected -- it sits close enough to FDX to be excluding around
+# the third-best name on a threshold nothing has validated.
+UNIVERSE_MIN_DOLLAR_VOL = float(os.environ.get("SCALP_MIN_DOLLAR_VOL", "200e6"))
 
 # Hysteresis: a name already in the universe is only dropped below these, so
 # boundary names don't flicker in and out leaving ragged history.
@@ -738,7 +747,20 @@ UNIVERSE_MIN_DOLLAR_VOL = float(os.environ.get("SCALP_MIN_DOLLAR_VOL", "100e6"))
 UNIVERSE_EXIT_PRICE_RATIO = float(os.environ.get("SCALP_EXIT_PRICE_RATIO", "0.85"))
 UNIVERSE_EXIT_PRICE      = float(os.environ.get(
     "SCALP_EXIT_PRICE", UNIVERSE_MIN_PRICE * UNIVERSE_EXIT_PRICE_RATIO))
-UNIVERSE_EXIT_DOLLAR_VOL = float(os.environ.get("SCALP_EXIT_DOLLAR_VOL", "70e6"))
+# The exit dollar volume is a RATIO for the same reason as the exit price, and
+# here the constant was actively load-bearing rather than merely inconsistent.
+# Retention by hysteresis is INDEFINITE -- `incumbent` is (qualified OR
+# retained), so a retained name is an incumbent again the following night, with
+# no time limit and stickiness playing no part. Left at a constant 70M while
+# the entry floor moved to 200M, every existing member doing $70-200M would
+# have been retained forever: the floor would have blocked new entrants and cut
+# almost nothing from the 777 it was raised to reduce. Verified against
+# classify() before the change, five nights running, sticky window expired.
+UNIVERSE_EXIT_DOLLAR_VOL_RATIO = float(
+    os.environ.get("SCALP_EXIT_DOLLAR_VOL_RATIO", "0.70"))
+UNIVERSE_EXIT_DOLLAR_VOL = float(os.environ.get(
+    "SCALP_EXIT_DOLLAR_VOL",
+    UNIVERSE_MIN_DOLLAR_VOL * UNIVERSE_EXIT_DOLLAR_VOL_RATIO))
 
 # Stickiness: once a symbol enters, keep fetching it this many calendar days
 # even after it drops out. Costs little, preserves continuity.

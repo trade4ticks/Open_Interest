@@ -99,15 +99,21 @@ Write these, I'll run them, we'll design from the results.
 
 `snapshot/ohlc?symbol=*&venue=utp_cta`, run after the close.
 
-Filters: **price $50–$2,000**, **dollar volume ≥ $100M** (close × volume), **spread
-≥ 4 bps**. The $100–$2,000 band yielded ~544 symbols on 2026-08-28 data; the floor moved
-to $50 because the ranking is in basis points, where a 10-cent spread on a $60 stock is
-16 bps — wider than FDX at 7.6. Thresholds in config.
+Filters: **price $50–$2,000**, **dollar volume ≥ $200M** (close × volume), **spread
+≥ 4 bps**. The floor moved to $50 because the ranking is in basis points, where a 10-cent
+spread on a $60 stock is 16 bps — wider than FDX at 7.6. That took the count to 777, so
+the dollar-volume floor went to $200M to cut the tail; it does not reach the traded names
+(FDX $317M, DDOG and DG all clear it). $300M was rejected as close enough to FDX to be
+excluding around the best name on an unvalidated threshold. Counts, same lineage:
+$100/$100M → ~544, $50/$100M → 777, $50/$200M → re-run `--dry-run`.
 
-**Hysteresis:** enter at ≥$50 and ≥$100M; exit only below $42.50 or $70M. The exit price
-is a *ratio* of the entry floor (0.85), so the band follows the floor instead of having
-to be moved with it. Prevents boundary names flickering in and out and leaving ragged
-history.
+**Hysteresis:** enter at ≥$50 and ≥$200M; exit only below $42.50 or $140M. Both exits are
+*ratios* of their entry floors (0.85 and 0.70), so the band follows the floor instead of
+having to be moved with it. That is not cosmetic: retention is **indefinite** —
+`incumbent` is (qualified OR retained), so a retained name is an incumbent again the next
+night, forever, with stickiness playing no part. A stale exit constant therefore neuters
+a raised entry floor silently, carrying every existing member above the old exit and
+blocking only new entrants.
 
 **Spread floor:** names too tight to trade are dropped before the expensive stage —
 sorted ascending the top of the list is AMZN, TSLA, MSFT, MCD, V, META at 2–3 bps, about
