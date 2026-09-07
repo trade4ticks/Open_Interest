@@ -170,7 +170,147 @@ spread is not a capturable one. The share is reported so it can't hide.
 
 `spread_bps_tw` is the numerator of every ranking ratio.
 
-## Noise — five variants × three horizons
+## Quiet windows — is the shift small relative to the range?
+
+**Trades only. No quotes anywhere in this family, deliberately.**
+
+Every metric above this section is a session-level average, and sessions are
+not what gets traded. A name is untradeable for five minutes, good for five,
+untradeable again; an average blends the minutes worth working with the hours
+worth ignoring. Calibration at 77 ticker-days found nothing in any of the 232
+session-level metrics — the chance table went from 136 observed at |ρ| ≥ 0.3
+against 14 expected down to 1 against 2.1 as the sample doubled, and the top
+correlation fell from +0.474 to +0.321. That is a spurious result dissolving,
+not a weak one strengthening.
+
+So: measure the state first, then measure only inside it.
+
+### The definitions
+
+For a window of trades:
+
+| | |
+|---|---|
+| `range` | interquartile spread of trade prices (p75 − p25). The middle 50%, so one stray print does not define it. |
+| `level` | volume-weighted mean trade price. |
+| `shift` | \|level(this window) − level(previous window)\| |
+| `ratio` | shift ÷ range, both in cents so the units cancel. |
+
+Thresholds on the ratio are 0.5, 1.0 and 2.0, and they are the three regimes
+rather than a sweep: a shift **smaller** than the capture is a scratch, a shift
+**about equal** to it is the old bid becoming the new ask — one loss in a
+string of winners — and a shift **larger** is past tradeable.
+
+### Why quotes are excluded by construction
+
+EXPE's midpoint moved 19 cents in 30 seconds because a 29-share bid was pulled
+and the next level down became the best bid. The stock barely moved. On books
+this thin the midpoint reports order flicker as price movement, and that
+contaminates every quote-derived noise variant. A trade price means somebody
+paid it.
+
+### Range is stored in cents AND bps, and the cents figure is the operative one
+
+A bps normalisation assumes fixed capital: shares = capital ÷ price, so profit
+= capital × range ÷ price. But the binding constraint is **liquidity, not
+capital** — size is set by what the book absorbs. Under that constraint profit
+= range-in-cents × shares-available, and bps penalises an expensive name for an
+expense that is not what limits the trade. A 15-cent IQR is 15 cents on a $700
+name and a $70 one; what differs is how many shares each will take.
+
+### The step is part of the definition
+
+Windows are 15s, 30s and 60s, and all three advance by **10 seconds**. With a
+30s window and a 10s step consecutive windows share 20 seconds of trades, so
+the shift measures a 10-second displacement smoothed over 30 seconds of data.
+A ratio of 1.0 means something different at a different step.
+
+### ⚠️ Windows overlap, so a window count is not a count of chances
+
+One 30-second quiet patch produces about **three** overlapping quiet windows at
+a 10s step — and the inflation differs per window length (≈1.5× at 15s, 3× at
+30s, 6× at 60s), so **the three window lengths are not comparable to each other
+on raw counts.**
+
+`quiet_episodes_30s_10` counts maximal runs instead: one patch is one episode
+whatever the window length. That is the "separate chances" quantity, and only
+one name can be traded at a time.
+
+A second reason the three rows are not directly comparable: on a random walk
+the shift is a fixed 10-second displacement while the range grows with the
+window, so the ratio scales roughly as 1/√window. Measured on synthetic data
+the median ratio runs 0.50 / 0.32 / 0.18 at 15s / 30s / 60s. The same threshold
+is a *stricter* test at 15s than at 60s.
+
+### The trade guard, and why zero needs a denominator
+
+Below **10 trades** a window's IQR is a function of one or two prints rather
+than a measurement. Sampling a finely-resolved price path at n points gives a
+median relative error against the path's true IQR of 33.6% at n=6, 28.8% at
+n=8, **25.5% at n=10**, 20.5% at n=15 — a smooth 1/√n decay with no knee, so
+10 is a judgement: the thresholds are spaced by factors of two, and ~25% error
+in the denominator will not usually carry a ratio across a boundary.
+
+Both the window **and its predecessor** must clear the guard, since the shift
+needs both levels.
+
+The cost is coverage on slow names. At Poisson arrivals a 15s window needs
+~40 trades/min before half its windows qualify; at 30 trades/min only 22% do,
+and only ~5% of *pairs*. That is why `quiet_eligible_windows_*` is stored
+beside every count — otherwise a stored zero cannot be told apart from a name
+that never had enough trades to measure, and on the 15s row the second is the
+common case.
+
+### ⚠️ The primary is pre-registered
+
+Nine window × threshold combinations on a small sample of realised results is
+nine chances to find a spurious winner, which is how the previous sweep
+produced a +0.474 that became +0.321. So one combination is named **before**
+the data is looked at:
+
+| | |
+|---|---|
+| `quiet_episodes_30s_10` | the **operational** metric — separate chances at ~4 holds and the old-bid-becomes-new-ask threshold |
+| `shift_over_range_median_30s` | the **statistical** test — continuous, uses every window instead of thresholding, so more power on a small sample |
+
+The other combinations are diagnostics. They do not get to be the answer
+unless the primary works.
+
+### The same code runs live
+
+`scalp/quiet.py` imports numpy and pandas and nothing from `scalp`. That is a
+requirement: the live tape tool is a separate project that must not import
+from `scalp`, so it vendors the file verbatim and diffs it. There is one
+implementation of this calculation, not two.
+
+## Noise — two variants × three horizons × one statistic
+
+**Cut from 5 × 3 × 5 on 2026-09-07**, against a correlation matrix over 8,990
+ticker-days. Note that n: the P&L calibration that originally pinned `rms` had
+77 and has since dissolved, so the redundancy finding is the well-estimated one
+and the selection finding never was.
+
+- The four **quote** variants are one measurement taken four times — mean
+  cross-variant |ρ| of 0.909 / 0.914 / 0.943 by horizon at `rms`.
+- `trade_price` **stands alone**, its own cluster at |ρ| > 0.90, never merging
+  with a quote family. Kept on the data as well as on the flicker argument.
+- `rms` has the *highest* cross-variant agreement of any statistic — it is the
+  statistic that makes the variants look alike, so calibration's "the five
+  landed within 0.017 of each other" was a property of the statistic, not a
+  finding about the variants.
+- `trade_price`'s five statistics correlate at 0.963–0.970 (minimums above
+  0.90), so it needs one. `tw_mid`'s genuinely differ (0.602 mean at 5s) — but
+  that divergence is the documented median collapse, which is the pathology,
+  not signal.
+
+**p75, not rms**, for both: robust to a single jump (what flicker produces) and
+cannot be dragged to zero by a bare majority of unchanged buckets (what kills
+the median). rms is the most sensitive statistic to large moves, so on a quote
+series whose large moves are phantom it amplifies exactly the contamination the
+cut exists to escape. The same statistic is used for both variants so the
+comparison between them is not confounded by the statistic.
+
+
 
 Median absolute change between consecutive **fixed-clock** buckets, in bps of
 the buckets' own level. Fixed clock, never trade-to-trade — otherwise busy

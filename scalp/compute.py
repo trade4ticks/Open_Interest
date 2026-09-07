@@ -50,7 +50,7 @@ from datetime import date
 
 import pandas as pd
 
-from scalp import config, db, metrics, schema, store
+from scalp import config, db, metrics, quiet, schema, store
 
 log = logging.getLogger(__name__)
 
@@ -173,10 +173,19 @@ def compute_symbol_day(symbol: str, day: date, *, with_intraday: bool = True
     #
     # It has to be a parameter rather than a module-level flag because this
     # runs in a worker PROCESS, which never sees argparse's result.
+    # Quiet windows come from ONE session-level pass, shared by the daily row
+    # and every bucket. Computing them inside compute_window instead would run
+    # the whole 2,340-window series 27 times per symbol-day and, worse, would
+    # let a window straddling a bucket boundary be counted in both.
+    qseries = metrics.quiet_session(df, cols, start, end)
+    daily.update(quiet.daily_metrics(qseries))
+
     buckets = []
     if with_intraday:
         buckets = metrics.compute_buckets(df, cols, start, end,
                                           config.INTRADAY_BUCKET_MINUTES)
+        for row in buckets:
+            row.update(metrics.quiet_bucket_row(qseries, row))
     return daily, buckets, prov
 
 

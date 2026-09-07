@@ -823,12 +823,38 @@ NOISE_HORIZONS_SEC = (5, 10, 30)
 # therefore an average of a quantity that is one-sided almost every time it
 # changes. The asymmetry is the phenomenon, and the mid destroys it by
 # construction.
+# CUT FROM FIVE TO TWO on 2026-09-07, against a correlation matrix over 8,990
+# ticker-days -- note that n, because the P&L calibration that originally
+# picked `rms` had only 77 and has since dissolved (top |rho| +0.474 -> +0.321
+# as the sample doubled, 136 hits at |rho| >= 0.3 against 14 expected falling
+# to 1 against 2.1). The redundancy finding is the well-estimated one; the
+# selection finding was not.
+#
+# What the matrix said:
+#
+#   The four QUOTE variants are one thing. At rms their mean cross-variant
+#   |rho| is 0.909 / 0.914 / 0.943 by horizon. Keeping four of them was
+#   keeping one measurement four times.
+#
+#   trade_price stands alone -- it is its own cluster at |rho| > 0.90, never
+#   merging with a quote family at any horizon or statistic. So it is kept on
+#   the data as well as on the argument below.
+#
+#   `rms` has the HIGHEST cross-variant agreement of any statistic. It is the
+#   statistic that makes the variants look alike, which means calibration's
+#   "the five landed within 0.017 of each other" was a property of the
+#   statistic and not a finding about the variants.
+#
+# And the structural reason, which is why trade_price is kept rather than
+# tw_mid alone: a 29-share bid is pulled, the next level down becomes the best
+# bid, and the midpoint moves 19 cents while the stock does not move (EXPE, 30
+# seconds). That contaminates tw_mid, last_mid, bid_side and ask_side
+# identically. trade_price is the only variant made of prices somebody paid.
+# Deleting it would have made the contamination question permanently
+# unanswerable for any session older than RAW_RETENTION_DAYS.
 NOISE_VARIANTS = (
-    "tw_mid",       # time-weighted midpoint, weighted by quote duration
-    "last_mid",     # instantaneous last-quote midpoint, for comparison
-    "trade_price",  # trade prices, for comparison (contains the spread itself)
-    "bid_side",     # bid alone — first-class
-    "ask_side",     # ask alone — first-class
+    "tw_mid",       # time-weighted midpoint — the quote-derived incumbent
+    "trade_price",  # trades only — immune to the flicker above, own cluster
 )
 
 # --- the statistic, not just the variant -------------------------------------
@@ -848,13 +874,39 @@ NOISE_VARIANTS = (
 # Every variant is summarised five ways and calibration picks. Naming: the
 # bare `noise_bps_<variant>_<h>s` IS the median, kept under its existing name;
 # the rest carry an explicit suffix.
+# CUT FROM FIVE TO ONE, and to p75 rather than the previously pinned rms.
+#
+# For trade_price the choice does not matter: its five statistics correlate at
+# 0.963 / 0.966 / 0.970 mean with minimums above 0.90, because consecutive
+# trades alternate across the spread and every summary of that is the same
+# summary. For tw_mid it does matter -- 0.602 mean at 5s with a 0.030 minimum,
+# so its statistics genuinely differ.
+#
+# But that divergence is the KNOWN PATHOLOGY, not signal. The median collapses
+# to exactly zero on sparse names (DDS, IESC, NEU returned 0.0000 while
+# trading 20-35 times a minute), and the spread among tw_mid's statistics is
+# largely that collapse. Preserving several of them preserves the artefact.
+#
+# So: one statistic, p75. It is robust to a single jump -- which is exactly
+# what quote flicker produces -- and cannot be dragged to zero by a bare
+# majority of unchanged buckets, which is what kills the median. rms is the
+# opposite on both counts: it is the most sensitive statistic to large moves,
+# so on a quote series whose large moves are phantom it amplifies precisely
+# the contamination this cut exists to get away from.
+#
+# The SAME statistic is used for both variants deliberately. Comparing tw_mid
+# at one statistic against trade_price at another would confound variant with
+# statistic, and telling those apart is the whole reason both are kept.
 NOISE_STATISTICS = (
-    "",        # median — the established name, correct on dense names
-    "_mean",   # mean absolute change
-    "_p75",    # robust to one jump, cannot be dragged to zero by a majority
-    "_p90",
-    "_rms",    # conventional realized-volatility estimator
+    "_p75",
 )
+
+# The move_rate / move_bps decomposition is published for the QUOTE variant
+# only. For trade prices move_rate is ~1.0 by construction -- consecutive
+# trades alternate across the spread, so the bucketed value virtually always
+# changes -- and a column that is near-constant across every name and every
+# session is not a measurement.
+NOISE_DECOMPOSITION_VARIANTS = ("tw_mid",)
 
 # Noise decomposes as HOW OFTEN the mid moves x HOW FAR it moves when it does.
 # The median conflates the two and, on a sparse name, loses entirely to the
@@ -960,7 +1012,13 @@ QUOTE_LOOKBACK_DAYS = int(os.environ.get("SCALP_QUOTE_LOOKBACK_DAYS", "5"))
 # which is kept indefinitely.
 INTRADAY_NOISE_VARIANT   = os.environ.get("SCALP_INTRADAY_NOISE_VARIANT", "tw_mid")
 INTRADAY_NOISE_HORIZON   = int(os.environ.get("SCALP_INTRADAY_NOISE_HORIZON", "5"))
-INTRADAY_NOISE_STATISTIC = os.environ.get("SCALP_INTRADAY_NOISE_STATISTIC", "rms")
+# Moved rms -> p75 with the cut above. This renames the stored column, which
+# is the documented consequence of putting the pin in the column name: intraday
+# is 14 days and rebuildable so it is free there, and intraday_monthly keeps
+# its old rms column with the history it already has and stops extending it.
+# That discontinuity is cheapest now, while the rollup is weeks old.
+# Override with SCALP_INTRADAY_NOISE_STATISTIC=rms to keep the old pin.
+INTRADAY_NOISE_STATISTIC = os.environ.get("SCALP_INTRADAY_NOISE_STATISTIC", "p75")
 
 _V = INTRADAY_NOISE_VARIANT
 _H = INTRADAY_NOISE_HORIZON
@@ -971,6 +1029,26 @@ INTRADAY_RATIO_COLUMN    = f"ratio_{_V}_{_H}s_{_S}"
 INTRADAY_MOVE_RATE_COLUMN = f"move_rate_{_V}_{_H}s"
 INTRADAY_MOVE_BPS_COLUMN  = f"move_bps_{_V}_{_H}s"
 INTRADAY_COVERAGE_COLUMN  = f"quote_bucket_coverage_{_H}s"
+
+# --- quiet windows -----------------------------------------------------------
+# The grid, the step, the thresholds and the trade guard all live in
+# scalp/quiet.py, NOT here, because that module is vendored verbatim into the
+# live tape tool and a constant defined here would not travel with it. Config
+# re-exports the primary's column names so INTRADAY_COLUMNS can name them
+# without importing quiet at module scope in two places.
+from scalp.quiet import (                                    # noqa: E402
+    MIN_TRADES as QUIET_MIN_TRADES,
+    PRIMARY_THRESHOLD_KEY as QUIET_PRIMARY_THRESHOLD_KEY,
+    PRIMARY_WINDOW_SEC as QUIET_PRIMARY_WINDOW_SEC,
+    STEP_SEC as QUIET_STEP_SEC,
+    THRESHOLDS as QUIET_THRESHOLDS,
+    WINDOWS_SEC as QUIET_WINDOWS_SEC,
+)
+
+QUIET_PRIMARY_COLUMN = (
+    f"quiet_windows_{QUIET_PRIMARY_WINDOW_SEC}s_{QUIET_PRIMARY_THRESHOLD_KEY}")
+QUIET_PRIMARY_ELIGIBLE_COLUMN = (
+    f"quiet_eligible_windows_{QUIET_PRIMARY_WINDOW_SEC}s")
 
 # --- the stored columns ------------------------------------------------------
 # (column name, SQL type). The column name IS the metrics-dict key, so the
@@ -995,6 +1073,13 @@ INTRADAY_COLUMNS: tuple[tuple[str, str], ...] = (
     ("off_mid_bps",           "DOUBLE PRECISION"),
     ("spread_cents_tw",       "DOUBLE PRECISION"),
     ("spread_bps_tw",         "DOUBLE PRECISION"),
+    # The quiet-window primary, and ONLY the primary. All nine combinations
+    # would be nine wide columns in the table whose entire design note is that
+    # it is a subset. The eligible count travels with it for the same reason
+    # it does in daily_metrics: a quiet count of 0 otherwise cannot be told
+    # apart from a bucket that never had enough trades to measure.
+    (QUIET_PRIMARY_COLUMN,          "INTEGER"),
+    (QUIET_PRIMARY_ELIGIBLE_COLUMN, "INTEGER"),
     (INTRADAY_NOISE_COLUMN,     "DOUBLE PRECISION"),
     (INTRADAY_RATIO_COLUMN,     "DOUBLE PRECISION"),
     (INTRADAY_MOVE_RATE_COLUMN, "DOUBLE PRECISION"),

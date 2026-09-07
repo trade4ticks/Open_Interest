@@ -238,7 +238,18 @@ def tier_sparse_noise() -> int:
 
     df, cols = compute.prepare(sparse_trade_quote(), SESSION)
     start, end = compute.session_bounds(SESSION)
-    m = metrics.compute_window(df, cols, start, end)
+
+    # The catalog now stores p75 alone, so the collapsed median is no longer a
+    # stored metric. Compute the full set once here anyway: this tier exists to
+    # show that the median collapses and the SURVIVOR does not, and dropping
+    # the comparison would leave the choice of p75 asserted rather than shown.
+    from scalp import config as _cfg
+    _stats = _cfg.NOISE_STATISTICS
+    _cfg.NOISE_STATISTICS = ("", "_mean", "_p75", "_p90", "_rms")
+    try:
+        m = metrics.compute_window(df, cols, start, end)
+    finally:
+        _cfg.NOISE_STATISTICS = _stats
     m.pop("_provenance", None)
 
     median = m.get("noise_bps_tw_mid_10s")
@@ -271,6 +282,14 @@ def tier_sparse_noise() -> int:
               f"{name} is {value}; if it is 0 the alternative statistics are "
               f"no better than the median and the fix does not work")
 
+    # p75 is the one actually stored, so it is the one that has to survive
+    # this fixture. Asserted separately from the loop above, which compares
+    # the candidates, because this is a statement about the SHIPPED catalog.
+    check("the SURVIVING statistic (p75) is what the catalog stores",
+          _cfg.NOISE_STATISTICS == ("_p75",), str(_cfg.NOISE_STATISTICS))
+    check("...and it does not collapse on this sparse tape",
+          p75 is not None and math.isfinite(p75) and p75 > 0, str(p75))
+
     check("decomposition recovers the magnitude the median lost",
           move_bps is not None and math.isfinite(move_bps) and move_bps > 0,
           f"move_bps is {move_bps}")
@@ -283,9 +302,9 @@ def tier_sparse_noise() -> int:
     check("ratio on the zero median is NaN, not infinite",
           not math.isfinite(m.get("ratio_tw_mid_10s", float("nan"))),
           str(m.get("ratio_tw_mid_10s")))
-    check("ratio on the rms statistic is a real number",
-          math.isfinite(m.get("ratio_tw_mid_10s_rms", float("nan"))),
-          str(m.get("ratio_tw_mid_10s_rms")))
+    check("ratio on the stored statistic is a real number",
+          math.isfinite(m.get("ratio_tw_mid_10s_p75", float("nan"))),
+          str(m.get("ratio_tw_mid_10s_p75")))
 
     return failures
 

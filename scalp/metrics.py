@@ -38,7 +38,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from scalp import config
+from scalp import config, quiet
 
 
 # --- the timestamp collapse --------------------------------------------------
@@ -352,19 +352,32 @@ def _change_statistics(changes: pd.Series, prefix: str, out: dict) -> None:
       _rms         root mean square — the conventional realized-volatility
                    estimator, and the most sensitive to large moves
     """
-    keys = (prefix, prefix + "_mean", prefix + "_p75", prefix + "_p90",
-            prefix + "_rms")
+    keys = tuple(prefix + suffix for suffix in config.NOISE_STATISTICS)
     if len(changes) == 0:
         for key in keys:
             out[key] = float("nan")
         return
 
     values = changes.to_numpy(dtype="float64")
-    out[prefix] = float(np.median(values))
-    out[prefix + "_mean"] = float(np.mean(values))
-    out[prefix + "_p75"] = float(np.percentile(values, 75))
-    out[prefix + "_p90"] = float(np.percentile(values, 90))
-    out[prefix + "_rms"] = float(np.sqrt(np.mean(np.square(values))))
+    # The set is config-driven so a cut is one edit rather than an edit here
+    # and a matching one there. An unknown suffix raises rather than silently
+    # storing nothing: a metric that vanishes without complaint is how a
+    # column comes to be missing from months of history.
+    for suffix in config.NOISE_STATISTICS:
+        key = prefix + suffix
+        if suffix == "":
+            out[key] = float(np.median(values))
+        elif suffix == "_mean":
+            out[key] = float(np.mean(values))
+        elif suffix == "_p75":
+            out[key] = float(np.percentile(values, 75))
+        elif suffix == "_p90":
+            out[key] = float(np.percentile(values, 90))
+        elif suffix == "_rms":
+            out[key] = float(np.sqrt(np.mean(np.square(values))))
+        else:
+            raise ValueError(
+                f"unknown noise statistic {suffix!r} in config.NOISE_STATISTICS")
 
 
 def _decomposition(changes: pd.Series, variant: str, horizon,
@@ -403,7 +416,10 @@ def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
                   trade_time_col: str,
                   start: pd.Timestamp, end: pd.Timestamp,
                   horizons=config.NOISE_HORIZONS_SEC) -> dict:
-    """Five noise variants x three horizons x five statistics, in bps.
+    """The configured noise variants x three horizons x the configured
+    statistics, in bps. Two variants and one statistic since 2026-09-07; see
+    config.NOISE_VARIANTS for what the correlation matrix said about the other
+    three, and config.NOISE_STATISTICS for why p75 and not rms.
 
     Each statistic summarises the absolute change between consecutive
     fixed-clock buckets. See _change_statistics for why there are five and not
@@ -449,18 +465,26 @@ def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
 
     for h in horizons:
         possible = int(math.ceil(window_seconds / h)) if window_seconds else 0
-        specs = {
+        available = {
             "tw_mid":      (q, mid, time_col, True),
             "last_mid":    (q, mid, time_col, False),
             "bid_side":    (q, b, time_col, True),
             "ask_side":    (q, a, time_col, True),
             "trade_price": (trades, tp, trade_time_col, False),
         }
+        unknown = set(config.NOISE_VARIANTS) - set(available)
+        if unknown:
+            raise ValueError(
+                f"unknown noise variant(s) {sorted(unknown)} in "
+                f"config.NOISE_VARIANTS; known: {sorted(available)}")
+        specs = {v: available[v] for v in config.NOISE_VARIANTS}
         for variant, (frame, series, tcol, weighted) in specs.items():
             prefix = "noise_bps_" + variant + "_" + str(h) + "s"
+            decompose = variant in config.NOISE_DECOMPOSITION_VARIANTS
             if frame.empty or series.empty:
                 _change_statistics(empty, prefix, out)
-                _decomposition(empty, variant, h, out)
+                if decompose:
+                    _decomposition(empty, variant, h, out)
                 out[prefix + "__buckets"] = 0
                 if variant == "tw_mid":
                     out["zero_change_bucket_share_" + str(h) + "s"] = float("nan")
@@ -472,7 +496,12 @@ def noise_metrics(q: pd.DataFrame, trades: pd.DataFrame, *,
                                  weighted=weighted)
             changes = _bps_changes(vals)
             _change_statistics(changes, prefix, out)
-            zero_share = _decomposition(changes, variant, h, out)
+            # The zero share is a by-product of the decomposition, and the
+            # midpoint variant is the one that publishes it, so it has to be
+            # computed here even when the decomposition is not stored.
+            zero_share = (_decomposition(changes, variant, h, out) if decompose
+                          else float(1.0 - (changes > ZERO_CHANGE_EPS_BPS).mean())
+                          if len(changes) else float("nan"))
             out[prefix + "__buckets"] = int(len(vals))
 
             # Coverage and staleness describe the QUOTE series, so they are
@@ -934,6 +963,41 @@ def cross_source_metrics(trade_metrics: dict,
     else:
         out["quotes_per_trade"] = float("nan")
     return out
+
+
+def quiet_session(df: pd.DataFrame, cols: Columns,
+                  start: pd.Timestamp, end: pd.Timestamp) -> dict:
+    """Quiet-window series for a whole symbol-day, computed ONCE.
+
+    The daily row and all 26 intraday rows are aggregations of this single
+    series rather than 27 separate passes over re-sliced trades. That is not
+    only cheaper -- it is what makes the daily count equal the sum of the
+    bucket counts by construction instead of by coincidence.
+
+    Excluded prints are removed first. A restatement or an off-quote print is
+    not a price somebody paid at that instant, and both the range and the
+    level are meant to describe what could actually have been captured.
+    """
+    window = slice_window(df, cols.time, start, end)
+    if window.empty:
+        return quiet.from_trades(window, time_col=cols.time,
+                                 price_col=cols.price, size_col=cols.size,
+                                 start=start, end=end)
+    dropped = excluded_mask(window, cols.condition_cols)
+    return quiet.from_trades(window[~dropped], time_col=cols.time,
+                             price_col=cols.price, size_col=cols.size,
+                             start=start, end=end)
+
+
+def quiet_bucket_row(series: dict, row: dict) -> dict:
+    """The primary quiet columns for one bucket, keyed off the bucket bounds
+    the row already carries."""
+    start, end = row.get("window_start"), row.get("window_end")
+    if start is None or end is None:
+        return {}
+    to_s = lambda t: pd.Timestamp(t).to_datetime64().astype(  # noqa: E731
+        "datetime64[ns]").astype("int64") / 1e9
+    return quiet.bucket_metrics(series, to_s(start), to_s(end))
 
 
 def compute_buckets(df: pd.DataFrame, cols: Columns,
