@@ -65,19 +65,27 @@ differs is how many shares each will take.
 
 --- The step is part of the definition -------------------------------------
 
-Windows advance by STEP_SEC, not by their own length. With a 30s window and a
-10s step consecutive windows share 20 seconds of trades, so the shift measures
-a 10-second displacement smoothed over 30 seconds of data. A ratio of 1.0
-means something DIFFERENT at a different step, so the step is not a rendering
-choice and is not exposed as a per-call knob without also changing what the
+Windows advance by a THIRD OF THEIR OWN LENGTH -- 10s / 20s / 40s for the
+30s / 60s / 120s grid. Consecutive windows therefore share two thirds of their
+trades at every length, and the shift measures a displacement proportional to
+the window rather than a fixed one.
+
+A fixed step would not do that. At 10s a 120s window overlaps by 92%, so
+consecutive measurements are nearly identical and the shift is a ten-second
+displacement smoothed over two minutes; all three rows would be measuring the
+same ten seconds through differently-sized smoothing.
+
+The step is part of the DEFINITION, not a rendering choice: a ratio of 1.0
+means something different at a different step, so changing it changes what the
 thresholds mean.
 
 --- Windows overlap, so windows are not chances -----------------------------
 
-At a 30s window and a 10s step, one 30-second quiet patch produces THREE
-overlapping quiet windows. A raw window count is therefore inflated by roughly
-window/step -- 1.5x at 15s, 3x at 30s, 6x at 60s -- and the three window
-lengths are NOT comparable to each other on it.
+One quiet patch produces about THREE overlapping quiet windows, since
+window/step is 3 at every length. A raw window count is therefore inflated
+about threefold -- but by the SAME factor on every row, which a fixed step did
+not give (it was 1.5x / 3x / 6x, so the three rows were not comparable to each
+other on raw counts at all).
 
 `quiet_episodes` counts maximal runs instead: one quiet patch is one episode
 whatever the window length. That is the "separate chances" quantity, and it is
@@ -99,8 +107,53 @@ import pandas as pd
 
 # --- the grid ---------------------------------------------------------------
 
-WINDOWS_SEC: tuple[int, ...] = (15, 30, 60)
-STEP_SEC: int = 10
+# 30 / 60 / 120, not 15 / 30 / 60.
+#
+# The 15s row was measuring the wrong thing. At a 10-trade guard and Poisson
+# arrivals a 15s window needs ~40 trades/min before half its windows qualify,
+# and at 30 trades/min only ~5% of window PAIRS are usable -- so its counts
+# partly encoded arrival rate rather than quietness, which is the exact failure
+# mode 171 metrics were cut to escape. It also sat below where the p10-p90 span
+# is trustworthy.
+#
+# And the question is not about a single trade. It is whether a name is in a
+# workable state and will STAY there for several round trips -- a question
+# about the next minute or two. The observed case that motivated this: 30
+# seconds untradeable followed by 90 seconds good, judged as one two-minute
+# decision.
+WINDOWS_SEC: tuple[int, ...] = (30, 60, 120)
+
+# THE STEP SCALES WITH THE WINDOW. Each window advances by a third of its own
+# length, so every row overlaps its predecessor by two thirds and measures a
+# displacement proportional to its own timescale.
+#
+# A fixed step does not do this. At 10s a 120s window overlaps by 92%,
+# consecutive measurements are nearly identical, and the shift is a 10-second
+# displacement smoothed over two minutes -- so all three rows would be
+# measuring the same ten seconds through differently-sized smoothing.
+#
+# Two things fall out of the constant ratio, and both are why it is a ratio
+# rather than three hand-picked numbers:
+#
+#   The overlap inflation becomes IDENTICAL across rows. window/step is 3
+#   everywhere, so one quiet patch produces about three overlapping windows at
+#   every length, where the old fixed step gave 1.5x / 3x / 6x and made the
+#   three rows incomparable on raw counts.
+#
+#   The ratio becomes scale-invariant. On a random walk the shift grows as
+#   sqrt(step) and the range as sqrt(window), so the ratio goes as
+#   sqrt(step/window) -- constant when the two scale together. Under the old
+#   fixed step the median ratio ran 0.50 / 0.32 / 0.18 across the grid, so a
+#   single threshold was a stricter test at short windows than at long ones.
+STEP_RATIO: float = 1.0 / 3.0
+STEPS_SEC: dict = {w: w * STEP_RATIO for w in WINDOWS_SEC}
+
+
+def step_for(window_s: float) -> float:
+    """The step this window advances by. Falls back to the ratio for a window
+    outside the grid, so an ad-hoc call from the tape tool is still coherent
+    rather than silently reusing some other row's step."""
+    return float(STEPS_SEC.get(int(window_s), float(window_s) * STEP_RATIO))
 
 # Suffix -> ratio threshold. The suffix is the column name, so it is fixed
 # text rather than a formatted float: '05' not '0.5', which would put a dot in
@@ -115,14 +168,16 @@ THRESHOLDS: tuple[tuple[str, float], ...] = (("05", 0.5), ("10", 1.0),
 # BEFORE the data is looked at, and the rest are diagnostics that do not get
 # to be the answer:
 #
-#   quiet_episodes_30s_10        the OPERATIONAL metric -- separate chances at
-#                                the 30s window (about four holds at a 6-8s
-#                                median) and the 1.0 threshold (the old bid
-#                                becoming the new ask).
-#   shift_over_range_median_30s  the STATISTICAL test -- continuous, uses
+#   quiet_episodes_60s_10        the OPERATIONAL metric -- separate chances at
+#                                the 60s window and the 1.0 threshold (the old
+#                                bid becoming the new ask). 60s is the middle
+#                                of the grid and the closest to the timescale
+#                                the judgement is actually made on: whether the
+#                                name stays workable for several round trips.
+#   shift_over_range_median_60s  the STATISTICAL test -- continuous, uses
 #                                every window instead of thresholding, so it
 #                                has more power on a small realised sample.
-PRIMARY_WINDOW_SEC: int = 30
+PRIMARY_WINDOW_SEC: int = 60
 PRIMARY_THRESHOLD_KEY: str = "10"
 
 # Minimum trades in a window before its IQR is believed.
@@ -173,7 +228,7 @@ def threshold_keys() -> tuple[str, ...]:
 
 def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
                   window_s: float, start_s: float, end_s: float,
-                  step_s: float = STEP_SEC,
+                  step_s: float | None = None,
                   min_trades: int = MIN_TRADES) -> dict:
     """Per-window arrays for one window length over one session.
 
@@ -197,6 +252,7 @@ def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
     trustworthy shift even if it is itself dense. Requiring only the current
     window would silently admit a ratio built on an unstable level.
     """
+    step_s = step_for(window_s) if step_s is None else float(step_s)
     if end_s <= start_s or window_s <= 0 or step_s <= 0:
         return _empty_series()
 
@@ -249,16 +305,24 @@ def window_series(t_sec: np.ndarray, price: np.ndarray, size: np.ndarray, *,
     eligible = np.zeros(n_win, dtype=bool)
     eligible[1:] = dense_now[1:] & dense_now[:-1]
 
-    # The IQR is the denominator. See the module docstring: the thresholds and
-    # every count below them are defined against it, so swapping in the wider
-    # span here would silently redefine what "quiet" means.
+    # The IQR is the denominator OF RECORD. See the module docstring: the
+    # thresholds and every count below them are defined against it, so swapping
+    # in the wider span here would silently redefine what "quiet" means.
     ratio = _ratio(shift_c, iqr_c)
     ratio[~eligible] = np.nan
+
+    # The same ratio against the wider span, published as a median only. It
+    # exists so that if p10p90 wins the range comparison, whether the ratio
+    # should move to it is answerable from THIS recompute rather than needing
+    # another one. It deliberately drives no counts and no thresholds.
+    ratio_pp = _ratio(shift_c, pp_c)
+    ratio_pp[~eligible] = np.nan
 
     return {"w_start": w_start, "n": n, "level": level, "iqr_c": iqr_c,
             "iqr_bps": iqr_bps, "pp_c": pp_c, "pp_bps": pp_bps,
             "dollar": dollar, "shift_c": shift_c, "ratio": ratio,
-            "eligible": eligible, "window_s": float(window_s)}
+            "ratio_pp": ratio_pp, "eligible": eligible,
+            "window_s": float(window_s), "step_s": float(step_s)}
 
 
 def _ratio(shift_c: np.ndarray, range_c: np.ndarray) -> np.ndarray:
@@ -292,11 +356,12 @@ def _empty_series() -> dict:
     z = np.zeros(0)
     return {"w_start": z, "n": z.astype("int64"), "level": z, "iqr_c": z,
             "iqr_bps": z, "pp_c": z, "pp_bps": z, "dollar": z, "shift_c": z,
-            "ratio": z, "eligible": np.zeros(0, dtype=bool), "window_s": 0.0}
+            "ratio": z, "ratio_pp": z, "eligible": np.zeros(0, dtype=bool),
+            "window_s": 0.0, "step_s": 0.0}
 
 
 def session_series(t_sec, price, size, *, start_s: float, end_s: float,
-                   windows=WINDOWS_SEC, step_s: float = STEP_SEC,
+                   windows=WINDOWS_SEC, step_s: float | None = None,
                    min_trades: int = MIN_TRADES) -> dict:
     """window_series for every window length, computed ONCE per session.
 
@@ -305,10 +370,10 @@ def session_series(t_sec, price, size, *, start_s: float, end_s: float,
     daily count equal the sum of the bucket counts by construction instead of
     by coincidence.
     """
-    return {int(w): window_series(t_sec, price, size, window_s=float(w),
-                                  start_s=start_s, end_s=end_s, step_s=step_s,
-                                  min_trades=min_trades)
-            for w in windows}
+    return {int(w): window_series(
+        t_sec, price, size, window_s=float(w), start_s=start_s, end_s=end_s,
+        step_s=step_for(w) if step_s is None else step_s,
+        min_trades=min_trades) for w in windows}
 
 
 # --- aggregation ------------------------------------------------------------
@@ -358,6 +423,10 @@ def daily_metrics(series: dict, *, thresholds=THRESHOLDS,
         # continuous statistic, and conditioning it on quietness would throw
         # away the half of the distribution that says how bad the rest is.
         out[f"shift_over_range_median_{w}s"] = _median(ratio[elig])
+        # The same statistic against the wider span. Not a second test to run
+        # alongside the first -- it answers whether the DENOMINATOR should
+        # change, which is a different question from whether the metric works.
+        out[f"shift_over_p10p90_median_{w}s"] = _median(ser["ratio_pp"][elig])
 
         thr_primary = dict(thresholds)[primary_key]
         sel = elig & np.isfinite(ratio) & (ratio < thr_primary)
@@ -415,6 +484,7 @@ def metric_names(windows=WINDOWS_SEC, thresholds=THRESHOLDS,
         names.append(f"quiet_eligible_windows_{w}s")
         names += [f"quiet_windows_{w}s_{k}" for k, _ in thresholds]
         names += [f"shift_over_range_median_{w}s",
+                  f"shift_over_p10p90_median_{w}s",
                   f"quiet_range_iqr_cents_{w}s", f"quiet_range_iqr_bps_{w}s",
                   f"quiet_range_p10p90_cents_{w}s",
                   f"quiet_range_p10p90_bps_{w}s",
@@ -427,7 +497,7 @@ def metric_names(windows=WINDOWS_SEC, thresholds=THRESHOLDS,
 
 def from_trades(trades: pd.DataFrame, *, time_col: str, price_col: str,
                 size_col: str, start: pd.Timestamp, end: pd.Timestamp,
-                windows=WINDOWS_SEC, step_s: float = STEP_SEC,
+                windows=WINDOWS_SEC, step_s: float | None = None,
                 min_trades: int = MIN_TRADES) -> dict:
     """session_series from a trade frame. The one place pandas is required.
 

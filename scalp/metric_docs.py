@@ -177,6 +177,13 @@ PATTERNS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"^quiet_range_p10p90_bps_(?P<w>\d+)s$"),
      "noise",
      "The 10th-to-90th percentile span in bps of the level."),
+    (re.compile(r"^shift_over_p10p90_median_(?P<w>\d+)s$"),
+     "noise",
+     "Median of shift over the 10-90 percentile span across every "
+     "eligible {w}-second window. The twin of shift_over_range_median "
+     "against the wider denominator, so if p10p90 wins the range "
+     "comparison, whether the RATIO should move to it is answerable from "
+     "the same recompute. Drives no counts and no thresholds."),
     (re.compile(r"^quiet_dollar_vol_per_min_(?P<w>\d+)s$"),
      "noise",
      "Median dollar volume per minute inside quiet {w}-second windows. Per "

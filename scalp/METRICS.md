@@ -247,29 +247,59 @@ capital** — size is set by what the book absorbs. Under that constraint profit
 expense that is not what limits the trade. A 15-cent IQR is 15 cents on a $700
 name and a $70 one; what differs is how many shares each will take.
 
-### The step is part of the definition
+### The grid is 30 / 60 / 120s, and the step scales with the window
 
-Windows are 15s, 30s and 60s, and all three advance by **10 seconds**. With a
-30s window and a 10s step consecutive windows share 20 seconds of trades, so
-the shift measures a 10-second displacement smoothed over 30 seconds of data.
-A ratio of 1.0 means something different at a different step.
+Windows advance by **a third of their own length** — 10s / 20s / 40s — so every
+row overlaps its predecessor by two thirds and measures a displacement
+proportional to its own timescale.
+
+The 15s row was dropped because it measured the wrong thing: at a 10-trade
+guard and Poisson arrivals it needs ~40 trades/min before half its windows
+qualify, and at 30 trades/min only ~5% of window *pairs* are usable — so its
+counts partly encoded arrival rate rather than quietness, the same failure mode
+171 metrics were cut to escape. The question is also not about a single trade
+but about whether a name stays workable for several round trips, which is a
+one-to-two-minute question.
+
+A fixed step would not scale. At 10s a 120s window overlaps by 92%, so
+consecutive measurements are near-identical and the shift is a ten-second
+displacement smoothed over two minutes — all three rows measuring the same ten
+seconds through differently-sized smoothing.
+
+Two things follow from the constant ratio:
+
+**Overlap inflation is now identical across rows.** `window/step` is 3
+everywhere, so one quiet patch produces about three overlapping windows at
+every length. Under a fixed step it was 1.5× / 3× / 6×, which made raw counts
+incomparable between rows.
+
+**The ratio becomes scale-invariant.** On a random walk the shift grows as
+√step and the range as √window, so the ratio goes as √(step/window) — constant
+when they scale together. Measured on a pure walk: **0.393 / 0.395 / 0.414**
+across the grid (spread 1.06×). Under a fixed 10s step the same data gives a
+2.5× spread.
+
+On a *real* tape the spread is ~1.5×, and the residual is **not** the
+definition — it is the bid-ask bounce putting a floor under the range at short
+windows, so short windows read quieter. Measured with the bounce removed the
+IQR grows 1.00 / 1.38 / 1.91 against the √window ideal of 1.00 / 1.41 / 2.00;
+with it, 1.00 / 1.07 / 1.28. That residual is a property of the tape rather
+than an artefact to remove — for a scalper the bounce at 30s *is* part of what
+gets captured.
 
 ### ⚠️ Windows overlap, so a window count is not a count of chances
 
-One 30-second quiet patch produces about **three** overlapping quiet windows at
-a 10s step — and the inflation differs per window length (≈1.5× at 15s, 3× at
-30s, 6× at 60s), so **the three window lengths are not comparable to each other
-on raw counts.**
+One quiet patch produces about **three** overlapping quiet windows — and since
+the step scales with the window, that factor is now the *same* on every row
+rather than 1.5× / 3× / 6× under a fixed step.
 
 `quiet_episodes_30s_10` counts maximal runs instead: one patch is one episode
 whatever the window length. That is the "separate chances" quantity, and only
 one name can be traded at a time.
 
-A second reason the three rows are not directly comparable: on a random walk
-the shift is a fixed 10-second displacement while the range grows with the
-window, so the ratio scales roughly as 1/√window. Measured on synthetic data
-the median ratio runs 0.50 / 0.32 / 0.18 at 15s / 30s / 60s. The same threshold
-is a *stricter* test at 15s than at 60s.
+`quiet_episodes` remains the "separate chances" quantity regardless: one patch
+is one episode whatever the window length, and only one name can be traded at a
+time.
 
 ### The trade guard, and why zero needs a denominator
 
@@ -299,8 +329,13 @@ the data is looked at:
 
 | | |
 |---|---|
-| `quiet_episodes_30s_10` | the **operational** metric — separate chances at ~4 holds and the old-bid-becomes-new-ask threshold |
-| `shift_over_range_median_30s` | the **statistical** test — continuous, uses every window instead of thresholding, so more power on a small sample |
+| `quiet_episodes_60s_10` | the **operational** metric — separate chances at the 60s window, the middle of the grid and the closest to the timescale the judgement is actually made on |
+| `shift_over_range_median_60s` | the **statistical** test — continuous, uses every window instead of thresholding, so more power on a small sample |
+
+`shift_over_p10p90_median_{w}s` is stored alongside it: the same statistic
+against the wider span, so that if `p10p90` wins the range comparison, whether
+the ratio should move to it is answerable from the same recompute rather than
+needing another one. It drives no counts and no thresholds.
 
 The other combinations are diagnostics. They do not get to be the answer
 unless the primary works.
