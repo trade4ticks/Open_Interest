@@ -29,9 +29,11 @@ one, and `metrics_wide()` below is the shared implementation.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from decimal import Decimal as _Decimal
 
 import pandas as pd
 import psycopg2
@@ -619,8 +621,73 @@ def _storable(v) -> bool:
 
 
 def _num(v) -> float | None:
-    f = float(v)
+    """Coerce to float, mapping every flavour of "no value" onto SQL NULL.
+
+    None is a legitimate input, not a caller error: a symbol with no prior
+    measurement genuinely has no spread_bps, and that absence is the state the
+    spread floor deliberately treats as "include". float(None) raises, so
+    without this the never-measured symbols -- the ones the floor is careful to
+    keep -- were the ones that broke the write.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
     return None if pd.isna(f) else f
+
+
+# The universe INSERT's column order, named once so the tuple builder, the
+# statement and the dry-run type report cannot disagree about position.
+UNIVERSE_COLUMNS = (
+    "trade_date", "symbol", "close", "volume", "dollar_volume",
+    "qualified", "retained", "first_entered", "sticky_until",
+    "spread_bps", "spread_excluded",
+)
+
+# What psycopg2 will adapt without a registered adapter. datetime.date covers
+# datetime and pandas.Timestamp (both subclasses); NaT is deliberately NOT
+# covered, since it is a datetime subclass that adapts to something Postgres
+# will not accept in a DATE column.
+_ADAPTABLE = (bool, int, float, str, _dt.date, _dt.datetime, _Decimal)
+
+
+def universe_values(trade_date: date, rows: list[dict]) -> list[tuple]:
+    """Rows -> INSERT tuples, in UNIVERSE_COLUMNS order.
+
+    Split out of write_universe so --dry-run can run THIS, rather than a
+    re-implementation of it that would drift. A dry run that builds the values
+    the real write builds is the difference between "the filters produced a
+    plausible count" and "this run will land".
+    """
+    return [(trade_date, r["symbol"], _num(r.get("close")),
+             r.get("volume"), _num(r.get("dollar_volume")),
+             bool(r["qualified"]), bool(r["retained"]),
+             r.get("first_entered"), r.get("sticky_until"),
+             _num(r.get("spread_bps")),
+             bool(r.get("spread_excluded", False))) for r in rows]
+
+
+def universe_value_problems(values: list[tuple]) -> list[str]:
+    """Values psycopg2 could not adapt, as readable complaints. Empty is good.
+
+    This is the check the dry run was missing. It is a type check rather than a
+    round-trip against the server precisely so it needs no database -- a dry
+    run that had to connect would not be a dry run.
+    """
+    out = []
+    for row in values:
+        symbol = row[1]
+        for col, v in zip(UNIVERSE_COLUMNS, row):
+            if v is None or isinstance(v, _ADAPTABLE):
+                # NaT is a datetime subclass and slips through isinstance.
+                if v is not None and not isinstance(v, (bool, int, float, str)) \
+                        and pd.isna(v):
+                    out.append(f"{symbol}.{col}: {v!r} (not a storable date)")
+                continue
+            out.append(f"{symbol}.{col}: {type(v).__name__} = {v!r}")
+    return out
 
 
 def write_universe(trade_date: date, rows: list[dict]) -> int:
@@ -640,11 +707,7 @@ def write_universe(trade_date: date, rows: list[dict]) -> int:
             spread_bps = EXCLUDED.spread_bps,
             spread_excluded = EXCLUDED.spread_excluded
     """
-    values = [(trade_date, r["symbol"], r.get("close"), r.get("volume"),
-               r.get("dollar_volume"), r["qualified"], r["retained"],
-               r.get("first_entered"), r.get("sticky_until"),
-               _num(r.get("spread_bps")),
-               bool(r.get("spread_excluded", False))) for r in rows]
+    values = universe_values(trade_date, rows)
     with connect() as conn, conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
     return len(values)

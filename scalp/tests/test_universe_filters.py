@@ -203,6 +203,63 @@ rows = classify(market(mkrow("MSFT", 400.0, 30_000_000)), prior, qm)
 check("an omitted lookup excludes nothing", rows[0]["spread_excluded"], False)
 
 
+print("\n=== 5. the write payload - what --dry-run used to skip ===")
+# The crash this reproduces: a never-measured symbol has spread_bps None by
+# design (that is the state the floor treats as "include"), and _num() called
+# float(None) on it. So the symbols the spread floor is most careful to KEEP
+# were exactly the ones that broke the INSERT -- and the dry run passed,
+# because it stopped at the counts and never built a row.
+from scalp import db
+
+check("_num(None) is NULL, not a crash", db._num(None), None)
+check("_num(nan) is NULL", db._num(float("nan")), None)
+check("_num passes a real number through", db._num(2.5), 2.5)
+check("_num survives a non-numeric", db._num("n/a"), None)
+
+# The failing shape end to end: unmeasured symbol -> classify -> write tuples.
+_rows = classify(market(mkrow("NEWCO", 60.0, 5_000_000)), pd.DataFrame(), TODAY)
+check("an unmeasured symbol has no spread", _rows[0]["spread_bps"], None)
+_vals = db.universe_values(TODAY, _rows)
+check("...and still builds a write tuple", len(_vals), 1)
+check("...with NULL in the spread column", _vals[0][-2], None)
+check("...and False, not NULL, in the NOT NULL flag", _vals[0][-1], False)
+check("...typed as a real bool for psycopg2", isinstance(_vals[0][-1], bool),
+      True)
+check("no unstorable values", db.universe_value_problems(_vals), [])
+
+# The real nightly shape: measured and never-measured names in one batch.
+_mixed = classify(
+    market(mkrow("AAA", 60.0, 5_000_000), mkrow("BBB", 300.0, 4_000_000)),
+    pd.DataFrame(), TODAY,
+    {"AAA": (12.0, TODAY - timedelta(days=1))})       # BBB unmeasured
+_mv = db.universe_values(TODAY, _mixed)
+check("mixed measured/unmeasured batch builds", len(_mv), 2)
+check("...with no unstorable values", db.universe_value_problems(_mv), [])
+check("...one NULL spread, one not",
+      sorted(v[-2] is None for v in _mv), [False, True])
+
+# The tuple must line up with the column list the INSERT names, or values land
+# in the wrong columns silently.
+check("tuple width matches the column list", len(_vals[0]),
+      len(db.UNIVERSE_COLUMNS))
+check("spread_bps is where the INSERT says it is", db.UNIVERSE_COLUMNS[-2],
+      "spread_bps")
+check("spread_excluded likewise", db.UNIVERSE_COLUMNS[-1], "spread_excluded")
+
+# The validator has to actually catch something, or it is decoration. NaT is
+# the realistic offender: it reaches first_entered from a prior-universe frame,
+# is a datetime subclass so isinstance() waves it through, and Postgres will
+# not take it in a DATE column.
+_bad = list(_vals[0])
+_bad[7] = pd.NaT
+check("the validator catches NaT in a date column",
+      len(db.universe_value_problems([tuple(_bad)])), 1)
+_bad2 = list(_vals[0])
+_bad2[2] = object()
+check("...and an unadaptable object",
+      len(db.universe_value_problems([tuple(_bad2)])), 1)
+
+
 print(f"\n{'=' * 62}")
 print(f"PASSED {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:

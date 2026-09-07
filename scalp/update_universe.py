@@ -436,9 +436,37 @@ def main() -> None:
               + ", ".join(f"{r['symbol']} {r['spread_bps']:.1f}"
                           for r in tightest))
 
+    # BUILD THE ACTUAL WRITE PAYLOAD, even on a dry run.
+    #
+    # The dry run used to stop at the counts, so it exercised the filters and
+    # nothing else -- and then a real run failed in write_universe on the
+    # never-measured symbols, whose spread_bps is legitimately None. A dry run
+    # that cannot fail the way the real run fails is not a rehearsal, it is a
+    # different script. This calls the same db.universe_values() the write
+    # calls, then type-checks the tuples, so the only thing --dry-run still
+    # does not do is hand them to Postgres.
+    values = db.universe_values(trade_date, rows)
+    problems = db.universe_value_problems(values)
+    print()
+    print(f"write payload   : {len(values):,} row(s) x "
+          f"{len(db.UNIVERSE_COLUMNS)} column(s)")
+    if problems:
+        print(f"UNSTORABLE      : {len(problems)} value(s) psycopg2 cannot adapt")
+        for line in problems[:10]:
+            print(f"  {line}")
+        if len(problems) > 10:
+            print(f"  ... and {len(problems) - 10} more")
+        raise SystemExit(
+            "\nRefusing to continue: these would fail on INSERT. "
+            "Nothing was written.")
+    n_null_spread = sum(1 for v in values if v[-2] is None)
+    print(f"                  {n_null_spread:,} with a NULL spread_bps "
+          f"(never measured — kept by design)")
+    print("                  all values storable")
+
     if args.dry_run:
         print()
-        print("--dry-run: nothing written.")
+        print("--dry-run: payload built and type-checked, nothing written.")
         return
 
     db.init_schema()
