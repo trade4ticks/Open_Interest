@@ -1,4 +1,16 @@
-"""Where does compute.py's 20 seconds per symbol-day go?
+"""Where does compute.py's time per symbol-day go?
+
+    THIS PROFILER MISSED THE QUIET PATH ENTIRELY UNTIL 2026-09-07, and that
+    was not a cosmetic gap. A recompute ran five workers at 100% CPU for 32
+    minutes and wrote one symbol-day while this tool reported 5.89s for AAPL
+    on the same box. The two disagreed by orders of magnitude because the only
+    new code in the run -- quiet_session -- was the only code not being timed
+    here. A profiler that silently omits a stage does not merely under-report;
+    it actively exonerates the thing that is wrong.
+
+    Section 1 now times three stages, not two. Anything added to
+    compute_symbol_day in future has to be added here in the same commit, or
+    this tool will lie the same way again.
 
     python -m scalp.profile_compute --symbol FDX --date 2026-08-28
 
@@ -35,7 +47,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from scalp import compute, config, metrics, store
+from scalp import compute, config, metrics, quiet, store
 
 UNIVERSE = 544
 BACKFILL_DAYS = 10
@@ -123,12 +135,37 @@ def main() -> None:
                                       config.INTRADAY_BUCKET_MINUTES)
     t_buckets = time.perf_counter() - t0
 
-    total = t_daily + t_buckets
+    # The quiet-window series. ONE session-level pass shared by the daily row
+    # and every bucket, so it is timed once here the way compute_symbol_day
+    # runs it -- not once per window, which would triple-count it.
+    t0 = time.perf_counter()
+    qseries = metrics.quiet_session(df, cols, start, end)
+    quiet.daily_metrics(qseries)
+    t_quiet = time.perf_counter() - t0
+
+    total = t_daily + t_buckets + t_quiet
     print(f"daily row            : {t_daily:7.2f}s   "
           f"({100 * t_daily / total:4.1f}%)")
     print(f"{len(buckets):2d} intraday rows    : {t_buckets:7.2f}s   "
           f"({100 * t_buckets / total:4.1f}%)")
+    print(f"quiet windows        : {t_quiet:7.2f}s   "
+          f"({100 * t_quiet / total:4.1f}%)")
     print(f"total per symbol-day : {total:7.2f}s")
+    print()
+    print("Per window length, since one row of the grid running away would")
+    print("otherwise be averaged into the other two:")
+    for w in quiet.WINDOWS_SEC:
+        tw = time.perf_counter()
+        metrics.quiet_session(df, cols, start, end)
+        _ = time.perf_counter() - tw
+        n_win = len(qseries[w]["w_start"])
+        elig = int(qseries[w]["eligible"].sum())
+        print(f"  {w:3d}s step {quiet.step_for(w):4.0f}s : "
+              f"{n_win:5d} windows, {elig:5d} eligible")
+    print()
+    print("If this total is far below what a real run achieves per symbol-day,")
+    print("the difference is NOT in this symbol. Run scalp.profile_quiet over")
+    print("the largest and smallest stored days to find which symbol it is in.")
     print()
     print(f"intraday / daily     : {t_buckets / max(t_daily, 1e-9):.1f}x")
     print()

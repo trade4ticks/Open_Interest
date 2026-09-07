@@ -96,17 +96,17 @@ def _worker_init() -> None:
         pass
 
 
-def _compute_unit(unit: tuple[str, date, bool]):
+def _compute_unit(unit: tuple):
     """Worker entry point. Module-level so it pickles.
 
     Returns (daily, buckets, provenance, error) rather than raising: an
     exception crossing a process boundary loses its traceback and can fail to
     pickle at all, which turns one bad symbol-day into a dead pool.
     """
-    symbol, day, with_intraday = unit
+    symbol, day, with_intraday, with_quiet = unit
     try:
         daily, buckets, prov = compute_symbol_day(
-            symbol, day, with_intraday=with_intraday)
+            symbol, day, with_intraday=with_intraday, with_quiet=with_quiet)
         return daily, buckets, prov, None
     except Exception as exc:
         return None, [], {}, f"{type(exc).__name__}: {exc}"
@@ -143,7 +143,8 @@ def prepare(df: pd.DataFrame, day: date) -> tuple[pd.DataFrame, metrics.Columns]
     return out, cols
 
 
-def compute_symbol_day(symbol: str, day: date, *, with_intraday: bool = True
+def compute_symbol_day(symbol: str, day: date, *, with_intraday: bool = True,
+                       with_quiet: bool = True
                        ) -> tuple[dict | None, list[dict], dict]:
     """Returns (daily metrics, 15-minute rows, provenance).
 
@@ -177,15 +178,18 @@ def compute_symbol_day(symbol: str, day: date, *, with_intraday: bool = True
     # and every bucket. Computing them inside compute_window instead would run
     # the whole 2,340-window series 27 times per symbol-day and, worse, would
     # let a window straddling a bucket boundary be counted in both.
-    qseries = metrics.quiet_session(df, cols, start, end)
-    daily.update(quiet.daily_metrics(qseries))
+    qseries = None
+    if with_quiet:
+        qseries = metrics.quiet_session(df, cols, start, end)
+        daily.update(quiet.daily_metrics(qseries))
 
     buckets = []
     if with_intraday:
         buckets = metrics.compute_buckets(df, cols, start, end,
                                           config.INTRADAY_BUCKET_MINUTES)
-        for row in buckets:
-            row.update(metrics.quiet_bucket_row(qseries, row))
+        if qseries is not None:
+            for row in buckets:
+                row.update(metrics.quiet_bucket_row(qseries, row))
     return daily, buckets, prov
 
 
@@ -197,6 +201,14 @@ def main() -> None:
                     help="comma-separated; default is everything on disk")
     ap.add_argument("--no-intraday", action="store_true",
                     help="skip the 15-minute rows")
+    ap.add_argument("--no-quiet", action="store_true",
+                    help="skip the quiet-window metrics. A TRIAGE SWITCH, not "
+                         "a normal mode: run a handful of symbols with and "
+                         "without it to establish whether a slow run is in "
+                         "that path before profiling anything. A run with "
+                         "this flag writes rows MISSING the quiet metrics, so "
+                         "it needs a --replace pass afterwards to repair "
+                         "them.")
     ap.add_argument("--replace", action="store_true",
                     help="delete each symbol-day's stored rows before writing. "
                          "Re-running is already idempotent — the writes upsert "
@@ -273,7 +285,13 @@ def main() -> None:
             log.warning("could not read free space for the Postgres data "
                         "directory (remote server?) — skipping the disk check")
 
-    units = [(symbol, day, with_intraday) for day in days for symbol in symbols
+    with_quiet = not args.no_quiet
+    if not with_quiet:
+        log.warning("--no-quiet: the quiet-window metrics will NOT be "
+                    "computed. Rows written now are incomplete and need a "
+                    "--replace pass to repair.")
+    units = [(symbol, day, with_intraday, with_quiet)
+             for day in days for symbol in symbols
              if store.has_day(symbol, day)]
     skipped = len(days) * len(symbols) - len(units)
     if not units:
