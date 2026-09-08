@@ -27,9 +27,30 @@ import pandas as pd
 GRID_MIN = (2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0)
 
 
+_TRUE = {"t", "true", "yes", "y", "1"}
+
+
+def to_bool(s: pd.Series) -> pd.Series:
+    r"""Postgres booleans survive \copy as the CHARACTERS 't' and 'f'.
+
+    Read back with no coercion they are non-empty strings, and every non-empty
+    string is truthy -- so `f` would evaluate True and every short trip would
+    be signed as a long. That is silent: nothing raises, the direction is
+    simply inverted, and the derived exit price comes out on the wrong side of
+    the entry. Coerced here rather than left to the call site, because there
+    is no error to notice downstream.
+    """
+    if pd.api.types.is_bool_dtype(s):
+        return s
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(bool)
+    return s.astype(str).str.strip().str.lower().isin(_TRUE)
+
+
 def load(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["entry_ts", "exit_ts"])
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df["is_long"] = to_bool(df["is_long"])
     return df.sort_values(["trade_date", "symbol", "entry_ts", "seq"],
                           kind="stable").reset_index(drop=True)
 
@@ -62,6 +83,83 @@ def episode_frame(df: pd.DataFrame, ep: pd.Series) -> pd.DataFrame:
     out["bps"] = np.where(out["capital"] > 0,
                           out["net"] / out["capital"] * 1e4, np.nan)
     return out
+
+
+def self_flow_report(df: pd.DataFrame, ef: pd.DataFrame) -> None:
+    """Can my own prints be found in the tape and removed, and how big are they.
+
+    Everything here comes from the fills CSV alone -- no parquet -- so the
+    feasibility of the exclusion is settled before the expensive run starts.
+
+    THE RECONSTRUCTION IS TWO LEGS PER TRIP AND THAT IS AN ASSUMPTION.
+    `fills` stores the round trip, not the executions: entry_ts, exit_ts, the
+    volume-weighted entry price, and the peak position. For a 2-leg trip that
+    IS the pair of prints exactly. For a trip that scaled in or out, the
+    opening price is an average that may match no print at all and the true
+    share count exceeds 2 x peak_shares -- so those trips under-remove. The
+    legs histogram below is therefore the precision ceiling on the whole
+    correction, and it is printed rather than assumed.
+
+    The exit price is derived, not stored: net_pnl = peak x (exit - entry) -
+    fees for a long, so exit = entry + net_pnl / peak, understated by
+    fees/peak. At 10-50 share clips that is a fraction of a cent -- inside any
+    sane matching tolerance, but it is a derived number and is labelled as one.
+    """
+    print("=== self-flow: can my own prints be excluded ===")
+    legs = df["legs"].value_counts().sort_index()
+    n2 = int((df["legs"] == 2).sum())
+    print(f"trips                {len(df)}")
+    print(f"  exactly 2 legs     {n2}  ({n2 / len(df) * 100:.1f}%) "
+          "-- entry and exit prints reconstruct exactly")
+    print(f"  more than 2 legs   {len(df) - n2}  "
+          "-- scaled in/out; entry price is a VWAP matching no single print, "
+          "and 2 x peak_shares understates what I actually traded")
+    print("legs histogram:")
+    for k, v in legs.items():
+        print(f"  {k:>3} legs  {v:>4}  {'#' * min(60, v)}")
+    print()
+
+    # Timestamp resolution decides the matching tolerance. A statement that
+    # reports whole seconds cannot be matched at sub-second precision, and
+    # assuming it can would silently fail to match anything.
+    sub = ((df["entry_ts"].dt.microsecond != 0) |
+           (df["exit_ts"].dt.microsecond != 0)).mean()
+    print(f"timestamps with sub-second precision: {sub * 100:.1f}%")
+    if sub < 0.01:
+        print("  -> whole seconds only. Match tolerance must be >= 1s, and "
+              "several of my own prints can share one second.")
+    print()
+
+    sgn = np.where(df["is_long"], 1.0, -1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        exit_px = df["entry_price"] + sgn * df["net_pnl"] / df["peak_shares"]
+        capture_c = (exit_px - df["entry_price"]) * sgn * 100.0
+    print("derived exit price (entry +/- net/shares), capture in cents:")
+    print("  " + pct(capture_c.to_numpy(), (10, 25, 50, 75, 90)))
+    print("peak_shares:   " + pct(df["peak_shares"].to_numpy(), (10, 25, 50, 75, 90)))
+    print("capital ($):   " + pct(df["capital"].to_numpy(), (10, 25, 50, 75, 90)))
+    print()
+
+    # MY DOLLAR VOLUME, which is what the contamination argument rests on.
+    # Two legs per trip: the capital goes on and comes off, so both sides
+    # print. This is the numerator; the tape's dollar volume over the same
+    # window is the denominator and needs the parquet, so the ratio itself
+    # lands in step 2.
+    print("my dollar volume (2 x capital, both sides print):")
+    per_day = df.groupby(["trade_date", "symbol"]).agg(
+        trips=("seq", "size"), my_dollars=("capital", lambda c: 2 * c.sum()),
+        shares=("peak_shares", "median"))
+    print(f"  total          ${2 * df['capital'].sum():,.0f}")
+    print("  per ticker-day " + pct(per_day["my_dollars"].to_numpy(),
+                                    (10, 50, 90)))
+    print("  top 10 ticker-days by my dollar volume:")
+    print(per_day.sort_values("my_dollars", ascending=False).head(10)
+          .to_string())
+    print()
+    ep_dollars = 2 * ef["capital"]
+    print("  per episode    " + pct(ep_dollars.to_numpy(), (10, 50, 90)))
+    print("  my prints per episode (2 x trips, if every trip is 2 legs): "
+          + pct((2 * ef["trips"]).to_numpy().astype(float), (10, 50, 90)))
 
 
 def pct(v: np.ndarray, q) -> str:
@@ -149,6 +247,8 @@ def main() -> None:
     vc = ef10["trips"].value_counts().sort_index()
     for k, v in vc.items():
         print(f"  {k:>3} trips  {v:>4}  {'#' * min(60, v)}")
+    print()
+    self_flow_report(df, ef10)
     print()
     print("episodes per session (N=10):")
     print(ef10.groupby("trade_date").agg(
