@@ -213,6 +213,55 @@ CREATE TABLE IF NOT EXISTS intraday_metrics (
 """
 
 
+def intraday_migration_sql() -> str:
+    """ADD COLUMN IF NOT EXISTS for every configured intraday column.
+
+    CREATE TABLE IF NOT EXISTS DOES NOTHING TO A TABLE THAT ALREADY EXISTS,
+    and that is not a subtlety -- it is how adding the quiet-window columns
+    produced a run where five workers computed for 32 minutes and wrote one
+    row. The table had been created before those columns existed, init_schema
+    silently no-opped, and every symbol-day computed correctly and then failed
+    in the INSERT with UndefinedColumn.
+
+    So the column set is reconciled on every init, the same way the universe
+    table's is. ADD COLUMN IF NOT EXISTS is idempotent and, for a nullable
+    column with no default, metadata-only rather than a table rewrite. On the
+    partitioned parent it cascades to every existing child partition.
+
+    What this does NOT do is drop or retype anything. A renamed column (the
+    noise pin moving from _rms to _p75) leaves the old one behind holding its
+    history, which is deliberate -- that history is the only record of the old
+    definition, and intraday_monthly keeps it indefinitely. Use
+    migrations/rebuild_intraday_metrics.sql when a real rebuild is wanted.
+    """
+    parts = []
+    for table in ("intraday_metrics", "intraday_monthly"):
+        for name, sql_type in config.INTRADAY_COLUMNS:
+            parts.append(f"ALTER TABLE {table} "
+                         f"ADD COLUMN IF NOT EXISTS {name} {sql_type};")
+    return "\n".join(parts)
+
+
+def intraday_column_drift(conn) -> tuple:
+    """(missing, extra) between config.INTRADAY_COLUMNS and the live table.
+
+    `missing` is fatal -- the writer names its columns explicitly, so an
+    INSERT would fail on every row. `extra` is not: it is what a renamed
+    metric leaves behind, and those columns are kept.
+    """
+    want = {name for name, _ in config.INTRADAY_COLUMNS}
+    fixed = {"trade_date", "symbol", "bucket_start", "bucket_time",
+             "month", "sessions", "trades_total"}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'intraday_metrics' AND table_schema = 'public'")
+        have = {r[0] for r in cur.fetchall()}
+    if not have:
+        return (sorted(want), [])
+    return (sorted(want - have), sorted(have - want - fixed))
+
+
 def intraday_monthly_ddl() -> str:
     """The rollup. Same metric subset, one row per (symbol, clock bucket, month).
 
@@ -334,7 +383,24 @@ def init_schema() -> None:
         cur.execute(UNIVERSE_MIGRATION_SQL)
         cur.execute(intraday_ddl())
         cur.execute(intraday_monthly_ddl())
+        # AFTER the CREATEs, and not optional. See intraday_migration_sql:
+        # CREATE TABLE IF NOT EXISTS cannot add a column to a table that
+        # already exists, so without this an added metric reaches the INSERT
+        # and fails there, once per symbol-day, for the length of the run.
+        cur.execute(intraday_migration_sql())
         cur.execute(FETCH_RUNS_DDL)
+    with connect() as conn:
+        missing, extra = intraday_column_drift(conn)
+    if missing:
+        raise RuntimeError(
+            f"intraday_metrics is still missing {len(missing)} configured "
+            f"column(s) after the migration ran: {missing}. Every INSERT "
+            f"would fail. This should be impossible -- ADD COLUMN IF NOT "
+            f"EXISTS just ran for each of them -- so check that "
+            f"config.INTRADAY_COLUMNS names valid SQL types.")
+    if extra:
+        log.info("intraday_metrics has %d column(s) not in the config set, "
+                 "kept for their history: %s", len(extra), extra)
     log.info("schema ensured on %s/%s", config.PG_HOST, config.PG_DB)
 
 

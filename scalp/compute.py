@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
@@ -57,6 +58,27 @@ log = logging.getLogger(__name__)
 
 # Linux only: ask the kernel to signal this process when its PARENT dies.
 PR_SET_PDEATHSIG = 1
+
+
+# CONSECUTIVE failures before the run gives up — worker exceptions and write
+# exceptions alike, since either one failing on every unit means the same
+# thing: the run cannot produce anything and is only burning CPU.
+#
+# Consecutive rather than cumulative, and the distinction is the whole design.
+# A systematic fault (a missing column, a broken pool) fails on the first unit
+# and on every unit after it, so a streak reaches the threshold immediately. A
+# genuinely bad symbol-day is isolated, and the next success resets the count,
+# so a long run survives a handful of them. A cumulative cap would kill a
+# 10,000-unit run over three unrelated bad rows.
+FAILURE_ABORT_STREAK = int(os.environ.get("SCALP_FAILURE_ABORT_STREAK", "3"))
+
+# How often the run says it is alive, in seconds, regardless of completions.
+HEARTBEAT_SEC = float(os.environ.get("SCALP_HEARTBEAT_SEC", "30"))
+
+
+class AbortRun(RuntimeError):
+    """A failure that makes continuing pointless — raised from the write path
+    so the pool can be cancelled rather than drained."""
 
 
 def _worker_init() -> None:
@@ -307,10 +329,34 @@ def main() -> None:
 
     rows_written = 0
     computed = failed = 0
+    recent_failures: list[str] = []      # the current consecutive streak
     printed: list[dict] = []
     months_touched: set[date] = set()
     days_written: set[date] = set()
     t0 = time.monotonic()
+
+    def _abort_if_systematic() -> None:
+        """Stop once the failures are clearly not about one symbol-day."""
+        if len(recent_failures) < FAILURE_ABORT_STREAK:
+            return
+        detail = "\n".join(f"  {m}" for m in recent_failures[:5])
+        hint = ""
+        joined = " ".join(recent_failures).lower()
+        if "undefinedcolumn" in joined or "does not exist" in joined:
+            hint = (
+                "\n\nThat looks like the stored table being behind "
+                "config.INTRADAY_COLUMNS.\nCREATE TABLE IF NOT EXISTS cannot "
+                "add a column to a table that already\nexists, which is why "
+                "this can appear after a metric is added. Run:\n\n"
+                "    python -c \"from scalp import db; db.init_schema()\"\n\n"
+                "which reconciles the column set, then re-run.")
+        elif "brokenprocesspool" in joined:
+            hint = ("\n\nThe worker pool died. That is usually an OOM kill — "
+                    "check dmesg and\nlower --workers.")
+        raise AbortRun(
+            f"{len(recent_failures)} consecutive failures — aborting rather "
+            f"than spending the rest of the run producing nothing.\n\n"
+            f"{detail}{hint}")
 
     def handle(symbol: str, day: date, payload) -> None:
         """Write one finished unit. Runs in the PARENT — one DB connection."""
@@ -318,11 +364,18 @@ def main() -> None:
         daily, buckets, prov, err = payload
         if err:
             failed += 1
-            log.warning("  %s %s: %s", symbol, day, err)
+            recent_failures.append(f"{symbol} {day}: {err}")
+            log.error("  FAILED %s %s: %s", symbol, day, err)
+            _abort_if_systematic()
             return
         if daily is None:
             return
         computed += 1
+        # NOT a place to clear the streak. Computing is not success -- the
+        # incident this guards against computed every symbol-day perfectly and
+        # failed in the write, so clearing here would reset the count on the
+        # very units that are failing and the threshold would never be reached.
+        # Only a completed WRITE breaks the streak.
         if args.do_print:
             printed.append({"symbol": symbol, "trade_date": day, **daily})
             if prov:
@@ -333,48 +386,124 @@ def main() -> None:
                          int(prov.get("records_lost_to_collapse", 0)),
                          prov.get("auction_minutes_trimmed", 0.0))
             return
-        if args.replace:
-            db.delete_symbol_day(day, symbol)
-        rows_written += db.write_daily_metrics(day, symbol, daily)
-        rows_written += db.write_provenance(day, symbol, prov)
-        if with_intraday:
-            rows_written += db.write_intraday_metrics(day, symbol, buckets)
-            months_touched.add(db.month_start(day))
-        days_written.add(day)
+        # THE WRITE IS GUARDED, AND A REPEATED FAILURE IS FATAL.
+        #
+        # This ran unguarded once. An added metric was missing from
+        # intraday_metrics, so every symbol-day computed correctly and then
+        # raised UndefinedColumn here -- and because the exception escaped the
+        # loop while every unit was already submitted, the pool's __exit__ sat
+        # in shutdown(wait=True) grinding through all 10,656 of them before
+        # the traceback could print. Five workers at 100% CPU for 32 minutes,
+        # one row written, no output. Indistinguishable from a hang.
+        #
+        # So: catch it, record it, and abort once it is clear the failure is
+        # systematic rather than one bad symbol-day. A schema mismatch fails
+        # on the FIRST row and on every row after it; there is nothing to be
+        # learned from discovering that 10,656 times.
+        try:
+            if args.replace:
+                db.delete_symbol_day(day, symbol)
+            rows_written += db.write_daily_metrics(day, symbol, daily)
+            rows_written += db.write_provenance(day, symbol, prov)
+            if with_intraday:
+                rows_written += db.write_intraday_metrics(day, symbol, buckets)
+                months_touched.add(db.month_start(day))
+            days_written.add(day)
+        except Exception as exc:                                  # noqa: BLE001
+            failed += 1
+            recent_failures.append(
+                f"{symbol} {day}: {type(exc).__name__}: {exc}")
+            log.error("  WRITE FAILED %s %s: %s: %s",
+                      symbol, day, type(exc).__name__, exc)
+            _abort_if_systematic()
+            return
+        recent_failures.clear()
+
+    last_log = [t0]
 
     def progress(done: int) -> None:
-        if done % 25 and done != len(units):
+        """TIME-BASED, not count-based.
+
+        The old form logged every 25 units, which says nothing at all while
+        units are not completing -- exactly the case where output matters. A
+        run that has stalled and a run that is working looked identical for 32
+        minutes. Now the line appears on a clock, so silence means stopped.
+        """
+        now = time.monotonic()
+        if (now - last_log[0]) < HEARTBEAT_SEC and done != len(units):
             return
-        elapsed = time.monotonic() - t0
+        last_log[0] = now
+        elapsed = now - t0
         rate = done / max(elapsed, 1e-9)
         log.info("  %d/%d  %.2f symbol-days/s  eta %.0fs  (%d failed)",
                  done, len(units), rate,
                  (len(units) - done) / max(rate, 1e-9), failed)
 
-    if workers <= 1:
-        for i, unit in enumerate(units, 1):
-            handle(unit[0], unit[1], _compute_unit(unit))
-            progress(i)
-    else:
-        # Metric computation is CPU-bound, so this is processes rather than
-        # threads — the GIL would serialise a thread pool exactly where the
-        # time is being spent.
-        with ProcessPoolExecutor(max_workers=workers,
-                                 initializer=_worker_init) as pool:
-            futures = {pool.submit(_compute_unit, u): u for u in units}
-            for i, fut in enumerate(as_completed(futures), 1):
-                symbol, day = futures[fut][0], futures[fut][1]
-                try:
-                    payload = fut.result()
-                except Exception as exc:          # worker died outright
-                    payload = (None, [], {}, f"{type(exc).__name__}: {exc}")
-                handle(symbol, day, payload)
+    def heartbeat(stop_evt) -> None:
+        """Says the run is alive even when NOTHING is completing.
+
+        progress() only fires when a unit finishes. A single pathological
+        symbol-day, or a pool wedged behind a blocking call, produces no
+        completions and therefore no output — which is the silence this
+        exists to break. Daemon thread, so it can never hold the process open.
+        """
+        while not stop_evt.wait(HEARTBEAT_SEC):
+            log.info("  ... alive: %d/%d done, %d failed, %.0fs elapsed",
+                     computed + failed, len(units), failed,
+                     time.monotonic() - t0)
+
+    stop_evt = threading.Event()
+    hb = threading.Thread(target=heartbeat, args=(stop_evt,), daemon=True)
+    hb.start()
+    aborted: AbortRun | None = None
+    try:
+        if workers <= 1:
+            for i, unit in enumerate(units, 1):
+                handle(unit[0], unit[1], _compute_unit(unit))
                 progress(i)
+        else:
+            # Metric computation is CPU-bound, so this is processes rather than
+            # threads — the GIL would serialise a thread pool exactly where the
+            # time is being spent.
+            #
+            # NOT a `with` block. Its __exit__ calls shutdown(wait=True), which
+            # waits for every SUBMITTED unit — and all of them are submitted up
+            # front. So an exception raised while handling results left the
+            # parent blocked until the pool had computed all 10,656 results it
+            # was about to discard. The explicit shutdown below cancels what
+            # has not started instead.
+            pool = ProcessPoolExecutor(max_workers=workers,
+                                       initializer=_worker_init)
+            futures = {pool.submit(_compute_unit, u): u for u in units}
+            try:
+                for i, fut in enumerate(as_completed(futures), 1):
+                    symbol, day = futures[fut][0], futures[fut][1]
+                    try:
+                        payload = fut.result()
+                    except Exception as exc:      # worker died outright
+                        payload = (None, [], {}, f"{type(exc).__name__}: {exc}")
+                    handle(symbol, day, payload)
+                    progress(i)
+            except AbortRun as exc:
+                aborted = exc
+                log.error("aborting: cancelling %d queued unit(s)",
+                          sum(1 for f in futures if not f.done()))
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+    except AbortRun as exc:
+        aborted = exc
+    finally:
+        stop_evt.set()
 
     elapsed = time.monotonic() - t0
     log.info("%d computed, %d skipped, %d failed in %.1f min (%.2f s/symbol-day)",
              computed, skipped, failed, elapsed / 60,
              elapsed / max(computed, 1))
+
+    if aborted is not None:
+        # Neither the rollup nor the vacuum runs on an aborted run: both would
+        # be computed from a partial write and would look like real output.
+        raise SystemExit(f"\nRUN ABORTED\n{'=' * 60}\n{aborted}")
 
     # --- monthly rollup -----------------------------------------------------
     # Written on every run, from day one. This is the ONLY irreversible
