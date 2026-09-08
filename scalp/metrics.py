@@ -734,7 +734,8 @@ class Columns:
 def compute_window(df: pd.DataFrame, cols: Columns,
                    start: pd.Timestamp, end: pd.Timestamp, *,
                    exclude_auction_edges_for_quotes: bool = True,
-                   with_provenance: bool = True) -> dict:
+                   with_provenance: bool = True,
+                   exclude_extra: pd.Series | None = None) -> dict:
     """Every metric for one symbol over [start, end).
 
     This is THE function. The daily row, each 15-minute row, and the future
@@ -743,6 +744,28 @@ def compute_window(df: pd.DataFrame, cols: Columns,
 
     Auction-edge trimming applies to the quote-derived metrics only. Trade
     counts and volume use the full window, because an arrival is an arrival.
+
+    `exclude_extra` drops further rows FROM THE TRADE SIDE ONLY, on top of the
+    condition-code exclusions. It exists for the episode analysis, which has
+    to measure the tape without the operator's own prints in it: at ~13% of a
+    name's dollar volume those prints are a systematic bias in every flow
+    metric, pushing at_bid_share up and at_ask_share not at all.
+
+    IT IS A MASK RATHER THAN A PRE-FILTERED FRAME, and that is the whole
+    reason it lives here instead of at the call site. The source is
+    trade_quote: one row per trade CARRYING the prevailing bid and ask. Handing
+    this function a frame with those rows already removed would delete quote
+    observations at exactly the instants trading happened, and move
+    spread_bps_tw -- a quote measurement that has nothing to do with who
+    traded. Passed as a mask it joins `dropped`, which the quote path already
+    ignores (`q` is built from `window`, not from `trades`), so the quote-
+    derived metrics are provably untouched: spread must come out identical
+    with and without it.
+
+    `rows_excluded` keeps meaning condition-code exclusions alone. The extra
+    count is published separately as `rows_excluded_extra` rather than folded
+    in, because that column is a data-quality diagnostic with months of
+    history and quietly redefining it would break the comparison.
     """
     window = slice_window(df, cols.time, start, end)
     result: dict = {
@@ -769,9 +792,14 @@ def compute_window(df: pd.DataFrame, cols: Columns,
     dropped = excluded_mask(window, cols.condition_cols)
     vendor_odd = _flag(window, FLAG_ODD_LOT_VENDOR, cols.condition_cols,
                        {VENDOR_ODD_LOT_CODE})
-    trades = window[~dropped]
     result["rows_excluded"] = int(dropped.sum())
     result["excluded_share"] = float(dropped.mean())
+    result["rows_excluded_extra"] = 0
+    if exclude_extra is not None:
+        extra = exclude_extra.reindex(window.index).fillna(False).astype(bool)
+        result["rows_excluded_extra"] = int(extra.sum())
+        dropped = dropped | extra
+    trades = window[~dropped]
 
     # Quotes: collapse same-instant records BEFORE any duration weighting.
     if exclude_auction_edges_for_quotes:

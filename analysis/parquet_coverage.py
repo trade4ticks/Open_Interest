@@ -14,9 +14,15 @@ and preparing each symbol-day once, not by the per-episode windows.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sys
 
 import pandas as pd
+
+# The analysis lives beside the package it reads, not inside it, so the repo
+# root goes on the path here rather than being demanded as PYTHONPATH at every
+# invocation. Placed before the `scalp` import deliberately.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from scalp import store
 
