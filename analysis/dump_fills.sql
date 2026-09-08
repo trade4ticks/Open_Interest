@@ -1,0 +1,16 @@
+-- Round-trip fills, one row per trip, for the episode analysis.
+--
+-- READ-ONLY. This SELECTs from `fills` in the `equities_scalp` database and
+-- writes a file on the client side via \copy. Nothing is written to Postgres.
+--
+-- The fills table is owned by the dashboard (app/routers/equities_scalp.py),
+-- not by this pipeline, which is why this analysis reads a CSV dump rather
+-- than opening a connection of its own: the analysis has no business holding
+-- credentials to a table it must never modify.
+--
+-- ORDERED BY (trade_date, symbol, entry_ts, seq) so the consumer can assume
+-- time order within a ticker-day and does not have to re-sort to find the
+-- gaps between consecutive trips. `seq` breaks the tie because two round
+-- trips can share an entry SECOND at an eight-second median hold -- which is
+-- the same reason `seq` is in the table's primary key.
+\copy (SELECT trade_date, symbol, seq, entry_ts, exit_ts, peak_shares, entry_price, capital, net_pnl, duration_s, is_long, legs FROM fills ORDER BY trade_date, symbol, entry_ts, seq) TO 'fills_dump.csv' WITH (FORMAT csv, HEADER true)
