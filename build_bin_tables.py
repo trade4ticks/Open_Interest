@@ -20,10 +20,27 @@ Per-tier runtime is ~1-3 minutes for ~70 metrics × 125 tickers × ~1800 dates.
 tt_thresholds rebuild is full (all metrics × all tickers) but cheap (~18k
 small array rows).  Run on the evening batch via --build-tt.
 
+tt_bins has two build modes.  --build-tt-bins rebuilds all history;
+--build-tt-bins-incremental rebuilds only rows at or after --since (default:
+today - FEATURES_LOOKBACK_DAYS, matching the window build_features re-upserts).
+Incremental is safe because the train-test ruler is frozen at the cutoff: a
+post-cutoff row's bin depends only on its own value and pre-cutoff history, so
+re-binning older post-cutoff rows reproduces the value they already hold.  That
+is NOT true of wf_bins (expanding window) or is_bins (whole-history population),
+which is why neither has an incremental mode.
+
+EDITING PRE-CUTOFF daily_features DATA INVALIDATES EVERY POST-CUTOFF ROW.
+The ruler shifts, so every bin moves.  Incremental cannot detect this — there
+is no timestamp on daily_features to detect it from.  After any backfill that
+touches trade_date < cutoff, run a full --build-tt-bins by hand.
+
 Usage:
     python build_bin_tables.py --tier {MORNING,EVENING}
     python build_bin_tables.py --build-tt
     python build_bin_tables.py --tier EVENING --build-tt    (combined)
+    python build_bin_tables.py --build-tt-bins                  (full history)
+    python build_bin_tables.py --build-tt-bins-incremental      (recent rows)
+    python build_bin_tables.py --build-tt-bins-incremental --since 2026-06-01
 """
 from __future__ import annotations
 
@@ -31,7 +48,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import psycopg2.extras
@@ -56,6 +73,17 @@ from lib.bin_schema import (
 # Cutoff stored as a date object for tt_bins (the bin compute compares date
 # objects, not strings).  Same calendar value as TRAIN_TEST_CUTOFF_DEFAULT.
 TT_CUTOFF_DATE = date.fromisoformat(TRAIN_TEST_CUTOFF_DEFAULT)
+
+# Mirrors run_pipeline.py's FEATURES_LOOKBACK_DAYS.  Deliberately a copy, not an
+# import: run_pipeline imports build_features, and this module is invoked BY
+# run_pipeline as a subprocess — importing back through the feature builder
+# would make the bin build depend on the module whose output it reads.
+#
+# If run_pipeline's window changes, change this too.  The incremental tt_bins
+# window must never be SHORTER than the window build_features re-upserts: every
+# run rewrites the last FEATURES_LOOKBACK_DAYS of daily_features, so a shorter
+# tt window would bin a row once and never revisit the revision.
+FEATURES_LOOKBACK_DAYS = 45
 
 logging.basicConfig(
     level=logging.INFO,
@@ -361,23 +389,7 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
         log.warning("daily_features has no tickers — nothing to bin.")
         return 0
 
-    # Build the upsert SQL once.  tt_bins is single-tier (no MORNING/EVENING
-    # split); the SET clause names cutoff_date + frac_<m> + bin20_<m> for
-    # every eligible metric.  Same frac+bin20 pair shape as wf_bins / is_bins.
-    write_cols = ["ticker", "trade_date", "cutoff_date"]
-    for m in metrics:
-        write_cols.append(f"frac_{m}")
-        write_cols.append(f"bin20_{m}")
-    set_clauses = ["cutoff_date = EXCLUDED.cutoff_date"]
-    for m in metrics:
-        set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
-        set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
-    set_sql = ",\n        ".join(set_clauses)
-    insert_sql = (
-        f"INSERT INTO tt_bins ({', '.join(write_cols)}) VALUES %s\n"
-        f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
-        f"    {set_sql}"
-    )
+    write_cols, insert_sql = _tt_upsert_sql(metrics)
 
     log.info("Computing + upserting tt_bins — %d metrics × %d tickers, "
              "streaming reads, commit per %d-ticker batch ...",
@@ -445,6 +457,215 @@ def _build_tt_bins(conn, cutoff: date = TT_CUTOFF_DATE,
     log.info("  tt_bins done: %d rows in %.1fs.  "
              "Thin tickers (zero binnable metrics): %d.",
              total_rows, time.time() - t0, n_thin_tickers)
+    return total_rows
+
+
+def _tt_upsert_sql(metrics: list) -> tuple[list, str]:
+    """(write_cols, insert_sql) for a tt_bins upsert over `metrics`.
+
+    Extracted verbatim from _build_tt_bins and shared with the incremental
+    build so the two paths cannot drift.  A column present in one path and
+    absent from the other would leave rows differing by which build wrote
+    them — and bin20 = 0 cannot express that distinction, so the divergence
+    would be invisible in the data.
+
+    tt_bins is single-tier (no MORNING/EVENING split); the SET clause names
+    cutoff_date + frac_<m> + bin20_<m> for every eligible metric.  Same
+    frac+bin20 pair shape as wf_bins / is_bins.
+    """
+    write_cols = ["ticker", "trade_date", "cutoff_date"]
+    for m in metrics:
+        write_cols.append(f"frac_{m}")
+        write_cols.append(f"bin20_{m}")
+    set_clauses = ["cutoff_date = EXCLUDED.cutoff_date"]
+    for m in metrics:
+        set_clauses.append(f"frac_{m} = EXCLUDED.frac_{m}")
+        set_clauses.append(f"bin20_{m} = EXCLUDED.bin20_{m}")
+    set_sql = ",\n        ".join(set_clauses)
+    insert_sql = (
+        f"INSERT INTO tt_bins ({', '.join(write_cols)}) VALUES %s\n"
+        f"ON CONFLICT (ticker, trade_date) DO UPDATE SET\n"
+        f"    {set_sql}"
+    )
+    return write_cols, insert_sql
+
+
+def _build_tt_bins_incremental(conn, since: date,
+                               cutoff: date = TT_CUTOFF_DATE,
+                               min_train: int = TT_MIN_TRAIN_DEFAULT) -> int:
+    """Rebuild tt_bins for rows at or after `since`, reusing the frozen ruler.
+
+    Why this is safe, and why wf_bins / is_bins have no equivalent
+    ------------------------------------------------------------------
+    train_test_series builds its ruler from pre-cutoff rows ONLY
+    (lib/bin_compute.py: `d < cutoff`).  A post-cutoff row's (frac, bin20) is
+    therefore a pure function of its own value and that frozen ruler — adding
+    or re-binning a later date cannot move an earlier one.  Re-binning a row
+    outside the window would reproduce the value it already holds, so skipping
+    it changes nothing.
+
+    wf_bins is an expanding window and is_bins ranks against the ticker's
+    entire history, so in both a new date shifts earlier rows.  Their full
+    rebuild is load-bearing; this one is not.
+
+    Ruler derivation is unchanged from the full build: pre-cutoff values come
+    from daily_features, exactly as _build_tt_bins reads them.  No dependency
+    on tt_thresholds, no stored edges, no schema change.
+
+    Read shape
+    ----------
+    Per ticker the SELECT keeps two disjoint bands and drops the middle:
+
+        trade_date <  cutoff     — needed to build the ruler
+        trade_date >= since      — the rows actually being written
+
+    The post-cutoff-but-pre-since band is read by the full build and is dead
+    weight here.  train_test_series still sees every pre-cutoff row, so the
+    ruler is identical and the written values are bit-identical to what a full
+    rebuild would produce for the same rows.
+
+    Break cases
+    -----------
+    new ticker (no tt_bins rows)
+        Full history for that ticker alone — it has no earlier rows to reuse.
+        Bounded: one ticker's rows × len(metrics).
+
+    newly eligible metric
+        sync_tt_bins_schema just added the column pair, so its history is
+        unpopulated and no date window can fill it.  Falls back to a full
+        rebuild.  Rare, and the alternative — leaving history at (NULL, 0) —
+        is indistinguishable from "unrankable" to every reader.
+
+    edited pre-cutoff data
+        NOT DETECTED, and not detectable: daily_features carries no timestamp
+        column to compare against.  A pre-cutoff edit moves the ruler and
+        therefore every post-cutoff bin.  Run a full --build-tt-bins by hand
+        after any such backfill.  This is stated in
+        --build-tt-bins-incremental's help text and in the module docstring;
+        it is the one correctness obligation this mode pushes onto the caller.
+
+    Returns the number of (ticker, trade_date) rows upserted.
+    """
+    log.info("Syncing tt_bins schema ...")
+    added_n, added_metrics = sync_tt_bins_schema(conn)
+    if added_n:
+        log.warning(
+            "%d metric column pair(s) just added to tt_bins (%s) — their "
+            "history is unpopulated and no date window can fill it. "
+            "Falling back to a FULL rebuild.",
+            added_n, ", ".join(added_metrics[:5]))
+        return _build_tt_bins(conn, cutoff=cutoff, min_train=min_train)
+
+    metrics_by_tier = get_metrics_by_tier(conn)
+    metrics = sorted(set(metrics_by_tier["MORNING"]) | set(metrics_by_tier["EVENING"]))
+    if not metrics:
+        log.warning("No eligible metrics — nothing to do.")
+        return 0
+
+    df_cols = existing_daily_features_columns(conn)
+    metrics = [m for m in metrics if m in df_cols]
+    log.info("tt_bins (incremental): %d eligible metric(s), cutoff = %s, "
+             "since = %s, min_train = %d.",
+             len(metrics), cutoff, since, min_train)
+
+    if since <= cutoff:
+        log.warning(
+            "since (%s) is at or before the cutoff (%s) — every row would be "
+            "in the write set, so this is a full rebuild with extra steps. "
+            "Use --build-tt-bins instead.", since, cutoff)
+
+    cols_sql = ", ".join(metrics)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT ticker FROM daily_features ORDER BY ticker")
+        all_tickers = [r[0] for r in cur.fetchall()]
+        # Per-ticker watermark doubles as new-ticker detection: a ticker in
+        # daily_features with no tt_bins rows has never been built.
+        cur.execute("SELECT ticker, max(trade_date) FROM tt_bins GROUP BY ticker")
+        known = {t for t, _ in cur.fetchall()}
+
+    total_tickers = len(all_tickers)
+    if total_tickers == 0:
+        log.warning("daily_features has no tickers — nothing to bin.")
+        return 0
+
+    write_cols, insert_sql = _tt_upsert_sql(metrics)
+
+    log.info("Computing + upserting tt_bins (incremental) — %d metrics × %d "
+             "tickers, commit per %d-ticker batch ...",
+             len(metrics), total_tickers, UPSERT_TICKER_BATCH)
+    t0 = time.time()
+
+    pending: list = []
+    total_rows = 0
+    n_tickers_done = 0
+    n_new = 0
+    n_nothing_to_write = 0
+
+    for ticker in all_tickers:
+        is_new = ticker not in known
+        if is_new:
+            # No prior rows to preserve, so build this ticker's full history.
+            sub = read_sql_df(
+                conn,
+                f"SELECT trade_date, {cols_sql} FROM daily_features "
+                f"WHERE ticker = %(t)s ORDER BY trade_date",
+                {"t": ticker},
+            )
+            n_new += 1
+        else:
+            sub = read_sql_df(
+                conn,
+                f"SELECT trade_date, {cols_sql} FROM daily_features "
+                f"WHERE ticker = %(t)s "
+                f"  AND (trade_date < %(cutoff)s OR trade_date >= %(since)s) "
+                f"ORDER BY trade_date",
+                {"t": ticker, "cutoff": cutoff, "since": since},
+            )
+        if sub.empty:
+            continue
+        sub["trade_date"] = pd.to_datetime(sub["trade_date"]).dt.date
+        dates = sub["trade_date"].tolist()
+
+        # Indices to WRITE.  The ruler needs every pre-cutoff row, so they stay
+        # in `dates` for train_test_series and are dropped only here.
+        keep = (list(range(len(dates))) if is_new
+                else [i for i, d in enumerate(dates) if d >= since])
+        if not keep:
+            n_nothing_to_write += 1
+            del sub
+            continue
+
+        cols: dict = {
+            "ticker":      [ticker] * len(keep),
+            "trade_date":  [dates[i] for i in keep],
+            "cutoff_date": [cutoff] * len(keep),
+        }
+        for m in metrics:
+            vals = sub[m].tolist()
+            fracs, bin20s = train_test_series(vals, dates, cutoff, min_train)
+            cols[f"frac_{m}"]  = [fracs[i] for i in keep]
+            cols[f"bin20_{m}"] = [bin20s[i] for i in keep]
+        pending.append(pd.DataFrame(cols))
+        del sub
+
+        if len(pending) >= UPSERT_TICKER_BATCH:
+            total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+            n_tickers_done += len(pending)
+            log.info("  ... %d/%d tickers, %d rows upserted",
+                     n_tickers_done, total_tickers, total_rows)
+            pending = []
+
+    if pending:
+        total_rows += _flush_upsert(conn, insert_sql, write_cols, pending)
+        n_tickers_done += len(pending)
+        log.info("  ... %d/%d tickers, %d rows upserted",
+                 n_tickers_done, total_tickers, total_rows)
+
+    log.info("  tt_bins (incremental) done: %d rows in %.1fs.  "
+             "New tickers built in full: %d.  Tickers with no row at or after "
+             "%s: %d.", total_rows, time.time() - t0, n_new, since,
+             n_nothing_to_write)
     return total_rows
 
 
@@ -566,15 +787,46 @@ def main() -> int:
     ap.add_argument("--build-tt-bins", action="store_true",
                     help="(Re)build tt_bins for the standard cutoff "
                          "(in-sample bin table the dashboard reads).")
+    ap.add_argument("--build-tt-bins-incremental", action="store_true",
+                    help="(Re)build tt_bins for rows at or after --since only. "
+                         "Safe because the train-test ruler is frozen at the "
+                         "cutoff, so older post-cutoff rows would only be "
+                         "rewritten to the values they already hold.  "
+                         "WARNING: does NOT detect edits to pre-cutoff "
+                         "daily_features data.  Such an edit moves the ruler "
+                         "and invalidates EVERY post-cutoff row; there is no "
+                         "timestamp on daily_features to detect it from.  "
+                         "After any backfill touching trade_date < the cutoff, "
+                         "run a full --build-tt-bins by hand.")
+    ap.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                    help=f"Earliest trade_date to rebuild with "
+                         f"--build-tt-bins-incremental.  Default: today - "
+                         f"{FEATURES_LOOKBACK_DAYS} days, matching the window "
+                         f"build_features re-upserts on every run.  Do not set "
+                         f"a shorter window than that, or revisions inside it "
+                         f"will be binned once and never revisited.")
     ap.add_argument("--build-tt", action="store_true",
                     help="(Re)build legacy tt_thresholds for the standard "
                          "cutoff.  Dashboard reads tt_bins instead; this is "
                          "kept for the underlying threshold artifact if needed.")
     args = ap.parse_args()
 
-    if not args.tier and not args.build_tt and not args.build_tt_bins:
+    if (not args.tier and not args.build_tt and not args.build_tt_bins
+            and not args.build_tt_bins_incremental):
         ap.print_help()
         return 1
+
+    if args.build_tt_bins and args.build_tt_bins_incremental:
+        log.error("--build-tt-bins and --build-tt-bins-incremental are "
+                  "mutually exclusive; the full rebuild already covers the "
+                  "incremental window.")
+        return 1
+
+    if args.since and not args.build_tt_bins_incremental:
+        log.warning("--since is ignored without --build-tt-bins-incremental.")
+
+    since = (date.fromisoformat(args.since) if args.since
+             else date.today() - timedelta(days=FEATURES_LOOKBACK_DAYS))
 
     overall_t0 = time.time()
     with get_connection() as conn:
@@ -586,6 +838,10 @@ def main() -> int:
         if args.build_tt_bins:
             n = _build_tt_bins(conn)
             log.info("tt_bins: %d rows upserted.", n)
+        if args.build_tt_bins_incremental:
+            n = _build_tt_bins_incremental(conn, since=since)
+            log.info("tt_bins (incremental, since %s): %d rows upserted.",
+                     since, n)
         if args.build_tt:
             n = _build_tt_thresholds(conn)
             log.info("tt_thresholds: %d rows upserted.", n)
