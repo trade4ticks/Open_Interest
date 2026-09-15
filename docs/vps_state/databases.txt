@@ -1,0 +1,13 @@
+List of databases
+       Name       |   Owner   | Encoding | Locale Provider |  Collate   |   Ctype    | ICU Locale | ICU Rules |    Access privileges
+------------------+-----------+----------+-----------------+------------+------------+------------+-----------+-------------------------
+ equities_scalp   | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ iv_analysis      | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ open_interest    | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ portfolio        | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ postgres         | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ spx_interpolated | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           |
+ template0        | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           | =c/portfolio           +
+                  |           |          |                 |            |            |            |           | portfolio=CTc/portfolio
+ template1        | portfolio | UTF8     | libc            | en_US.utf8 | en_US.utf8 |            |           | =c/portfolio           +
+                  |           |          |                 |            |            |            |           | portfolio=CTc/portfolio

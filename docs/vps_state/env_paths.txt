@@ -1,0 +1,20 @@
+# --- Postgres (VPS) ----------------------------------------------------------
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=open_interest
+POSTGRES_USER=**********
+POSTGRES_PASSWORD=**********
+
+# --- ThetaData ---------------------------------------------------------------
+# Same primary terminal as the SPX project (Tailscale-reachable on the VPS).
+THETADATA_BASE_URL=http://***.**.**.**:*****
+
+OI_RAW_DIR=/data/oi_raw
+
+CHAIN_EOD_DIR=/data/chain_eod
+POLYGON_API_KEY=************************************
+EQUITY_1MIN_DIR=/data/equity_1min
+
+CHAIN_INTRADAY_DIR=/mnt/trading_volume_3/chain_intraday
+CHAIN_SNAPSHOTS_DIR=/mnt/trading_volume_3/chain_snapshots
+CHAIN_LIVE_DIR=/mnt/trading_volume_3/chain_live

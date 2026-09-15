@@ -1,0 +1,21 @@
+NEXT                            LEFT LAST                              PASSED UNIT                           ACTIVATES
+Mon 2026-09-14 09:50:00 EDT     7min Mon 2026-09-14 09:40:01 EDT  2min 6s ago sysstat-collect.timer          sysstat-collect.service
+Mon 2026-09-14 09:57:49 EDT    15min Mon 2026-09-14 08:58:47 EDT    43min ago fwupd-refresh.timer            fwupd-refresh.service
+Mon 2026-09-14 10:07:57 EDT    25min Mon 2026-09-14 09:11:10 EDT    30min ago droplet-agent-update.timer     droplet-agent-update.service
+Mon 2026-09-14 11:59:37 EDT 2h 17min Sun 2026-09-13 22:00:27 EDT      11h ago apt-daily.timer                apt-daily.service
+Mon 2026-09-14 14:21:42 EDT 4h 39min Mon 2026-09-14 07:03:33 EDT 2h 38min ago motd-news.timer                motd-news.service
+Mon 2026-09-14 17:35:19 EDT       7h Sun 2026-09-13 17:35:19 EDT      16h ago update-notifier-download.timer update-notifier-download.service
+Mon 2026-09-14 17:43:20 EDT       8h Sun 2026-09-13 17:43:20 EDT      15h ago systemd-tmpfiles-clean.timer   systemd-tmpfiles-clean.service
+Tue 2026-09-15 00:00:00 EDT      14h Mon 2026-09-14 00:00:04 EDT       9h ago dpkg-db-backup.timer           dpkg-db-backup.service
+Tue 2026-09-15 00:00:00 EDT      14h Mon 2026-09-14 00:00:04 EDT       9h ago logrotate.timer                logrotate.service
+Tue 2026-09-15 00:07:00 EDT      14h Mon 2026-09-14 00:07:04 EDT       9h ago sysstat-summary.timer          sysstat-summary.service
+Tue 2026-09-15 01:37:02 EDT      15h Mon 2026-09-14 02:40:33 EDT       7h ago man-db.timer                   man-db.service
+Tue 2026-09-15 06:12:45 EDT      20h Mon 2026-09-14 06:33:33 EDT  3h 8min ago apt-daily-upgrade.timer        apt-daily-upgrade.service
+Thu 2026-09-17 19:17:45 EDT   3 days Wed 2026-09-09 23:02:54 EDT   4 days ago update-notifier-motd.timer     update-notifier-motd.service
+Sun 2026-09-20 03:10:40 EDT   5 days Sun 2026-09-13 03:11:14 EDT 1 day 6h ago e2scrub_all.timer              e2scrub_all.service
+Mon 2026-09-21 00:09:13 EDT   6 days Mon 2026-09-14 00:07:37 EDT       9h ago fstrim.timer                   fstrim.service
+-                                  - -                                      - apport-autoreport.timer        apport-autoreport.service
+-                                  - -                                      - snapd.snap-repair.timer        snapd.snap-repair.service
+-                                  - -                                      - ua-timer.timer                 ua-timer.service
+
+18 timers listed.

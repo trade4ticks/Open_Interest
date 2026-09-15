@@ -1,0 +1,31 @@
+/mnt/trading_volume_2:
+total 52
+drwxr-xr-x    4 root root  4096 Apr 19 08:45 .
+drwxr-xr-x    5 root root  4096 Aug 17 17:26 ..
+drwx------    2 root root 16384 Apr 19 08:41 lost+found
+drwxr-xr-x 1005 root root 28672 Aug 24 09:36 spx_options
+
+/mnt/trading_volume_3:
+total 48
+drwxr-xr-x   9 root root  4096 Sep 10 18:53 .
+drwxr-xr-x   5 root root  4096 Aug 17 17:26 ..
+drwxr-xr-x   2 root root  4096 Sep  7 18:23 backup
+drwxr-xr-x 123 root root  4096 Aug 24 11:26 chain_live
+drwxr-xr-x 123 root root  4096 Sep  7 15:21 chain_snapshots
+drwxr-xr-x   4 root root  4096 Sep  1 08:47 equities_scalp
+drwxr-xr-x   4 root root  4096 Sep 10 20:24 ext_trades
+drwx------   2 root root 16384 Aug 17 17:26 lost+found
+drwxr-xr-x   7 root root  4096 Sep 10 13:57 quote_ticks
+
+/mnt/volume1:
+total 60
+drwxr-xr-x   4 root root  4096 Apr 17 09:31 .
+drwxr-xr-x   5 root root  4096 Aug 17 17:26 ..
+-rwxr-xr-x   1 root root  7431 Apr 17 09:07 .first-mount.sh
+drwx------   2 root root 16384 Apr 17 09:07 lost+found
+drwxr-xr-x 669 root root 28672 Sep 14 09:36 spx_options
+2.0G    /data/chain_eod
+4.0K    /data/equities_scalp
+5.0G    /data/equity_1min
+577M    /data/oi_raw
+395M    /data/spx_options

@@ -1,0 +1,17 @@
+Query run 2026-09-14 against open_interest:
+
+SELECT 'tt_bins' AS tbl, min(trade_date)::text AS earliest, max(trade_date)::text AS latest, count(DISTINCT ticker) AS tickers FROM tt_bins
+UNION ALL SELECT 'wf_bins', min(trade_date)::text, max(trade_date)::text, count(DISTINCT ticker) FROM wf_bins
+UNION ALL SELECT 'is_bins', min(trade_date)::text, max(trade_date)::text, count(DISTINCT ticker) FROM is_bins
+UNION ALL SELECT 'daily_features', min(trade_date)::text, max(trade_date)::text, count(DISTINCT ticker) FROM daily_features;
+
+      tbl       |  earliest  |   latest   | tickers
+----------------+------------+------------+---------
+ tt_bins        | 2018-12-31 | 2026-08-14 |     121
+ wf_bins        | 2018-12-31 | 2026-09-14 |     121
+ daily_features | 2018-12-31 | 2026-09-14 |     121
+ is_bins        | 2018-12-31 | 2026-09-14 |     121
+
+This is actual data recency (max trade_date), not an ANALYZE timestamp.
+tt_bins is one month behind the other three. Ticker coverage is identical
+across all four, so the backfill propagated correctly — the gap is dates only.

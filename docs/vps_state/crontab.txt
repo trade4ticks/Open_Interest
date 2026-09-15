@@ -1,0 +1,41 @@
+# Edit this file to introduce tasks to be run by cron.
+#
+# Each task to run has to be defined through a single line
+# indicating with different fields when the task will be run
+# and what command to run for the task
+#
+# To define the time you can provide concrete values for
+# minute (m), hour (h), day of month (dom), month (mon),
+# and day of week (dow) or use '*' in these fields (for 'any').
+#
+# For example, you can run a backup of all your user accounts
+# at 5 a.m every week with:
+# 0 5 * * 1 tar -zcf /var/backups/home.tgz /home/
+#
+# Fetch live data for portfolio dashboard:
+*/5 * * * 1-5 flock -n /tmp/fetch_trades.lock /root/Portfolio_Dashboard/.venv/bin/python /root/Portfolio_Dashboard/scripts/fetch_trades.py >> /root/Portfolio_Dashboard/logs/fetch_trades.log 2>&1
+#
+# Full pipeline to fetch, clean, interpolate/smooth
+1-59/5 * * * 1-5 flock -n /tmp/spx_pipeline.lock /Thetadata_Raw_SPX/.venv/bin/python /Thetadata_Raw_SPX/run_pipeline.py >> /Thetadata_Raw_SPX/logs/pipeline.log 2>&1
+#
+# Open Interest Daily Pipeline
+TZ=America/New_York
+
+# EVENING — finalize + next-day features, ~5:30pm ET, weekdays
+00 18 * * 1-5 flock -n /tmp/oi_research.lock /Open_Interest/.venv/bin/python /Open_Interest/run_pipeline.py --tier EVENING >> /Open_Interest/logs/pipeline.log 2>&1
+
+# PREMARKET — early proxy run, ~7:00am ET, weekdays
+00 7 * * 1-5 flock -n /tmp/oi_research.lock /Open_Interest/.venv/bin/python /Open_Interest/run_pipeline_early.py >> /Open_Interest/logs/pipeline.log 2>&1
+
+# MORNING — authoritative open + OI, ~9:35am ET, weekdays
+35 9 * * 1-5 flock -n /tmp/oi_research.lock /Open_Interest/.venv/bin/python /Open_Interest/run_pipeline.py --tier MORNING >> /Open_Interest/logs/pipeline.log 2>&1
+
+# LIVE INTRADAY SURFACE — Fetches equity live chain, cleans it, surfaces it and calc metrics every 5 min during RTH, weekdays
+*/5 9-16 * * 1-5 flock -n /tmp/live_surface.lock /Open_Interest/.venv/bin/python /Open_Interest/run_live_pipeline.py >> /Open_Interest/logs/live_pipeline.log 2>&1
+
+# Daily postgres portfolio backup (portfolio transactions & trades)
+0 2 * * * /usr/local/bin/pg_backup.sh >> /root/Portfolio_Dashboard/logs/pg_backup.log 2>&1
+#
+
+# EARNINGS CALENDAR — nightly refresh, 8:30pm ET, weekdays
+30 20 * * 1-5 flock -n /tmp/earnings.lock /Open_Interest/.venv/bin/python /Open_Interest/fetch_earnings_calendar.py >> /Open_Interest/logs/earnings.log 2>&1

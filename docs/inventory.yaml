@@ -1,0 +1,2009 @@
+ID: open_interest-inventory
+generated: 2026-09-14
+pass: read-only
+scope:
+  included: [root, lib/, analysis/, migrations/, scalp/, Cowork/]
+  excluded: [.venv/, __pycache__/]
+  note: "Sections 1a, 1b and 2 complete. Section 3 not yet written."
+
+precedence:
+  rule_set_in: rev2
+  order:
+    - rank: 1
+      source: machine-verified vps_state captures
+      files: [crontab.txt, oi_schema_trimmed.sql, table_stats.txt, env_paths.txt, storage_layout.txt, bin_freshness.txt]
+      status: truth
+    - rank: 2
+      source: source code in this repo
+      status: beats all prose including vps_state/README.md
+    - rank: 3
+      source: vps_state/README.md prose
+      status: orientation notes; authoritative on out-of-scope boundaries, not on what writes what
+    - rank: 4
+      source: project-root docs (README.md, CLAUDE.md, PIPELINE_BRIEF.md)
+      status: lowest
+  consequence: where rank 2 beats rank 3, the README is listed as needing correction, not as a finding
+
+verification:
+  scripts: read from working-tree source
+  database: "docs/vps_state/ machine-generated captures"
+  unverifiable: "marked with an uncertain flag and a reason"
+  table_naming: always database.table
+
+revisions:
+  - id: rev1
+    date: 2026-09-14
+    inputs_changed:
+      - docs/vps_state/README.md supplied
+      - docs/vps_state/crontab.txt re-supplied complete (8 jobs, was 6 - first two were truncated)
+      - docs/vps_state/bin_freshness.txt added
+      - batabases.txt renamed databases.txt
+    sections_revised: [vps_state_gaps, cron, doc_conflicts.3, questions.q2, questions.q4]
+    section_1a_script_rows_changed: none
+    reason: the two recovered cron jobs belong to other projects and invoke nothing in this repo
+
+vps_state_gaps:
+  - file: docs/vps_state/README.md
+    status: resolved_rev1
+    was: absent
+  - file: docs/vps_state/databases.txt
+    status: resolved_rev1
+    was: present_as_batabases.txt
+  - file: docs/vps_state/crontab.txt
+    status: resolved_rev1
+    was: truncated_first_two_jobs_missing
+    effect_before: total job count understated as 6; Q4 ownership inferred from a partial line
+  - file: docs/vps_state/table_stats.txt
+    issue: last_stats is an ANALYZE timestamp, not a last-write time
+    effect: cannot be used to date last writes
+    superseded_for_bins_by: docs/vps_state/bin_freshness.txt
+  - file: docs/vps_state/table_stats.txt
+    issue: database not named in header
+    assumption: open_interest (all relnames match that DB, none match others)
+  - file: equities_scalp schema
+    status: not_supplied
+    effect: PKs for equities_scalp tables are read from scalp/db.py CREATE TABLE statements, i.e. what the code creates, not what is deployed
+
+cron:
+  source: docs/vps_state/crontab.txt
+  revision: rev1_complete_8_jobs
+  total_jobs: 8
+  project_jobs: 5
+  timezone: America/New_York
+  timezone_note: >
+    TZ=America/New_York is set at crontab.txt:22, after the first two jobs.
+    Cron environment assignments apply only to entries that follow them, so the
+    Portfolio_Dashboard and Thetadata_Raw_SPX jobs run in the system timezone,
+    not ET. Observation only - both are other projects' jobs and out of scope.
+  entries:
+    - schedule: "*/5 * * * 1-5"
+      command: /root/Portfolio_Dashboard/scripts/fetch_trades.py
+      lock: /tmp/fetch_trades.lock
+      project: Portfolio_Dashboard
+      in_project: false
+      recovered_in: rev1
+    - schedule: "1-59/5 * * * 1-5"
+      command: /Thetadata_Raw_SPX/run_pipeline.py
+      lock: /tmp/spx_pipeline.lock
+      project: Thetadata_Raw_SPX
+      in_project: false
+      recovered_in: rev1
+      note: offset one minute from the dashboard job
+    - schedule: "00 18 * * 1-5"
+      command: run_pipeline.py --tier EVENING
+      lock: /tmp/oi_research.lock
+      tier: EVENING
+    - schedule: "00 7 * * 1-5"
+      command: run_pipeline_early.py
+      lock: /tmp/oi_research.lock
+      tier: PREMARKET
+    - schedule: "35 9 * * 1-5"
+      command: run_pipeline.py --tier MORNING
+      lock: /tmp/oi_research.lock
+      tier: MORNING
+    - schedule: "*/5 9-16 * * 1-5"
+      command: run_live_pipeline.py
+      lock: /tmp/live_surface.lock
+      tier: LIVE
+    - schedule: "30 20 * * 1-5"
+      command: fetch_earnings_calendar.py
+      lock: /tmp/earnings.lock
+      tier: EARNINGS
+    - schedule: "0 2 * * *"
+      command: /usr/local/bin/pg_backup.sh
+      tier: BACKUP
+      in_project: false
+  systemd_timers:
+    relevant_to_project: false
+    note: all 18 timers in timers.txt are OS-level (apt, logrotate, sysstat, fwupd)
+
+parquet_roots:
+  source: docs/vps_state/env_paths.txt
+  OI_RAW_DIR: /data/oi_raw
+  CHAIN_EOD_DIR: /data/chain_eod
+  EQUITY_1MIN_DIR: /data/equity_1min
+  CHAIN_INTRADAY_DIR: /mnt/trading_volume_3/chain_intraday
+  CHAIN_SNAPSHOTS_DIR: /mnt/trading_volume_3/chain_snapshots
+  CHAIN_LIVE_DIR: /mnt/trading_volume_3/chain_live
+
+critical_findings:
+  - id: build_features_destroyed
+    severity: high
+    file: build_features.py
+    detail: >
+      Working tree is 2 bytes (newline + "q"). git diff reports 1755 deletions,
+      1 insertion, uncommitted. HEAD version is 89858 bytes.
+      run_pipeline.py:57 and run_pipeline_early.py:49 import build_for_ticker at
+      module scope, so both fail at import locally. VPS runs its own checkout.
+    recovery: git checkout -- build_features.py
+    acted_on: false
+  - id: tt_bins_no_caller
+    severity: high
+    table: open_interest.tt_bins
+    detail: >
+      Built only by build_bin_tables.py --build-tt-bins (:377). No cron entry,
+      no script, no subprocess passes that flag. run_pipeline.py:237 passes
+      --build-tt, which writes open_interest.tt_thresholds instead.
+      Dashboard reads tt_bins per build_bin_tables.py:571; build_trade_paths.py
+      reads it at :473-497.
+    acted_on: false
+
+doc_conflicts:
+  - n: 1
+    doc: README.md:119-122
+    claim: single cron entry "0 7 * * 1-5 run_pipeline.py" with no tier flag
+    truth: five Open_Interest cron entries; run_pipeline.py requires --tier
+    severity: high
+  - n: 2
+    doc: README.md:106
+    claim: one daily run of four steps
+    truth: three daily tiers plus a 5-minute intraday loop plus a 20:30 earnings job
+    severity: high
+  - n: 3
+    doc: PIPELINE_BRIEF.md:244
+    claim: "Nothing runs on a schedule unless I add it to cron myself."
+    truth: six active cron entries, five of them this project's
+    severity: high
+  - n: 4
+    doc: CLAUDE.md:19-24
+    claim: two tiers, EVENING always before MORNING
+    truth: >
+      correct as far as it goes, but omits the 07:00 PREMARKET cron, which also
+      calls build_features with tier="MORNING" (run_pipeline_early.py:188).
+      Two crons write MORNING columns for the same trade_date.
+    severity: medium
+  - n: 5
+    doc: build_bin_tables.py:2
+    claim: "Build / refresh wf_bins and tt_thresholds"
+    truth: also builds open_interest.is_bins (:266) and open_interest.tt_bins (:377)
+    severity: medium
+  - n: 6
+    doc: build_bin_tables.py:5-6
+    claim: usage block lists --tier and --build-tt
+    truth: omits --build-tt-bins, the only writer of open_interest.tt_bins
+    severity: high
+  - n: 7
+    doc: README.md:32
+    claim: config.py is "Postgres + ThetaData + OI_RAW_DIR"
+    truth: six parquet roots plus Polygon credentials
+    severity: low
+  - n: 8
+    doc: sql/01_schema.sql:10
+    claim: build_features.py reads OI_RAW_DIR parquet directly
+    truth: true at HEAD; false in the working tree (see build_features_destroyed)
+    severity: low
+  - n: 9
+    doc: run_live_pipeline.py:45-49
+    claim: cron line for the live loop
+    truth: matches crontab.txt:16 exactly
+    severity: none
+    note: no conflict, recorded as the one doc that is correct
+  - n: 10
+    doc: migrations/README.md:13
+    claim: option_oi_raw dropped 2026-09-01
+    truth: confirmed absent from open_interest
+    severity: none
+    note: no conflict, confirms the doc
+
+scripts:
+
+  - path: run_pipeline.py
+    group: orchestrator
+    purpose: "Daily two-tier pipeline."
+    kind: entry
+    flags: ["--tier {MORNING,EVENING} (required)"]
+    invoked_by: cron
+    invoked_detail: crontab.txt:7 (18:00 EVENING), crontab.txt:13 (09:35 MORNING)
+    git: 2026-06-10
+    reads:
+      tables: [open_interest.underlying_ohlc]
+      parquet: [OI_RAW_DIR]
+      apis: [thetadata]
+    writes:
+      tables: []
+      parquet: []
+    calls: [fetch_ohlc.py, fetch_chain_eod.py, fetch_oi.py, fetch_oi_snapshot.py, build_features.py, build_bin_tables.py]
+
+  - path: run_pipeline_early.py
+    group: orchestrator
+    purpose: "7 am pre-open pipeline."
+    kind: entry
+    flags: []
+    invoked_by: cron
+    invoked_detail: crontab.txt:10 (07:00)
+    git: 2026-06-07
+    reads:
+      tables: [open_interest.underlying_ohlc]
+      parquet: [OI_RAW_DIR]
+    writes:
+      tables: []
+      parquet: []
+    calls: [fetch_ohlc_premarket.py, fetch_oi_snapshot.py, build_features.py, build_bin_tables.py]
+
+  - path: run_live_pipeline.py
+    group: orchestrator
+    purpose: "live capture, then metrics for what it just captured."
+    kind: entry
+    flags: ["--skip-metrics", "--no-z", "--tickers", "--connections", "--workers", "--max-inflight", "--no-persist", "--force", "--lock", "--no-lock"]
+    invoked_by: cron
+    invoked_detail: crontab.txt:16 (*/5 9-16 weekdays)
+    git: 2026-08-25
+    reads: {tables: [], parquet: []}
+    writes: {tables: [], parquet: []}
+    calls: [fetch_live_surface.py, build_equity_metrics.py]
+
+  - path: fetch_ohlc.py
+    group: fetcher
+    purpose: "Pull daily OHLC for one or more tickers from yfinance and upsert into underlying_ohlc."
+    kind: entry
+    flags: []
+    flags_note: interactive prompt, no argparse
+    invoked_by: [run_pipeline.py, cron]
+    git: 2026-06-07
+    reads: {tables: [open_interest.underlying_ohlc], apis: [yfinance]}
+    writes: {tables: [open_interest.underlying_ohlc]}
+
+  - path: fetch_ohlc_premarket.py
+    group: fetcher
+    purpose: "Fetch a premarket open-price proxy from ThetaData's IV snapshot endpoint and write it to underlying_ohlc.open with provenance."
+    kind: entry
+    flags: []
+    invoked_by: [run_pipeline_early.py, cron]
+    git: 2026-06-09
+    reads: {apis: [thetadata]}
+    writes: {tables: [open_interest.underlying_ohlc], columns: [open]}
+
+  - path: fetch_oi.py
+    group: fetcher
+    purpose: "Pull daily Open Interest from ThetaData and write to parquet at {OI_RAW_DIR}/{ticker}/{year}.parquet."
+    kind: entry
+    flags: []
+    flags_note: interactive prompt
+    invoked_by: [run_pipeline.py, cron]
+    git: 2026-09-01
+    reads: {apis: [thetadata], parquet: [OI_RAW_DIR]}
+    writes: {parquet: ["OI_RAW_DIR/{TICKER}/{year}.parquet"]}
+
+  - path: fetch_oi_snapshot.py
+    group: fetcher
+    purpose: "Pull TODAY's OI snapshot and write to parquet at {OI_RAW_DIR}/{ticker}/{year}.parquet."
+    kind: entry
+    flags: []
+    flags_note: interactive prompt
+    invoked_by: [run_pipeline.py, run_pipeline_early.py, cron]
+    git: 2026-05-19
+    reads: {apis: [thetadata]}
+    writes: {parquet: ["OI_RAW_DIR/{TICKER}/{year}.parquet"]}
+
+  - path: fetch_chain_eod.py
+    group: fetcher
+    purpose: "Pure I/O fetcher for ThetaData's EOD greeks chain. Replaces both fetch_volume_eod.py and fetch_iv_chain.py."
+    kind: entry
+    flags: []
+    invoked_by: [run_pipeline.py, cron]
+    git: 2026-06-08
+    reads: {apis: [thetadata], parquet: [OI_RAW_DIR]}
+    writes: {parquet: ["CHAIN_EOD_DIR/{TICKER}/{year}.parquet"]}
+
+  - path: fetch_live_surface.py
+    group: fetcher
+    purpose: "live intraday surface, every 5 minutes."
+    kind: entry
+    flags: ["--tickers", "--connections", "--workers", "--max-inflight", "--no-persist", "--force", "--lock", "--no-lock"]
+    invoked_by: [run_live_pipeline.py, cron]
+    git: 2026-08-25
+    reads: {apis: [thetadata], tables: [open_interest.equity_surface_diagnostics]}
+    writes:
+      parquet: ["CHAIN_LIVE_DIR/{TICKER}/{YYYYMMDD}/{HHMM}.parquet"]
+      tables: [open_interest.equity_surface, open_interest.equity_atm, open_interest.equity_surface_diagnostics]
+
+  - path: fetch_earnings_calendar.py
+    group: fetcher
+    purpose: "nightly earnings calendar refresh from yfinance."
+    kind: entry
+    flags: ["--tickers", "--delay", "--limit", "--init-db"]
+    invoked_by: cron
+    invoked_detail: crontab.txt:23 (20:30 weekdays)
+    git: 2026-08-25
+    reads: {apis: [yfinance], parquet: [CHAIN_SNAPSHOTS_DIR, OI_RAW_DIR]}
+    writes: {tables: [open_interest.earnings_calendar, open_interest.earnings_coverage]}
+
+  - path: fetch_chain_snapshots.py
+    group: fetcher
+    purpose: "Pure I/O fetcher for twice-daily intraday option chain snapshots (09:45:00 and 15:45:00 ET)."
+    kind: entry
+    flags: ["--force", "--repair", "--batch-days", "--connections", "--write-queue", "--debug-response", "--resume", "--progress-file", "--tickers", "--start", "--end"]
+    invoked_by: manual
+    git: 2026-08-26
+    reads: {apis: [thetadata], parquet: [OI_RAW_DIR]}
+    writes: {parquet: ["CHAIN_SNAPSHOTS_DIR/{TICKER}/{YYYYMM}.parquet"]}
+
+  - path: fetch_chain_intraday.py
+    group: fetcher
+    purpose: "full-day 5-minute intraday option chain bars. Sister script to fetch_chain_snapshots.py."
+    kind: entry
+    flags: ["--force", "--batch-days", "--response-format", "--connections", "--debug-response", "--tickers", "--start", "--end"]
+    invoked_by: manual
+    git: 2026-08-18
+    reads: {apis: [thetadata], parquet: [OI_RAW_DIR]}
+    writes: {parquet: ["CHAIN_INTRADAY_DIR/{TICKER}/{YYYYMMDD}.parquet", "CHAIN_INTRADAY_DIR/{TICKER}/{YYYYMMDD}.manifest.json"]}
+    note: target directory does not exist on disk; see question q1
+
+  - path: fetch_equity_1min.py
+    group: fetcher
+    purpose: "1-minute equity bars from Polygon.io / Massive."
+    kind: entry
+    flags: ["--dry-run", "--probe", "--force", "--repair", "--batch-chunks", "--connections", "--splice-renames", "--symbol-history-out", "--no-symbol-history", "--debug-response", "--tickers", "--start", "--end"]
+    invoked_by: manual
+    git: 2026-08-15
+    reads: {apis: [polygon], parquet: [OI_RAW_DIR]}
+    writes: {parquet: ["EQUITY_1MIN_DIR/{TICKER}/{year}.parquet", "EQUITY_1MIN_DIR/_manifest/{TICKER}.parquet"]}
+
+  - path: fetch_iv_chain.py
+    group: fetcher
+    purpose: "Pull EOD greeks and upsert ATM IV metrics to option_iv_daily."
+    kind: entry
+    flags: []
+    invoked_by: nothing_found
+    superseded_by: fetch_chain_eod.py
+    git: 2026-05-27
+    reads: {apis: [thetadata], tables: [open_interest.underlying_ohlc], parquet: [OI_RAW_DIR]}
+    writes: {tables: [open_interest.option_iv_daily]}
+
+  - path: fetch_volume_eod.py
+    group: fetcher
+    purpose: "Pull EOD option volume and upsert aggregated metrics to option_volume_daily."
+    kind: entry
+    flags: []
+    invoked_by: nothing_found
+    superseded_by: fetch_chain_eod.py
+    git: 2026-05-27
+    reads: {apis: [thetadata], tables: [open_interest.underlying_ohlc]}
+    writes: {tables: [open_interest.option_volume_daily]}
+
+  - path: build_features.py
+    group: builder
+    purpose: "Builds the daily_features row per (ticker, trade_date) across MORNING/EVENING column sets."
+    purpose_source: git show HEAD (working tree is destroyed)
+    kind: entry
+    flags: ["--tier"]
+    flags_note: run_pipeline* call build_for_ticker() directly, not the CLI
+    invoked_by: [run_pipeline.py, run_pipeline_early.py, cron]
+    git: 2026-06-09
+    working_tree_state: DESTROYED_2_BYTES
+    reads:
+      tables: [open_interest.underlying_ohlc]
+      parquet: [OI_RAW_DIR, CHAIN_EOD_DIR]
+      via: duckdb read_parquet
+    writes:
+      tables: [open_interest.daily_features]
+      mechanism: MORNING_UPSERT_SQL / EVENING_UPSERT_SQL, disjoint column sets
+
+  - path: build_bin_tables.py
+    group: builder
+    purpose: "Build / refresh wf_bins and tt_thresholds."
+    purpose_note: docstring stale; also builds is_bins and tt_bins
+    kind: entry
+    flags: ["--tier {MORNING,EVENING}", "--build-tt-bins", "--build-tt"]
+    invoked_by: [run_pipeline.py, run_pipeline_early.py, cron]
+    invoked_detail: subprocess at run_pipeline.py:235 and run_pipeline_early.py:112
+    git: 2026-08-16
+    reads: {tables: [open_interest.daily_features, open_interest.metric_classification]}
+    writes_by_flag:
+      "--tier": [open_interest.wf_bins, open_interest.is_bins]
+      "--build-tt-bins": [open_interest.tt_bins]
+      "--build-tt": [open_interest.tt_thresholds]
+    flag_name_mismatch: true
+    flag_name_mismatch_detail: "--build-tt writes tt_thresholds, not tt_bins; --build-tt-bins writes tt_bins and is never passed"
+
+  - path: build_equity_surface.py
+    group: builder
+    purpose: "stage 3 of the chain pipeline. fetch -> clean -> INTERPOLATE -> metrics"
+    kind: entry
+    flags: ["--start", "--end", "--tickers", "--source", "--workers"]
+    invoked_by: manual
+    git: 2026-08-26
+    reads:
+      parquet: [CHAIN_SNAPSHOTS_DIR, CHAIN_INTRADAY_DIR]
+      parquet_note: CHAIN_SNAPSHOTS_DIR is the default; CHAIN_INTRADAY_DIR only with --source intraday
+      tables: [open_interest.equity_surface_diagnostics]
+    writes: {tables: [open_interest.equity_surface, open_interest.equity_atm, open_interest.equity_surface_diagnostics]}
+
+  - path: build_equity_metrics.py
+    group: builder
+    purpose: "derived vol metrics off the interpolated surface. Stage 4."
+    kind: entry
+    flags: ["--start", "--end", "--tickers", "--snapshots", "--rebuild", "--no-z"]
+    invoked_by: [run_live_pipeline.py, cron, manual]
+    invoked_detail: run_live_pipeline.py:75 imports run_for_snapshot
+    git: 2026-08-25
+    reads: {tables: [open_interest.equity_surface_diagnostics, open_interest.equity_surface, open_interest.equity_atm, open_interest.underlying_ohlc, open_interest.earnings_calendar]}
+    writes: {tables: [open_interest.equity_metrics, open_interest.equity_metrics_z, open_interest.equity_metrics_catalog]}
+
+  - path: build_trade_paths.py
+    group: builder
+    purpose: "resolve exit outcomes for every possible entry."
+    kind: entry
+    flags: ["--tickers", "--anchors", "--start", "--end", "--session-filter", "--block", "--force", "--dry-run"]
+    invoked_by: manual
+    git: 2026-09-05
+    reads: {tables: [open_interest.daily_features, open_interest.tt_bins], parquet: [EQUITY_1MIN_DIR]}
+    writes: {tables: [open_interest.trade_paths, open_interest.trade_paths_manifest, open_interest.trade_path_rules]}
+    note: reads open_interest.tt_bins, which nothing refreshes
+
+  - path: backfill_call_price.py
+    group: backfill
+    purpose: "populate equity_surface.call_price on rows written before that column existed, WITHOUT re-fitting."
+    kind: entry
+    flags: ["--start", "--end", "--dry-run", "--verify"]
+    invoked_by: manual
+    git: 2026-08-23
+    reads: {tables: [open_interest.equity_surface]}
+    writes: {tables: [open_interest.equity_surface], columns: [call_price]}
+
+  - path: backfill_days_to_earnings.py
+    group: backfill
+    purpose: "populate days_to_earnings on existing rows."
+    kind: entry
+    flags: ["--tickers", "--dry-run", "--report", "--verify", "--limit", "--all"]
+    invoked_by: manual
+    git: 2026-08-25
+    reads: {tables: [open_interest.earnings_calendar, open_interest.earnings_coverage, open_interest.equity_metrics]}
+    writes: {tables: [open_interest.equity_metrics], columns: [days_to_earnings]}
+
+  - path: backfill_source_session.py
+    group: backfill
+    purpose: "One-time UPDATE to populate source_session on every existing row of option_volume_daily and option_iv_daily."
+    kind: entry
+    flags: []
+    invoked_by: manual
+    status: complete
+    git: 2026-05-27
+    reads: {tables: [open_interest.option_volume_daily, open_interest.option_iv_daily]}
+    writes: {tables: [open_interest.option_volume_daily, open_interest.option_iv_daily], columns: [source_session]}
+
+  - path: migrate_chain_snapshots_to_monthly.py
+    group: migration
+    purpose: "one-time layout change for the chain_snapshots store: {YYYY}.parquet -> {YYYYMM}.parquet"
+    kind: entry
+    flags: ["--dry-run", "--tickers", "--years", "--verify", "--keep-year-files", "--no-normalize", "--keep-going"]
+    invoked_by: manual
+    git: 2026-08-26
+    reads: {parquet: ["CHAIN_SNAPSHOTS_DIR/{TICKER}/{YYYY}.parquet"]}
+    writes: {parquet: ["CHAIN_SNAPSHOTS_DIR/{TICKER}/{YYYYMM}.parquet"]}
+
+  - path: migrations/export_raw_to_parquet.py
+    group: migration
+    purpose: "One-time migration: Postgres option_oi_raw -> {OI_RAW_DIR}/{ticker}/{year}.parquet"
+    kind: entry
+    flags: []
+    invoked_by: manual
+    status: complete_source_table_dropped
+    git: 2026-09-01
+    reads: {tables: [open_interest.option_oi_raw]}
+    reads_note: option_oi_raw no longer exists; script cannot run
+    writes: {parquet: ["OI_RAW_DIR/{TICKER}/{year}.parquet"]}
+
+  - path: init_db.py
+    group: migration
+    purpose: "One-time schema + view initialisation for the open_interest DB."
+    kind: entry
+    flags: []
+    invoked_by: manual
+    git: 2026-08-25
+    reads: {files: ["sql/*.sql"]}
+    writes: {ddl_target: open_interest}
+
+  - path: migrations/drop_option_oi_surface.sql
+    group: migration
+    purpose: drops the retired option_oi_surface table
+    kind: sql
+    invoked_by: manual
+    git: 2026-09-01
+    writes: {drops: [open_interest.option_oi_surface]}
+
+  - path: migrations/rebuild_intraday_metrics.sql
+    group: migration
+    purpose: rebuilds partitioned intraday_metrics
+    kind: sql
+    invoked_by: manual
+    git: 2026-09-07
+    writes: {tables: [equities_scalp.intraday_metrics], mechanism: TRUNCATE}
+    note: belongs to the scalp system, not the Open_Interest pipeline
+
+  - path: audit_chain_snapshots.py
+    group: audit
+    purpose: "completeness audit of the chain_snapshots store. Read-only."
+    kind: entry
+    flags: ["--tickers", "--start", "--end", "--max-gap", "--universe", "--no-enumerate", "--connections", "--out", "--summary-out"]
+    invoked_by: manual
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_SNAPSHOTS_DIR, OI_RAW_DIR], apis: [thetadata]}
+    writes: {files: ["--out CSV", "--summary-out CSV"]}
+
+  - path: audit_equity_1min.py
+    group: audit
+    purpose: "completeness audit of the equity_1min store. Read-only and fully offline."
+    kind: entry
+    flags: ["--tickers", "--start", "--end", "--max-gap", "--regular-ratio", "--universe", "--no-leading-empty", "--leading-empty-out", "--out", "--summary-out"]
+    invoked_by: manual
+    git: 2026-08-15
+    reads: {parquet: [EQUITY_1MIN_DIR, OI_RAW_DIR]}
+    writes: {files: ["--out CSV", "--summary-out CSV", "--leading-empty-out CSV"]}
+
+  - path: audit_symbol_gaps.py
+    group: audit
+    purpose: "how much history the ticker-rename gap has already cost. READ-ONLY."
+    kind: entry
+    flags: ["--tickers", "--history-start", "--no-vendor", "--known-renames", "--out"]
+    invoked_by: manual
+    git: 2026-08-15
+    reads: {tables: [open_interest.daily_features, open_interest.underlying_ohlc], parquet: [OI_RAW_DIR, CHAIN_EOD_DIR], apis: [polygon]}
+    writes: {files: ["--out CSV"]}
+
+  - path: audit_trade_paths.py
+    group: audit
+    purpose: "correctness and coverage checks for trade_paths. Read-only."
+    kind: entry
+    flags: ["--tolerance", "--skip-coverage"]
+    invoked_by: manual
+    git: 2026-08-15
+    reads: {tables: [open_interest.trade_paths, open_interest.daily_features, open_interest.underlying_ohlc]}
+    writes: {stdout: true}
+
+  - path: snapshot_null_audit.py
+    group: audit
+    purpose: "every column, NULL rate intraday vs at the close. Read-only."
+    kind: entry
+    flags: ["--date", "--table {equity_metrics,equity_metrics_z,both}", "--threshold", "--by-bucket", "--verbose"]
+    invoked_by: manual
+    git: 2026-08-25
+    reads: {tables: [open_interest.equity_metrics, open_interest.equity_metrics_z]}
+    writes: {stdout: true}
+
+  - path: validate_bins.py
+    group: audit
+    purpose: "8-check validation suite for wf_bins and tt_thresholds."
+    kind: entry
+    flags: ["--verbose"]
+    invoked_by: manual
+    git: 2026-06-01
+    reads: {tables: [open_interest.daily_features, open_interest.wf_bins, open_interest.tt_thresholds]}
+    writes: {stdout: true}
+    gap: does not validate open_interest.is_bins or open_interest.tt_bins
+
+  - path: zscore_migration_check.py
+    group: audit
+    purpose: "scope and preview the z-score redefinition. Read-only."
+    kind: entry
+    flags: ["--scope", "--diff", "--ticker", "--limit"]
+    invoked_by: manual
+    git: 2026-08-25
+    reads: {tables: [open_interest.equity_metrics, open_interest.equity_metrics_z]}
+    writes: {stdout: true}
+
+  - path: rv_vrp_noise_report.py
+    group: audit
+    purpose: "quantify the short-tenor VRP noise. Read-only."
+    kind: entry
+    flags: ["--snapshot", "--min-obs", "--ticker", "--ratio"]
+    invoked_by: manual
+    git: 2026-08-25
+    reads: {tables: [open_interest.equity_metrics]}
+    writes: {stdout: true}
+
+  - path: iv25d_quality_report.py
+    group: audit
+    purpose: "Read-only diagnostic measuring 25-delta IV data quality in data/chain_eod/"
+    kind: entry
+    flags: []
+    invoked_by: manual
+    git: 2026-06-09
+    reads: {parquet: [CHAIN_EOD_DIR], tables: [open_interest.daily_features]}
+    writes: {stdout: true}
+
+  - path: phase1_iv25d_sample.py
+    group: audit
+    purpose: "Phase 1 verification of the proposed 25-delta IV metrics (14d and 30d tenors)."
+    kind: entry
+    flags: ["--tickers", "--dates", "--n-dates"]
+    invoked_by: manual
+    git: 2026-06-09
+    reads: {parquet: [CHAIN_EOD_DIR], tables: [open_interest.underlying_ohlc]}
+    writes: {stdout: true}
+
+  - path: verify_surface_fixes.py
+    group: audit
+    purpose: "attribute surface changes to a specific fix. Read-only. No database, no writes."
+    kind: entry
+    flags: ["--ticker", "--date", "--snapshot", "--source", "--tenor", "--sweep-knots"]
+    invoked_by: manual
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_INTRADAY_DIR, CHAIN_LIVE_DIR, CHAIN_SNAPSHOTS_DIR]}
+    writes: {stdout: true}
+
+  - path: verify_csv_path.py
+    group: audit
+    purpose: "prove the CSV response path matches the JSON one. Read-only."
+    kind: entry
+    flags: ["--ticker", "--date", "--expiration"]
+    invoked_by: manual
+    git: 2026-08-18
+    reads: {apis: [thetadata]}
+    writes: {stdout: true}
+
+  - path: diagnose_transform.py
+    group: audit
+    purpose: "why is write_expiration ~15x slower on the VPS? Read-only diagnostic."
+    kind: entry
+    flags: ["--ticker", "--date", "--expiration"]
+    invoked_by: manual
+    git: 2026-08-18
+    reads: {apis: [thetadata]}
+    writes: {parquet: ["CHAIN_INTRADAY_DIR/_diag/"], files: [system temp]}
+    note: docstring says read-only but it writes probe files
+
+  - path: probe_session_gap.py
+    group: audit
+    purpose: "Why does audit_chain_snapshots see a session that fetch_chain_snapshots won't fetch?"
+    kind: entry
+    flags: ["--ticker", "--date", "--window"]
+    invoked_by: manual
+    git: 2026-09-07
+    reads: {apis: [thetadata], parquet: [CHAIN_SNAPSHOTS_DIR]}
+    writes: {stdout: true}
+
+  - path: probe_snapshot_first_order.py
+    group: audit
+    purpose: "does /v3/option/snapshot/greeks/first_order accept expiration=*?"
+    kind: entry
+    flags: ["--tickers", "--sample", "--format"]
+    invoked_by: manual
+    git: 2026-08-23
+    reads: {apis: [thetadata]}
+    writes: {stdout: true}
+
+  - path: bench_greeks_endpoints.py
+    group: audit
+    purpose: "first_order vs implied_volatility, head to head."
+    kind: entry
+    flags: ["--tickers", "--date", "--pairs", "--warmup", "--start-time", "--end-time", "--interval", "--format"]
+    invoked_by: manual
+    git: 2026-08-23
+    reads: {apis: [thetadata]}
+    writes: {stdout: true}
+
+  - path: backtest_spreads.py
+    group: audit
+    purpose: "Backtest call debit spreads from a predefined trade list."
+    kind: entry
+    flags: []
+    invoked_by: manual
+    git: 2026-05-19
+    reads: {files: [input CSV], tables: [open_interest.underlying_ohlc], parquet: [OI_RAW_DIR]}
+    writes: {tables: [open_interest.backtest_call_spread]}
+
+  - path: check.py
+    group: dev
+    purpose: "pre-push gates. Run this before every push."
+    kind: entry
+    flags: ["--gate"]
+    invoked_by: manual
+    git: 2026-08-16
+    reads: {files: [project source]}
+    writes: {stdout: true}
+
+  - path: deadlock_proof.py
+    group: dev
+    purpose: "Reproduce the run_cycle deadlock and prove the interleaved loop fixes it."
+    kind: entry
+    flags: []
+    invoked_by: manual
+    git: 2026-08-24
+    reads: {}
+    writes: {stdout: true}
+
+  - path: lockproof.py
+    group: dev
+    purpose: "Reproduce the outage mechanism and prove the fix. POSIX only."
+    kind: entry
+    flags: []
+    invoked_by: manual
+    git: 2026-08-24
+    reads: {files: [temp]}
+    writes: {files: [temp]}
+
+  - path: config.py
+    group: lib
+    purpose: "Project configuration - loads .env once, exposes typed constants."
+    kind: lib
+    invoked_by: everything
+    git: 2026-08-24
+    reads: {files: [.env]}
+    writes: {}
+
+  - path: db.py
+    group: lib
+    purpose: "Postgres connection + query helpers."
+    kind: lib
+    invoked_by: every DB-touching script
+    git: 2026-04-28
+    reads: {}
+    writes: {}
+
+  - path: lib/parquet_store.py
+    group: lib
+    purpose: "Parquet storage for raw OI rows."
+    kind: lib
+    layout: "{OI_RAW_DIR}/{ticker}/{year}.parquet"
+    git: 2026-08-26
+    reads: {parquet: [OI_RAW_DIR]}
+    writes: {parquet: [OI_RAW_DIR]}
+
+  - path: lib/chain_store.py
+    group: lib
+    purpose: "Parquet storage for raw EOD greeks chain rows."
+    kind: lib
+    layout: "{CHAIN_EOD_DIR}/{ticker}/{year}.parquet"
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_EOD_DIR]}
+    writes: {parquet: [CHAIN_EOD_DIR]}
+
+  - path: lib/chain_snapshot_store.py
+    group: lib
+    purpose: "Parquet storage for twice-daily intraday option-chain snapshots."
+    kind: lib
+    layout: "{CHAIN_SNAPSHOTS_DIR}/{ticker}/{YYYYMM}.parquet"
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_SNAPSHOTS_DIR]}
+    writes: {parquet: [CHAIN_SNAPSHOTS_DIR]}
+
+  - path: lib/chain_intraday_store.py
+    group: lib
+    purpose: "Parquet storage for full-day 5-minute intraday option-chain bars."
+    kind: lib
+    layout: "{CHAIN_INTRADAY_DIR}/{ticker}/{YYYYMMDD}.parquet + .manifest.json"
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_INTRADAY_DIR]}
+    writes: {parquet: [CHAIN_INTRADAY_DIR]}
+
+  - path: lib/chain_live_store.py
+    group: lib
+    purpose: "Parquet storage for live 5-minute chain captures."
+    kind: lib
+    layout: "{CHAIN_LIVE_DIR}/{TICKER}/{YYYYMMDD}/{HHMM}.parquet"
+    git: 2026-08-26
+    reads: {parquet: [CHAIN_LIVE_DIR]}
+    writes: {parquet: [CHAIN_LIVE_DIR]}
+
+  - path: lib/equity_1min_store.py
+    group: lib
+    purpose: "Parquet storage for 1-minute equity bars (Polygon / Massive)."
+    kind: lib
+    layout: "{EQUITY_1MIN_DIR}/{ticker}/{year}.parquet + _manifest/{ticker}.parquet"
+    git: 2026-08-26
+    reads: {parquet: [EQUITY_1MIN_DIR]}
+    writes: {parquet: [EQUITY_1MIN_DIR]}
+
+  - path: lib/parquet_schema.py
+    group: lib
+    purpose: "Canonical-type enforcement for every parquet store in this project."
+    kind: lib
+    git: 2026-08-26
+
+  - path: lib/surface_store.py
+    group: lib
+    purpose: "Equity option surface: stage 5 (store)."
+    kind: lib
+    git: 2026-08-24
+    reads: {tables: [open_interest.equity_surface_diagnostics]}
+    writes: {tables: [open_interest.equity_surface, open_interest.equity_atm, open_interest.equity_surface_diagnostics]}
+
+  - path: lib/surface_fit.py
+    group: lib
+    purpose: "Equity option surface: stages 1-4 (clean, fit, sample, greeks)."
+    kind: lib
+    git: 2026-08-24
+
+  - path: lib/surface_config.py
+    group: lib
+    purpose: "Configuration for the equity option surface interpolation stage."
+    kind: lib
+    git: 2026-08-24
+
+  - path: lib/clean_chain.py
+    group: lib
+    purpose: "computed fields and data-quality flags for equity option chains."
+    kind: lib
+    git: 2026-08-22
+
+  - path: lib/metrics_compute.py
+    group: lib
+    purpose: "Equity surface metrics: compute (pipeline stage 4)."
+    kind: lib
+    git: 2026-08-25
+    reads: {tables: [open_interest.underlying_ohlc, open_interest.equity_atm, open_interest.equity_surface, open_interest.equity_surface_diagnostics, open_interest.earnings_calendar]}
+
+  - path: lib/metrics_config.py
+    group: lib
+    purpose: "Equity surface metrics: the column registry (pipeline stage 4)."
+    kind: lib
+    git: 2026-08-25
+
+  - path: lib/metrics_store.py
+    group: lib
+    purpose: "Equity surface metrics: schema, catalog, z-scores and writes (stage 4)."
+    kind: lib
+    git: 2026-08-25
+    reads: {tables: [open_interest.equity_surface_diagnostics, open_interest.equity_metrics]}
+    writes: {tables: [open_interest.equity_metrics, open_interest.equity_metrics_z, open_interest.equity_metrics_catalog]}
+
+  - path: lib/earnings_store.py
+    group: lib
+    purpose: "Earnings calendar store: fetch from yfinance, upsert, and look up."
+    kind: lib
+    git: 2026-08-25
+    reads: {apis: [yfinance], tables: [open_interest.earnings_calendar]}
+    writes: {tables: [open_interest.earnings_calendar, open_interest.earnings_coverage]}
+
+  - path: lib/bin_compute.py
+    group: lib
+    purpose: "Pure compute helpers for wf_bins, is_bins, and tt_thresholds."
+    kind: lib
+    git: 2026-06-05
+
+  - path: lib/bin_schema.py
+    group: lib
+    purpose: "Dynamic schema sync for wf_bins and is_bins."
+    kind: lib
+    git: 2026-06-05
+    reads: {tables: [open_interest.metric_classification]}
+    writes: {ddl: [open_interest.wf_bins, open_interest.is_bins, open_interest.tt_bins]}
+
+  - path: lib/trade_path_rules.py
+    group: lib
+    purpose: "Exit-rule registry and vectorised evaluator for build_trade_paths.py."
+    kind: lib
+    git: 2026-09-05
+
+  - path: lib/trade_path_schema.py
+    group: lib
+    purpose: "Dynamic per-rule column sync for trade_paths."
+    kind: lib
+    git: 2026-09-05
+    writes: {ddl: [open_interest.trade_paths], tables: [open_interest.trade_path_rules]}
+
+  - path: lib/thetadata.py
+    group: lib
+    purpose: "ThetaData v3 client."
+    kind: lib
+    git: 2026-08-25
+    reads: {apis: [thetadata]}
+
+  - path: lib/polygon.py
+    group: lib
+    purpose: "Polygon.io / Massive REST client - 1-minute equity aggregates."
+    kind: lib
+    git: 2026-08-15
+    reads: {apis: [polygon]}
+
+  - path: lib/polygon_symbols.py
+    group: lib
+    purpose: "Symbol-history resolution for tickers that were renamed."
+    kind: lib
+    git: 2026-08-15
+    reads: {apis: [polygon]}
+
+  - path: lib/chain_fetch_common.py
+    group: lib
+    purpose: "Shared infrastructure for the chain fetchers."
+    kind: lib
+    git: 2026-08-26
+    writes: {files: ["logs/*.log"]}
+
+  - path: lib/split_factors.py
+    group: lib
+    purpose: "Split-adjustment factors for converting raw option strikes into split-adjusted units."
+    kind: lib
+    git: 2026-08-15
+    reads: {tables: [open_interest.underlying_ohlc]}
+
+  - path: lib/market_hours.py
+    group: lib
+    purpose: "NYSE trading-day helpers (thin wrapper over pandas_market_calendars)."
+    kind: lib
+    git: 2026-08-15
+
+  - path: lib/expirations.py
+    group: lib
+    purpose: "Standard-monthly expiration helper."
+    kind: lib
+    git: 2026-04-28
+    invoked_by: uncertain
+    uncertain: true
+    uncertain_reason: no importer found outside tests
+
+  - path: analysis/dump_fills.sql
+    group: analysis
+    purpose: "Round-trip fills, one row per trip, for the episode analysis. READ-ONLY."
+    kind: sql
+    invoked_by: manual
+    git: 2026-09-08
+    reads: {tables: [equities_scalp.fills]}
+    reads_note: file states this table is owned by the dashboard (app/routers/equities_scalp.py)
+    writes: {files: [fills_dump.csv]}
+
+  - path: analysis/episode_shape.py
+    group: analysis
+    purpose: "Step 1b: what the fills actually look like, and how much the episode boundary N matters."
+    kind: entry
+    flags: ["csv (positional, default fills_dump.csv)"]
+    invoked_by: manual
+    git: 2026-09-08
+    reads: {files: [fills_dump.csv]}
+    writes: {stdout: true}
+
+  - path: analysis/parquet_coverage.py
+    group: analysis
+    purpose: "Step 1c: is the tape actually on disk for every ticker-day I traded, and how big is it."
+    kind: entry
+    flags: ["csv (positional)"]
+    invoked_by: manual
+    git: 2026-09-08
+    reads: {files: [fills_dump.csv], parquet: [scalp store, stat only]}
+    writes: {stdout: true}
+
+  - path: analysis/episode_metrics.py
+    group: analysis
+    purpose: "Step 2: one row per trading episode, with the tape measured over exactly the window I was exposed to."
+    kind: entry
+    flags: ["--gap-minutes", "--lead-minutes", "--out", "--out-full", "--time-tol", "--price-tol"]
+    invoked_by: manual
+    git: 2026-09-08
+    reads: {files: [fills_dump.csv], parquet: [scalp store]}
+    writes: {files: ["--out CSV", "--out-full CSV"]}
+
+  - path: analysis/episode_correlate.py
+    group: analysis
+    purpose: "Step 2b: the same correlations, at episode grain, with a chance table."
+    kind: entry
+    flags: ["csv (positional)", "--permutations", "--seed", "--min-coverage"]
+    invoked_by: manual
+    git: 2026-09-08
+    reads: {files: [episode CSV from episode_metrics.py]}
+    writes: {stdout: true}
+
+questions:
+
+  q1:
+    question: CHAIN_INTRADAY_DIR is set in .env but the directory does not exist. What reads or writes it, and is that code path live?
+    answer: code path intact but dormant; no scheduled reader or writer
+    configured_path: /mnt/trading_volume_3/chain_intraday
+    exists_on_disk: false
+    volume_mounted: true
+    volume_evidence: chain_live and chain_snapshots siblings present on the same volume
+    writers:
+      - script: fetch_chain_intraday.py
+        via: lib/chain_intraday_store.py SessionWriter
+        scheduled: false
+      - script: diagnose_transform.py
+        target: CHAIN_INTRADAY_DIR/_diag/
+        scheduled: false
+        incidental: true
+    readers:
+      - script: build_equity_surface.py
+        condition: --source intraday
+        default: false
+        scheduled: false
+      - script: verify_surface_fixes.py
+        condition: --source intraday
+        scheduled: false
+      - script: lib/chain_live_store.py
+        note: imports schema constants only, no I/O
+      - script: test_equity_surface_parallel.py
+        note: overrides env to a temp dir
+    live_equivalent: CHAIN_LIVE_DIR, written by fetch_live_surface.py under run_live_pipeline.py cron
+    uncertain: whether the directory previously held data that was deleted
+
+  q2:
+    question: What builds wf_bins and is_bins, and how is tt_bins meant to be built?
+    premise_correction: cron does reach build_bin_tables.py, as a subprocess of run_pipeline.py and run_pipeline_early.py
+    chain: crontab.txt -> run_pipeline*.py -> subprocess build_bin_tables.py
+    wf_bins:
+      built_by: build_bin_tables.py --tier {MORNING,EVENING}
+      frequency: 3x per weekday (07:00, 09:35, 18:00)
+      scheduled: true
+    is_bins:
+      built_by: build_bin_tables.py --tier {MORNING,EVENING}
+      note: same flag as wf_bins, one flag writes both tables sequentially in main()
+      frequency: 3x per weekday
+      scheduled: true
+    tt_thresholds:
+      built_by: build_bin_tables.py --build-tt
+      frequency: EVENING only
+      scheduled: true
+      status: legacy per build_bin_tables.py:571
+    tt_bins:
+      built_by: build_bin_tables.py --build-tt-bins
+      scheduled: false
+      caller: NONE
+      detail: no cron entry, no script, no subprocess passes --build-tt-bins
+      consumers: [dashboard (per build_bin_tables.py:571), build_trade_paths.py:473-497]
+      impact: the table the dashboard reads is the one nothing refreshes
+    date_discrepancy:
+      status: RESOLVED_rev1
+      source: docs/vps_state/bin_freshness.txt
+      user_reported_last_write: 2026-08-14
+      confirmed: true
+      table_stats_last_stats_was: 2026-09-01 10:38:49
+      table_stats_verdict: ANALYZE sweep, correctly rejected as evidence
+      freshness:
+        open_interest.tt_bins:        {earliest: 2018-12-31, latest: 2026-08-14, tickers: 121}
+        open_interest.wf_bins:        {earliest: 2018-12-31, latest: 2026-09-14, tickers: 121}
+        open_interest.is_bins:        {earliest: 2018-12-31, latest: 2026-09-14, tickers: 121}
+        open_interest.daily_features: {earliest: 2018-12-31, latest: 2026-09-14, tickers: 121}
+      gap_shape: dates_only
+      gap_detail: identical 121-ticker coverage and identical 2018-12-31 start across all four; only the tail is missing
+      downstream_impact: build_trade_paths.py joins current daily_features against tt_bins that stop one month short
+
+  q3:
+    question: Do the five empty research_* tables in open_interest get touched by this project?
+    answer: no
+    evidence: zero grep matches across the entire repo including sql/, migrations/, scalp/, and docs
+    tables: [open_interest.research_runs, open_interest.research_results, open_interest.research_series, open_interest.research_charts, open_interest.research_followups]
+    row_state: 0 live tuples, 0 inserts ever
+    interpretation: never received a row, not emptied later
+    spx_interpolated_counterparts:
+      note: same five names plus research_knowledge, research_backtest_staging, research_backtest_uploads, research_pnl_uploads
+      implication: open_interest has a partial copy of a fuller schema
+    uncertain: which codebase created them
+    uncertain_reason: dashboard is the obvious candidate but its source is not visible and vps_state/README.md is missing
+
+  q4:
+    question: Does any script in this project write /mnt/trading_volume_3 quote_ticks, ext_trades, or backup?
+    answer: no
+    evidence: repo-wide grep for quote_ticks, ext_trades, /mnt/, backup returns four hits, all in scalp/, all about equities_scalp
+    project_writes_on_that_volume: [equities_scalp (scalp/), chain_live, chain_snapshots]
+    ownership_inference: WITHDRAWN_rev1
+    withdrawal_reason: >
+      The first pass named Thetadata_Raw_SPX as likely owner of quote_ticks and
+      ext_trades, reasoning from the truncated crontab.txt:1 fragment. The
+      complete crontab confirms that project runs a 5-minute pipeline, but
+      vps_state/README.md:24-26 says other projects' directories are out of
+      scope and "Don't infer owners for them", and README:56-57 names these
+      three directories specifically as "Out of scope; don't guess".
+      Only the verified negative is asserted.
+    unowned:
+      - path: /mnt/trading_volume_3/backup
+        written_by_this_project: false
+        written_by_this_project_verified: true
+        owner: not_determined_out_of_scope
+      - path: /mnt/trading_volume_3/quote_ticks
+        mtime: 2026-09-10 13:57
+        written_by_this_project: false
+        written_by_this_project_verified: true
+        owner: not_determined_out_of_scope
+        note: live, not archival - do not treat as reclaimable space
+      - path: /mnt/trading_volume_3/ext_trades
+        mtime: 2026-09-10 20:24
+        written_by_this_project: false
+        written_by_this_project_verified: true
+        owner: not_determined_out_of_scope
+        note: live, not archival
+    spx_options_note:
+      logical_store_halves: [/mnt/trading_volume_2/spx_options, /mnt/volume1/spx_options]
+      third_location: /data/spx_options
+      third_location_size: 395 MB
+      third_location_referenced_in_project: false
+
+# ============================================================================
+# SECTION 2 - DATA STORE INVENTORY
+# Partition children excluded throughout. equity_surface, equity_atm,
+# equity_metrics, equity_metrics_z and equities_scalp.intraday_metrics are
+# each one logical table.
+# ============================================================================
+
+section2_conflicts:
+  - id: trade_paths_ownership
+    tables: [open_interest.trade_paths, open_interest.trade_paths_manifest, open_interest.trade_path_rules]
+    readme_says: "vps_state/README.md:19 lists trade_paths* among tables a separate codebase writes"
+    code_says:
+      - "build_trade_paths.py:433 INSERT INTO trade_paths"
+      - "build_trade_paths.py:444 INSERT INTO trade_paths_manifest"
+      - "lib/trade_path_schema.py:114 INSERT INTO trade_path_rules"
+      - "lib/trade_path_schema.py:90,93 CREATE TABLE trade_paths"
+      - "sql/07_trade_paths.sql owns the DDL"
+    verdict: this repo unambiguously writes all three
+    resolution: RESOLVED_rev2
+    resolution_detail: user confirmed this is a README error; trade_paths* removed from the external-writer list
+  - id: underlying_ohlc_ownership
+    tables: [open_interest.underlying_ohlc]
+    readme_says: "vps_state/README.md:22 gives it as the example of read-here-produced-elsewhere"
+    code_says:
+      - "fetch_ohlc.py:29 INSERT INTO underlying_ohlc (cron EVENING and MORNING)"
+      - "fetch_ohlc_premarket.py:48 upsert of open column (cron PREMARKET)"
+    verdict: this repo writes it on three cron runs per weekday
+    resolution: RESOLVED_rev2
+    resolution_detail: user confirmed the README had the direction backwards - produced here, read by the dashboard
+
+external_writer_list_rederived:
+  revision: rev2
+  method: >
+    grep every one of the 40 logical open_interest table names across all .py
+    and .sql in root, lib/, sql/, migrations/, analysis/, scalp/ and Cowork/,
+    excluding only .venv/ and the docs/ output of this inventory. A table has an
+    in-repo writer if any source file contains INSERT, UPDATE, COPY, TRUNCATE,
+    CREATE TABLE, or a store-module constant naming it.
+  count: 19
+  readme_list_count: 16
+  readme_wrongly_included: [open_interest.trade_paths, open_interest.trade_paths_manifest, open_interest.trade_path_rules]
+  readme_missed: [open_interest.global_bins_cache, open_interest.equity_structure_presets, open_interest.signals]
+  no_writer_in_repo:
+    - open_interest.analyze_cache_outcome
+    - open_interest.analyze_cache_slim
+    - open_interest.analyze_cache_trade_meta
+    - open_interest.analyze_primary_cache
+    - open_interest.corner_scan_1f
+    - open_interest.corner_scan_2f
+    - open_interest.corner_scan_notes
+    - open_interest.global_bins_cache
+    - open_interest.ic_batch_cache
+    - open_interest.sec_scan_cache
+    - open_interest.ticker_analysis_chain_cache
+    - open_interest.ticker_analysis_layouts
+    - open_interest.equity_structure_presets
+    - open_interest.signals
+    - open_interest.research_charts
+    - open_interest.research_followups
+    - open_interest.research_results
+    - open_interest.research_runs
+    - open_interest.research_series
+  signals_note: >
+    the only source occurrences of the string "signals" anywhere in the repo are
+    the English word in comments (sql/01_schema.sql:116, iv25d_quality_report.py:468,
+    scalp/metrics.py:443). Never an identifier.
+  shared_write_special_case:
+    table: open_interest.metric_classification
+    no_create_table_in_repo: true
+    written_by_repo: ["sql/06_25d_skew_metrics.sql:47 INSERT INTO, applied by init_db.py"]
+    read_by_repo: ["lib/bin_schema.py:51 - selects metric, tier WHERE eligible_as_metric = TRUE"]
+    significance: an externally-owned table governs which columns every bin table gets, while this repo also mutates it
+    section3_candidate: true
+  ddl_owned_by_repo:
+    count: 20
+    tables: [underlying_ohlc, daily_features, option_volume_daily, option_iv_daily, backtest_call_spread, wf_bins, is_bins, tt_bins, tt_thresholds, trade_paths, trade_path_rules, trade_paths_manifest, equity_surface, equity_atm, equity_surface_diagnostics, equity_metrics, equity_metrics_z, equity_metrics_catalog, earnings_calendar, earnings_coverage]
+    plus: ensure_*_partition functions that create partition children on demand
+
+databases:
+  open_interest:
+    logical_tables: 40
+    raw_relations: 124
+    difference: partition children
+  equities_scalp:
+    logical_tables: 9
+    logical_tables_note: 7 written by this repo, 2 (fills, fills_daily) external
+    raw_relations: 25
+    difference: 16 daily partition children of intraday_metrics
+    schema_captured: false
+
+tables:
+
+  - name: open_interest.daily_features
+    owner: in-repo
+    written_by:
+      - {script: build_features.py, via: "run_pipeline.py --tier EVENING", columns: EVENING_COLS}
+      - {script: build_features.py, via: "run_pipeline.py --tier MORNING", columns: MORNING_COLS}
+      - {script: build_features.py, via: run_pipeline_early.py, columns: MORNING_COLS}
+    read_by: [build_bin_tables.py, build_trade_paths.py, audit_symbol_gaps.py, audit_trade_paths.py, validate_bins.py, iv25d_quality_report.py]
+    pk: [ticker, trade_date]
+    rows: 200677
+    inserts_ever: 1204779
+    freshness: {earliest: 2018-12-31, latest: 2026-09-14, tickers: 121}
+
+  - name: open_interest.underlying_ohlc
+    owner: in-repo
+    conflict: underlying_ohlc_ownership
+    written_by:
+      - {script: fetch_ohlc.py, via: run_pipeline.py both tiers}
+      - {script: fetch_ohlc_premarket.py, via: run_pipeline_early.py, columns: [open]}
+    read_by: [build_features.py, run_pipeline.py, run_pipeline_early.py, backtest_spreads.py, fetch_iv_chain.py, fetch_volume_eod.py, audit_symbol_gaps.py, audit_trade_paths.py, lib/metrics_compute.py, lib/split_factors.py, phase1_iv25d_sample.py]
+    pk: [ticker, trade_date]
+    rows: 227434
+
+  - name: open_interest.wf_bins
+    owner: in-repo
+    written_by: [{script: build_bin_tables.py, flag: "--tier MORNING|EVENING", scheduled: true, frequency: 3x per weekday}]
+    read_by: [validate_bins.py]
+    pk: [ticker, trade_date]
+    rows: 262440
+    freshness: {latest: 2026-09-14}
+
+  - name: open_interest.is_bins
+    owner: in-repo
+    written_by: [{script: build_bin_tables.py, flag: "--tier MORNING|EVENING", note: same flag as wf_bins}]
+    read_by: []
+    consumer: external_consumer_likely
+    pk: [ticker, trade_date]
+    rows: 229917
+    freshness: {latest: 2026-09-14}
+    gap: validate_bins.py does not cover it
+
+  - name: open_interest.tt_bins
+    owner: in-repo
+    written_by: [{script: build_bin_tables.py, flag: "--build-tt-bins", scheduled: false, caller: NONE}]
+    read_by: [build_trade_paths.py]
+    consumer: "dashboard (per build_bin_tables.py:571)"
+    pk: [ticker, trade_date]
+    rows: 225204
+    freshness: {earliest: 2018-12-31, latest: 2026-08-14, tickers: 121}
+    status: STALE_ONE_MONTH
+
+  - name: open_interest.tt_thresholds
+    owner: in-repo
+    written_by: [{script: build_bin_tables.py, flag: "--build-tt", via: "run_pipeline.py --tier EVENING"}]
+    read_by: [validate_bins.py]
+    pk: [metric, ticker, cutoff_date]
+    rows: 19118
+    note: described by its own builder as legacy, yet it is the one cron refreshes
+
+  - name: open_interest.metric_classification
+    owner: in-repo
+    written_by: [{script: "sql/06_25d_skew_metrics.sql:47", via: init_db.py}]
+    read_by: [lib/bin_schema.py]
+    pk: [metric]
+    rows: 172
+    role: control table - drives which metrics build_bin_tables.py bins
+
+  - name: open_interest.equity_surface
+    owner: in-repo
+    written_by:
+      - {script: fetch_live_surface.py, via: run_live_pipeline.py, scheduled: true, frequency: every 5 min RTH}
+      - {script: build_equity_surface.py, scheduled: false}
+      - {script: backfill_call_price.py, operation: UPDATE, columns: [call_price]}
+    read_by: [lib/metrics_compute.py, backfill_call_price.py]
+    unique: [ticker, trade_date, snapshot, dte, put_delta]
+    partitioning: {by: RANGE, column: trade_date, granularity: monthly}
+    rows_202609: 19101023
+
+  - name: open_interest.equity_atm
+    owner: in-repo
+    written_by: [fetch_live_surface.py, build_equity_surface.py]
+    read_by: [lib/metrics_compute.py]
+    unique: [ticker, trade_date, snapshot, dte]
+    partitioning: {by: RANGE, column: trade_date, granularity: monthly}
+    rows_202609: 1005335
+
+  - name: open_interest.equity_surface_diagnostics
+    owner: in-repo
+    written_by: [fetch_live_surface.py, build_equity_surface.py]
+    read_by: [build_equity_metrics.py, lib/metrics_store.py, lib/surface_store.py, lib/metrics_compute.py]
+    pk: [ticker, trade_date, snapshot, expiry]
+    partitioning: none
+    rows: 3979247
+    note: not partitioned unlike its three siblings - 937 MB in a single table
+
+  - name: open_interest.equity_metrics
+    owner: in-repo
+    written_by:
+      - {script: build_equity_metrics.py, via: run_live_pipeline.py, scheduled: true}
+      - {script: backfill_days_to_earnings.py, operation: UPDATE, columns: [days_to_earnings]}
+    read_by: [snapshot_null_audit.py, zscore_migration_check.py, rv_vrp_noise_report.py, lib/metrics_store.py, backfill_days_to_earnings.py]
+    pk: [ticker, trade_date, snapshot]
+    partitioning: {by: RANGE, column: trade_date, granularity: monthly}
+
+  - name: open_interest.equity_metrics_z
+    owner: in-repo
+    written_by: [{script: build_equity_metrics.py, suppressed_by: "--no-z"}]
+    read_by: [snapshot_null_audit.py, zscore_migration_check.py]
+    pk: [ticker, trade_date, snapshot]
+    partitioning: {by: RANGE, column: trade_date, granularity: monthly}
+
+  - name: open_interest.equity_metrics_catalog
+    owner: in-repo
+    written_by: [{script: "lib/metrics_store.py:146", via: "build_equity_metrics.py init-db"}]
+    read_by: []
+    consumer: external_consumer_likely
+    consumer_evidence: "lib/metrics_config.py:9 calls it the dashboard metric picker"
+    pk: [column_name]
+    rows: 767
+
+  - name: open_interest.earnings_calendar
+    owner: in-repo
+    written_by: [{script: fetch_earnings_calendar.py, via: cron 20:30, helper: lib/earnings_store.py}]
+    read_by: [backfill_days_to_earnings.py, lib/metrics_compute.py]
+    pk: [ticker, earnings_date]
+    rows: 2280
+
+  - name: open_interest.earnings_coverage
+    owner: in-repo
+    written_by: [{script: fetch_earnings_calendar.py, via: cron 20:30}]
+    read_by: [backfill_days_to_earnings.py]
+    pk: [ticker]
+    rows: 120
+
+  - name: open_interest.trade_paths
+    owner: in-repo
+    conflict: trade_paths_ownership
+    written_by: [{script: build_trade_paths.py, scheduled: false, mechanism: COPY to _tp_stage then INSERT}]
+    read_by: [audit_trade_paths.py]
+    pk: [ticker, trade_date, entry_anchor]
+    rows: 441029
+
+  - name: open_interest.trade_paths_manifest
+    owner: in-repo
+    conflict: trade_paths_ownership
+    written_by: [build_trade_paths.py]
+    read_by: [build_trade_paths.py]
+    pk: [ticker, entry_anchor]
+    rows: 242
+
+  - name: open_interest.trade_path_rules
+    owner: in-repo
+    conflict: trade_paths_ownership
+    written_by: [lib/trade_path_schema.py]
+    read_by: [lib/trade_path_rules.py]
+    pk: [rule_key]
+    rows: 143
+
+  - name: open_interest.option_iv_daily
+    owner: in-repo
+    written_by: [{script: fetch_iv_chain.py, caller: NONE, status: superseded_by_fetch_chain_eod}]
+    read_by: []
+    pk: [ticker, trade_date]
+    rows: 215060
+    status: legacy
+
+  - name: open_interest.option_volume_daily
+    owner: in-repo
+    written_by: [{script: fetch_volume_eod.py, caller: NONE, status: superseded_by_fetch_chain_eod}]
+    read_by: []
+    pk: [ticker, trade_date]
+    rows: 215582
+    status: legacy
+
+  - name: open_interest.backtest_call_spread
+    owner: in-repo
+    written_by: [{script: backtest_spreads.py, scheduled: false}]
+    read_by: []
+    pk: [id]
+    unique: [ticker, trade_date, exit_date]
+    rows: 1971
+
+  - {name: open_interest.analyze_cache_outcome,       owner: external, pk: [cache_key, outcome], rows: 104, kind: cache}
+  - {name: open_interest.analyze_cache_slim,          owner: external, pk: [cache_key], rows: 8, kind: cache}
+  - {name: open_interest.analyze_cache_trade_meta,    owner: external, pk: [cache_key], rows: 8, kind: cache}
+  - {name: open_interest.analyze_primary_cache,       owner: external, pk: [cache_key], rows: 17, kind: cache}
+  - {name: open_interest.corner_scan_1f,              owner: external, pk: [metric, extreme, outcome, mode], rows: 5512}
+  - {name: open_interest.corner_scan_2f,              owner: external, pk: [primary_metric, secondary_metric, corner_direction, outcome, mode], rows: 1130468}
+  - {name: open_interest.corner_scan_notes,           owner: external, pk: [primary_metric, secondary_metric, corner_direction, outcome], rows: 35}
+  - {name: open_interest.global_bins_cache,           owner: external, pk: [cache_key], rows: 8, kind: cache}
+  - {name: open_interest.ic_batch_cache,              owner: external, pk: [cache_key], rows: 3, kind: cache}
+  - {name: open_interest.sec_scan_cache,              owner: external, pk: [structural_key], rows: 6, kind: cache}
+  - {name: open_interest.ticker_analysis_chain_cache, owner: external, pk: [cache_key], rows: 603, kind: cache}
+  - {name: open_interest.ticker_analysis_layouts,     owner: external, pk: [id], unique: [name], rows: 0, kind: ui_state}
+  - {name: open_interest.equity_structure_presets,    owner: external, pk: [id], unique: [name], rows: 1, kind: ui_state}
+  - {name: open_interest.signals,                     owner: external, pk: [id], rows: 22}
+  - {name: open_interest.research_charts,             owner: external, pk: [id], rows: 0, inserts_ever: 0, see: questions.q3}
+  - {name: open_interest.research_followups,          owner: external, pk: [id], rows: 0, inserts_ever: 0, see: questions.q3}
+  - {name: open_interest.research_results,            owner: external, pk: [id], rows: 0, inserts_ever: 0, see: questions.q3}
+  - {name: open_interest.research_runs,               owner: external, pk: [id], rows: 0, inserts_ever: 0, see: questions.q3}
+  - {name: open_interest.research_series,             owner: external, pk: [id], rows: 0, inserts_ever: 0, see: questions.q3}
+
+  - name: equities_scalp.universe
+    owner: in-repo
+    written_by: [{script: scalp/update_universe.py, helper: "scalp/db.py:763 write_universe"}]
+    read_by: [scalp internals]
+    pk: [trade_date, symbol]
+    pk_source: "scalp/db.py:139"
+    uncertain: true
+    uncertain_reason: no equities_scalp schema capture supplied
+
+  - name: equities_scalp.daily_metrics
+    owner: in-repo
+    written_by: [{script: scalp/compute.py, helper: db.write_daily_metrics}]
+    read_by: [scalp internals]
+    pk: [trade_date, symbol, metric]
+    pk_source: "scalp/db.py:148"
+    shape: long/EAV via _upsert_long
+    uncertain: true
+
+  - name: equities_scalp.provenance
+    owner: in-repo
+    written_by: [{script: scalp/compute.py, helper: db.write_provenance}]
+    read_by: ["scalp/db.py:456 provenance_wide"]
+    pk: [trade_date, symbol, item]
+    pk_source: "scalp/db.py:177"
+    uncertain: true
+
+  - name: equities_scalp.intraday_metrics
+    owner: in-repo
+    written_by:
+      - {script: scalp/compute.py, helper: "scalp/db.py:491 write_intraday_metrics"}
+      - {script: migrations/rebuild_intraday_metrics.sql, operation: TRUNCATE}
+    read_by: [scalp internals]
+    pk: [trade_date, symbol, bucket_start]
+    pk_source: "scalp/db.py:211"
+    partitioning: {by: RANGE, column: trade_date, granularity: daily, suffix: _YYYYMMDD, created_at: "scalp/db.py:321"}
+    partitions_present: 16
+    partition_range: [2026-08-17, 2026-09-08]
+    uncertain: true
+
+  - name: equities_scalp.intraday_monthly
+    owner: in-repo
+    written_by: [{script: scalp/compute.py, helper: "scalp/db.py:545 upsert_intraday_monthly"}]
+    read_by: [scalp internals]
+    pk: [month, symbol, bucket_time]
+    pk_source: "scalp/db.py:286"
+    role: rollup of intraday_metrics
+    uncertain: true
+
+  - name: equities_scalp.fetch_runs
+    owner: in-repo
+    written_by: [{script: scalp/fetch.py, helper: "scalp/db.py:578 write_fetch_run"}]
+    read_by: [scalp internals]
+    pk: [run_ts, trade_date]
+    pk_source: "scalp/db.py:308"
+    role: run ledger
+    uncertain: true
+
+  - name: equities_scalp.rankings
+    owner: in-repo
+    written_by: [{helper: "scalp/db.py:787 write_ranking", caller: NONE}]
+    read_by: []
+    pk: [run_ts, trade_date, symbol, variant]
+    pk_source: "scalp/db.py:191"
+    flag: writer function exists and is never called anywhere in the repo
+    section3_candidate: true
+    uncertain: true
+
+  - name: equities_scalp.fills
+    owner: external
+    owner_evidence: "analysis/dump_fills.sql:6 states the table is owned by the dashboard app/routers/equities_scalp.py"
+    written_by: []
+    read_by: ["analysis/dump_fills.sql produces fills_dump.csv, consumed by analysis/episode_shape.py, episode_metrics.py, parquet_coverage.py"]
+    pk: UNCERTAIN
+    uncertain_reason: not in any supplied schema
+
+  - name: equities_scalp.fills_daily
+    owner: external
+    written_by: []
+    read_by: []
+    pk: UNCERTAIN
+
+parquet_stores:
+
+  - logical_name: raw OI
+    env_var: OI_RAW_DIR
+    resolved_path: /data/oi_raw
+    volume: /data
+    size: 577M
+    partitioning: "{TICKER}/{year}.parquet"
+    dedupe_key: [trade_date, expiration, strike, option_type]
+    written_by:
+      - {script: fetch_oi.py, scheduled: true}
+      - {script: fetch_oi_snapshot.py, scheduled: true}
+    read_by: [build_features.py, backtest_spreads.py]
+    also_used_as: ticker universe source for run_pipeline.py, run_pipeline_early.py, fetch_chain_eod.py, fetch_chain_snapshots.py, fetch_chain_intraday.py, fetch_equity_1min.py, fetch_earnings_calendar.py, fetch_iv_chain.py, audit_chain_snapshots.py, audit_equity_1min.py, audit_symbol_gaps.py
+    status: active
+
+  - logical_name: EOD greeks chain
+    env_var: CHAIN_EOD_DIR
+    resolved_path: /data/chain_eod
+    volume: /data
+    size: 2.0G
+    partitioning: "{TICKER}/{year}.parquet"
+    written_by: [{script: fetch_chain_eod.py, via: "run_pipeline.py --tier EVENING", scheduled: true}]
+    read_by: [build_features.py, iv25d_quality_report.py, phase1_iv25d_sample.py, audit_symbol_gaps.py]
+    status: active
+
+  - logical_name: 1-minute equity bars
+    env_var: EQUITY_1MIN_DIR
+    resolved_path: /data/equity_1min
+    volume: /data
+    size: 5.0G
+    partitioning: "{TICKER}/{year}.parquet plus _manifest/{TICKER}.parquet"
+    written_by: [{script: fetch_equity_1min.py, scheduled: false}]
+    read_by: [build_trade_paths.py, audit_equity_1min.py]
+    status: active_manually_fed
+
+  - logical_name: twice-daily chain snapshots
+    env_var: CHAIN_SNAPSHOTS_DIR
+    resolved_path: /mnt/trading_volume_3/chain_snapshots
+    volume: /mnt/trading_volume_3
+    dir_entries: 123
+    dir_mtime: 2026-09-07
+    partitioning: "{TICKER}/{YYYYMM}.parquet"
+    partitioning_note: monthly since migrate_chain_snapshots_to_monthly.py; legacy yearly files still detected at build_equity_surface.py:381
+    snapshots_per_day: 2
+    snapshot_times: ["09:45 ET", "15:45 ET"]
+    written_by: [{script: fetch_chain_snapshots.py, scheduled: false}]
+    read_by: [build_equity_surface.py, audit_chain_snapshots.py, probe_session_gap.py, verify_surface_fixes.py, fetch_earnings_calendar.py]
+    default_source_for: build_equity_surface.py
+    status: active_manually_fed
+
+  - logical_name: live 5-minute chain captures
+    env_var: CHAIN_LIVE_DIR
+    resolved_path: /mnt/trading_volume_3/chain_live
+    volume: /mnt/trading_volume_3
+    dir_entries: 123
+    dir_mtime: 2026-08-24
+    partitioning: "{TICKER}/{YYYYMMDD}/{HHMM}.parquet"
+    partitioning_note: one file per capture cycle, written pre-clean_chain
+    written_by: [{script: fetch_live_surface.py, via: run_live_pipeline.py, scheduled: true, frequency: every 5 min RTH}]
+    read_by: [verify_surface_fixes.py]
+    status: active
+    note: the only parquet store on a schedule
+
+  - logical_name: full-day 5-minute intraday chain bars
+    env_var: CHAIN_INTRADAY_DIR
+    resolved_path: /mnt/trading_volume_3/chain_intraday
+    volume: /mnt/trading_volume_3
+    exists_on_disk: false
+    partitioning: "{TICKER}/{YYYYMMDD}.parquet plus {YYYYMMDD}.manifest.json"
+    written_by:
+      - {script: fetch_chain_intraday.py, scheduled: false}
+      - {script: diagnose_transform.py, target: _diag/, incidental: true}
+    read_by:
+      - {script: build_equity_surface.py, condition: "--source intraday"}
+      - {script: verify_surface_fixes.py, condition: "--source intraday"}
+    status: SUPERSEDED_PENDING_DECISION
+    status_evidence: "vps_state/README.md:50-52"
+    superseded_by: {store: CHAIN_LIVE_DIR, script: fetch_live_surface.py}
+
+  - logical_name: scalp raw tape
+    env_var: SCALP_DATA_DIR
+    resolved_path: UNCERTAIN
+    resolved_path_reason: not defined in config.py and not present in env_paths.txt
+    documented_path: /mnt/trading_volume_3/equities_scalp
+    documented_in: "scalp/README.md:242"
+    partitioning: "raw/{SYMBOL}/{YYYY-MM-DD}.parquet"
+    partitioning_source: "scalp/store.py:7"
+    volume: /mnt/trading_volume_3
+    written_by: [scalp/ - see section 1b]
+    read_by: [scalp/, analysis/episode_metrics.py, analysis/parquet_coverage.py]
+    status: active
+    warning: an empty /data/equities_scalp of 4K also exists, consistent with the unmounted-mnt failure mode scalp/config.py:479 warns about
+
+volumes:
+  - path: /data
+    contents: [oi_raw, chain_eod, equity_1min, equities_scalp empty 4K, spx_options 395M]
+    in_scope: partial
+    note: spx_options here is referenced by no script in this repo and is a third location for a store whose two real halves are on volume1 and trading_volume_2
+  - path: /mnt/trading_volume_3
+    contents: [chain_live, chain_snapshots, equities_scalp, backup, ext_trades, quote_ticks]
+    in_scope: partial
+    note: backup, ext_trades and quote_ticks have no writer in this repo; out of scope per README
+  - path: /mnt/trading_volume_2
+    contents: [spx_options]
+    entries: 1005
+    in_scope: false
+    note: other project - first 3-4 years, complete and static
+  - path: /mnt/volume1
+    contents: [spx_options]
+    entries: 669
+    in_scope: false
+    note: other project - recent years through live
+
+# ============================================================================
+# SECTION 1b - SCRIPT INVENTORY: scalp/ and Cowork/
+# ============================================================================
+
+scalp_subsystem:
+  scheduled: false
+  scheduled_evidence: no crontab.txt entry names scalp, "-m scalp.", or any file under it
+  invocation: python -m scalp.<module>
+  isolation: deliberate
+  isolation_evidence:
+    - "scalp/__init__.py - self-contained by design, nothing imports from the project root"
+    - "scalp/config.py - SELF-CONTAINED, deliberately does not import the project-root module"
+    - "scalp/db.py - SELF-CONTAINED, does not import the project-root db.py"
+    - "scalp/thetadata.py:2 - SELF-CONTAINED BY DESIGN, DO NOT REFACTOR INTO A SHARED MODULE"
+  duplication_verdict: intentional, not drift
+  storage_contract: "scalp/store.py:4 - Parquet is the record. Postgres holds derived metrics only, no tick data"
+  database: equities_scalp
+
+scripts_1b:
+
+  - path: scalp/update_universe.py
+    group: scalp_pipeline
+    purpose: "Nightly candidate list. One API call."
+    kind: entry
+    invocation: python -m scalp.update_universe
+    flags: ["--date", "--from-eod", "--candidates", "--eod-workers", "--dry-run", "--verbose"]
+    invoked_by: manual
+    invoked_note: docstring says nightly but no cron entry exists
+    git: 2026-09-06
+    reads: {apis: [thetadata stock EOD]}
+    writes: {tables: [equities_scalp.universe], helper: "scalp/db.py:763 write_universe"}
+
+  - path: scalp/fetch.py
+    group: scalp_pipeline
+    purpose: "Fetch trade_quote to parquet. Resumable, incremental, space-aware."
+    kind: entry
+    flags: ["--start", "--end", "--symbols", "--workers", "--plan", "--yes", "--confirm-threshold", "--allow-today", "--min-exchange-codes", "--verbose"]
+    invoked_by: manual
+    git: 2026-09-01
+    reads: {apis: ["thetadata /v3/stock/history/trade_quote"], tables: [equities_scalp.universe]}
+    writes:
+      parquet: ["SCALP_DATA_DIR/raw/{SYMBOL}/{YYYY-MM-DD}.parquet"]
+      tables: [equities_scalp.fetch_runs]
+
+  - path: scalp/compute.py
+    group: scalp_pipeline
+    purpose: "Read parquet, compute metrics, write Postgres."
+    kind: entry
+    flags: ["--start", "--end", "--symbols", "--no-intraday", "--no-quiet", "--replace", "--workers", "--print", "--verbose"]
+    invoked_by: manual
+    git: 2026-09-07
+    reads: {parquet: [SCALP_DATA_DIR]}
+    writes:
+      tables: [equities_scalp.daily_metrics, equities_scalp.provenance, equities_scalp.intraday_metrics, equities_scalp.intraday_monthly]
+
+  - path: scalp/prune.py
+    group: scalp_pipeline
+    purpose: "Delete old raw parquet. RUN BY HAND. Dry-run by default."
+    kind: entry
+    flags: ["--intraday", "--intraday-before", "--older-than", "--before", "--symbols", "--delete"]
+    invoked_by: manual_by_design
+    git: 2026-09-01
+    destructive: true
+    reads: {parquet: [SCALP_DATA_DIR], tables: [equities_scalp.intraday_metrics]}
+    writes:
+      deletes_parquet: true
+      drops_partitions: "equities_scalp.intraday_metrics daily partitions past retention (prune.py:84, DROP TABLE not DELETE)"
+      guard: dry-run unless --delete
+
+  - path: scalp/config.py
+    group: scalp_lib
+    purpose: "Configuration for the equities-scalp pipeline. SELF-CONTAINED."
+    kind: lib
+    git: 2026-09-07
+    size: 66KB
+    defines: [SCALP_DATA_DIR, INTRADAY_RETENTION_DAYS, universe filters]
+    notable_lines: {479: unmounted-/mnt warning, 533: volume capacity note}
+
+  - path: scalp/db.py
+    group: scalp_lib
+    purpose: "Postgres access for the equities-scalp pipeline. SELF-CONTAINED."
+    kind: lib
+    git: 2026-09-07
+    owns: all seven equities_scalp CREATE TABLE statements and every write helper
+
+  - path: scalp/store.py
+    group: scalp_lib
+    purpose: "Parquet store: layout, atomic writes, and what is already on disk."
+    kind: lib
+    git: 2026-08-31
+    layout: "raw/{SYMBOL}/{YYYY-MM-DD}.parquet"
+
+  - path: scalp/thetadata.py
+    group: scalp_lib
+    purpose: "ThetaData v3 STOCK client. SELF-CONTAINED BY DESIGN."
+    kind: lib
+    git: 2026-08-31
+    note: stock endpoints, distinct from lib/thetadata.py which is options
+
+  - path: scalp/schema.py
+    group: scalp_lib
+    purpose: "Column names as the vendor actually returns them, and how to resolve them."
+    kind: lib
+    git: 2026-08-31
+
+  - path: scalp/metrics.py
+    group: scalp_lib
+    purpose: "Metric computation for the equities-scalp ranker."
+    kind: lib
+    git: 2026-09-08
+    size: 49KB
+    note: most recently edited file in the repo
+
+  - path: scalp/quiet.py
+    group: scalp_lib
+    purpose: "Quiet-window metrics: is the level shift small relative to the range I work?"
+    kind: lib
+    git: 2026-09-07
+
+  - path: scalp/quality.py
+    group: scalp_lib
+    purpose: "Data-quality guards for the trade tape (restatement detection)."
+    kind: entry
+    flags: ["--selftest"]
+    invoked_by: manual
+    git: 2026-08-31
+    note: runnable via --selftest but exposes no pipeline action
+
+  - path: scalp/metric_docs.py
+    group: scalp_lib
+    purpose: "Metric name -> its definition and its section in METRICS.md."
+    kind: lib
+    git: 2026-09-07
+    consumer: external_consumer_likely
+    consumer_evidence: docstring says it exists so the dashboard can make every column header a link
+
+  - path: scalp/audit_venue.py
+    group: scalp_diagnostic
+    purpose: "Is the stored tape consolidated, or Nasdaq-only? Reads parquet, nothing else."
+    kind: entry
+    flags: ["--start", "--end", "--sample", "--full", "--symbols", "--threshold", "--seed"]
+    invoked_by: manual
+    git: 2026-08-31
+    reads: {parquet: [SCALP_DATA_DIR]}
+    writes: {stdout: true}
+
+  - path: scalp/profile_compute.py
+    group: scalp_diagnostic
+    purpose: "Where does compute.py's time per symbol-day go?"
+    kind: entry
+    flags: ["--symbol", "--date", "--top", "--universe", "--days"]
+    invoked_by: manual
+    git: 2026-09-07
+    reads: {parquet: [SCALP_DATA_DIR]}
+    writes: {stdout: true}
+
+  - path: scalp/profile_quiet.py
+    group: scalp_diagnostic
+    purpose: "Where does quiet_session's time go, and on which symbols?"
+    kind: entry
+    flags: ["--date", "--symbols", "--top", "--bottom", "--all", "--with-compute", "--workers", "--csv"]
+    invoked_by: manual
+    git: 2026-09-07
+    reads: {parquet: [SCALP_DATA_DIR]}
+    writes: {stdout: true, files: ["--csv"]}
+
+  - path: scalp/step0/_common.py
+    group: scalp_step0
+    purpose: "Shared helpers for the step 0 discovery scripts."
+    kind: lib
+    git: 2026-08-31
+
+  - {path: scalp/step0/s0_availability.py,    group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "GATE - is /v3/stock/history/trade_quote on the Standard plan?",        flags: ["--symbol","--date","--verbose"],                                                        reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s1_venue_check.py,     group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "does it need venue=utp_cta?",                                          flags: ["--symbol","--date","--expected","--tolerance","--skip-control","--verbose"],            reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s2_one_day.py,         group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "one symbol, one day of trade_quote - shape, time and size",            flags: ["--symbol","--date","--verbose"],                                                        reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s3_multiday_timing.py, group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "how long does a 544-symbol backfill actually take?",                   flags: ["--symbol","--end-date","--days","--compare-serial","--universe-size","--verbose"],      reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s4_conditions.py,      group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "which trade condition codes are present, and which to exclude?",       flags: ["--symbols","--date","--verbose"],                                                       reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s5_quote_emission.py,  group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "are quote records emitted on every update, or only on change?",        flags: ["--symbol","--date","--start-time","--end-time","--interval","--verbose"],               reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s6_session_bounds.py,  group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "where are the missing 19% of shares?",                                 flags: ["--symbol","--date","--expected","--verbose"],                                           reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+  - {path: scalp/step0/s7_quote_sizing.py,    group: scalp_step0, kind: entry, git: 2026-08-31, purpose: "how big is a full-day quote-tick pull, and what does 1s cost?",        flags: ["--symbols","--date","--compare-symbol","--universe-size","--days","--verbose"],         reads: {apis: [thetadata]}, writes: {stdout: true}, invoked_by: manual_one_time}
+
+  - {path: scalp/tests/check_references.py,       group: scalp_tests, kind: entry,  git: 2026-08-31, purpose: "Resolve every cross-module attribute reference in scalp/ without importing."}
+  - {path: scalp/tests/smoke.py,                  group: scalp_tests, kind: entry,  git: 2026-09-07, purpose: "Execute every entry point and the whole metric path. No socket, no database."}
+  - {path: scalp/tests/test_quiet.py,             group: scalp_tests, kind: pytest, git: 2026-09-07, purpose: "Hand-checked tests for scalp/quiet.py and the metric cut."}
+  - {path: scalp/tests/test_schema_sync.py,       group: scalp_tests, kind: pytest, git: 2026-09-07, purpose: "The intraday column set must reach the table, and a failing run must stop."}
+  - {path: scalp/tests/test_timestamp_collapse.py, group: scalp_tests, kind: entry, git: 2026-09-07, purpose: "Same-timestamp collapsing must happen BEFORE duration weighting."}
+  - {path: scalp/tests/test_universe_filters.py,  group: scalp_tests, kind: pytest, git: 2026-09-06, purpose: "Universe filter tests - the price band and the spread floor."}
+  - {path: scalp/tests/test_worker_reaping.py,    group: scalp_tests, kind: entry,  git: 2026-09-01, purpose: "Do pool workers die when the parent is killed with -9?"}
+
+scalp_docs:
+  - {path: scalp/README.md,  size: 24KB, git: 2026-08-31}
+  - {path: scalp/METRICS.md, size: 36KB, git: 2026-09-08, note: what metric_docs.py maps column names into}
+
+cowork:
+  path: Cowork/metrics_panel
+  contains_scripts: false
+  file_count: 9
+  file_types: [parquet]
+  layout: hive_partitioned
+  partition_key: year
+  partition_range: [2018, 2026]
+  single_write_job: true
+  single_write_job_evidence: all nine files share the UUID prefix 43fdd9b81f714ac3bfd944a40fe116c5
+  rows_total: 220232
+  rows_by_year: {2018: 47, 2019: 26712, 2020: 27647, 2021: 29430, 2022: 30804, 2023: 30976, 2024: 31272, 2025: 31245, 2026: 12099}
+  columns: 158
+  size_mb: 297
+  first_columns: [ticker, trade_date, total_oi, call_oi, put_oi, put_call_oi_ratio, max_oi_strike_call, max_oi_strike_put, pct_oi_in_front_expiry, d1_total_oi_change, d5_total_oi_change, d20_total_oi_change, rv_5d, rv_20d, ret_1d_fwd_oc]
+  identification: one-shot export of open_interest.daily_features partitioned by year
+  identification_basis: column names match daily_features exactly; same 2018-2026 span; 220232 rows vs the table's 200677 live rows
+  written_by: []
+  read_by: []
+  grep_result: zero hits for "Cowork" or "metrics_panel" across all source
+  git_tracked: false
+  section3_candidate: true
+  section3_reason: ~297 MB of untracked, unreferenced duplicate of a live Postgres table in the repo root
+
+# ============================================================================
+# SECTION 3 - ORPHANS AND CONFLICTS
+# Candidates for review only. Nothing acted on.
+# ============================================================================
+
+section3:
+  status: candidates_for_review_only
+  acted_on: false
+
+  excluded_by_rule:
+    - rule: scalp duplication is deliberate
+      evidence: "scalp/thetadata.py:2 SELF-CONTAINED BY DESIGN - DO NOT REFACTOR INTO A SHARED MODULE; scalp/config.py and scalp/db.py carry equivalent notes"
+      not_filed: [scalp/config.py, scalp/db.py, scalp/thetadata.py]
+    - rule: absence from cron is not abandonment
+      not_filed: all manual-by-design scripts, listed below with their intent evidence
+
+  no_caller:
+
+    manual_by_design:
+      - {scripts: [scalp/prune.py], evidence: "docstring: RUN BY HAND. Dry-run by default."}
+      - {scripts: [check.py], evidence: "pre-push gates. Run this before every push."}
+      - {scripts: [init_db.py], evidence: "One-time schema + view initialisation"}
+      - {scripts: [migrate_chain_snapshots_to_monthly.py], evidence: "one-time layout change"}
+      - {scripts: [backfill_call_price.py, backfill_days_to_earnings.py, backfill_source_session.py], evidence: "each states its one-time population; backfill_source_session.py explicitly One-time UPDATE"}
+      - {scripts: [deadlock_proof.py, lockproof.py], evidence: "Reproduce ... and prove the fix"}
+      - {scripts: [scalp/step0/s0_availability.py, scalp/step0/s1_venue_check.py, scalp/step0/s2_one_day.py, scalp/step0/s3_multiday_timing.py, scalp/step0/s4_conditions.py, scalp/step0/s5_quote_emission.py, scalp/step0/s6_session_bounds.py, scalp/step0/s7_quote_sizing.py], evidence: "numbered Step 0.N discovery questions; whole directory dated 2026-08-31"}
+      - {scripts: [audit_chain_snapshots.py, audit_equity_1min.py, audit_symbol_gaps.py, audit_trade_paths.py, probe_session_gap.py, probe_snapshot_first_order.py, verify_csv_path.py, verify_surface_fixes.py, bench_greeks_endpoints.py, snapshot_null_audit.py, rv_vrp_noise_report.py, zscore_migration_check.py, iv25d_quality_report.py, phase1_iv25d_sample.py], evidence: "each opens Read-only / READ-ONLY / Read-only diagnostic"}
+      - {scripts: [fetch_chain_snapshots.py, fetch_chain_intraday.py, fetch_equity_1min.py, build_equity_surface.py, build_trade_paths.py], evidence: manual pipeline stages with full CLI surfaces}
+      - {scripts: [scalp/update_universe.py, scalp/fetch.py, scalp/compute.py, scalp/audit_venue.py, scalp/profile_compute.py, scalp/profile_quiet.py, scalp/quality.py], evidence: "no cron reaches scalp/ at all; invoked as python -m scalp.<module>"}
+
+    appears_abandoned:
+      - target: fetch_iv_chain.py
+        evidence: "fetch_chain_eod.py:4 - Replaces both fetch_volume_eod.py and fetch_iv_chain.py"
+        caller: none
+        git: 2026-05-27
+        note: still present and runnable; writes open_interest.option_iv_daily which nothing in the repo reads
+      - target: fetch_volume_eod.py
+        evidence: "same sentence at fetch_chain_eod.py:4"
+        caller: none
+        git: 2026-05-27
+        note: writes open_interest.option_volume_daily which nothing in the repo reads
+      - target: migrations/export_raw_to_parquet.py
+        evidence: "migrations/README.md:13 - Complete. Table dropped 2026-09-01"
+        caller: none
+        note: CANNOT RUN - source table open_interest.option_oi_raw no longer exists. Non-functional, not merely uncalled
+      - target: "scalp/db.py:787 write_ranking()"
+        kind: function_not_script
+        caller: none
+        note: the only writer of equities_scalp.rankings
+
+    ambiguous:
+      - target: backtest_spreads.py
+        git: 2026-05-19
+        note: oldest file in the project; docstring describes an ongoing capability, not a one-time job, so it fails the manual-by-design test - but nothing calls it and its output table has no in-repo reader
+        uncertain: true
+        uncertain_reason: the code does not say whether this is a live tool or a finished experiment
+      - target: validate_bins.py
+        note: manual by design, but its coverage no longer matches the tables that exist - see name_vs_behaviour item 4
+
+  written_never_read:
+
+    external_consumer_likely:
+      - {store: open_interest.is_bins, written_by: "build_bin_tables.py --tier, 3x per weekday", in_repo_readers: 0}
+      - {store: open_interest.equity_metrics_catalog, written_by: "lib/metrics_store.py:146", in_repo_readers: 0, consumer_named_at: "lib/metrics_config.py:9 - the dashboard's metric picker"}
+      - {store: open_interest.tt_bins, written_by: "build_bin_tables.py --build-tt-bins (never invoked)", in_repo_readers: 1, reader: build_trade_paths.py, consumer_named_at: "build_bin_tables.py:571"}
+      - {store: equities_scalp.intraday_monthly, written_by: "scalp/compute.py:516", in_repo_readers: 0, note: "built by reading intraday_metrics at scalp/db.py:554; never selected from anywhere"}
+
+    checked_and_have_readers:
+      note: listed only to record that they were verified, not flagged
+      stores:
+        - {store: equities_scalp.daily_metrics, readers: ["scalp/db.py:862, 871, 882"]}
+        - {store: equities_scalp.provenance, readers: ["scalp/db.py:459"]}
+        - {store: equities_scalp.fetch_runs, readers: ["scalp/db.py:588"]}
+        - {store: equities_scalp.universe, readers: ["scalp/db.py:803, 820, 826, 835, 841", "scalp/update_universe.py:156"]}
+        - {store: equities_scalp.intraday_metrics, readers: ["scalp/db.py:554"]}
+
+    no_establishable_reader:
+      - {store: open_interest.option_iv_daily, rows: 215060, written_by: "fetch_iv_chain.py (orphaned)"}
+      - {store: open_interest.option_volume_daily, rows: 215582, written_by: "fetch_volume_eod.py (orphaned)"}
+      - {store: open_interest.backtest_call_spread, rows: 1971, written_by: "backtest_spreads.py (uncalled)"}
+
+    dead_both_directions:
+      - {store: equities_scalp.rankings, note: "no writer (its only writer function has no caller) and no reader - the one table in either database with nothing on either side"}
+      - {store: CHAIN_INTRADAY_DIR, path: /mnt/trading_volume_3/chain_intraday, note: configured in .env, directory does not exist, no scheduled writer or reader}
+      - {store: Cowork/metrics_panel, size_mb: 297, rows: 220232, note: zero grep hits for Cowork or metrics_panel in any source; untracked in git}
+      - {store: /data/spx_options, size_mb: 395, note: referenced by no script in this repo; third location of a store whose two real halves are on volume1 and trading_volume_2}
+
+    read_here_produced_elsewhere:
+      - {store: equities_scalp.fills, readers: ["analysis/dump_fills.sql -> fills_dump.csv -> analysis/episode_*.py"], producer: "dashboard app/routers/equities_scalp.py per analysis/dump_fills.sql:6"}
+
+    neither_read_nor_written:
+      count: 19
+      see: external_writer_list_rederived.no_writer_in_repo
+      owners: not_listed_per_user_rule
+
+    scheduled_write_manual_read_only:
+      - store: CHAIN_LIVE_DIR
+        written_by: "fetch_live_surface.py under cron, every 5 min RTH"
+        note: the only parquet store on a schedule; sole in-repo reader is verify_surface_fixes.py, a manual diagnostic
+        intent: "fetch_live_surface.py:8-9 says it is an archive, not for the dashboard"
+
+  multiple_writers:
+
+    by_design_documented:
+      - table: open_interest.daily_features
+        writers: ["build_features.py via run_pipeline.py --tier EVENING", "via run_pipeline.py --tier MORNING", "via run_pipeline_early.py"]
+        contract: "CLAUDE.md and run_pipeline.py:23-28 - disjoint column sets, no DELETE before upsert"
+      - table: [open_interest.wf_bins, open_interest.is_bins]
+        writers: ["build_bin_tables.py MORNING tier", "build_bin_tables.py EVENING tier"]
+        contract: "build_bin_tables.py:8-13 - same disjoint-column contract, DO NOT add a DELETE"
+      - table: open_interest.underlying_ohlc
+        writers: ["fetch_ohlc.py (full row)", "fetch_ohlc_premarket.py (open column only)"]
+        contract: "fetch_ohlc_premarket.py:29 explains the overwrite ordering"
+
+    no_stated_contract:
+      - table: open_interest.equity_surface
+        writers: ["fetch_live_surface.py (cron, every 5 min)", "build_equity_surface.py (manual)", "backfill_call_price.py (UPDATE call_price)"]
+        concern: three writers on one UNIQUE key; writers 1 and 2 can target the same partitions, one live and one hand-run, with nothing documenting precedence
+      - table: open_interest.equity_atm
+        writers: [fetch_live_surface.py, build_equity_surface.py]
+      - table: open_interest.equity_surface_diagnostics
+        writers: [fetch_live_surface.py, build_equity_surface.py]
+      - table: open_interest.equity_metrics
+        writers: ["build_equity_metrics.py (cron)", "backfill_days_to_earnings.py (UPDATE)"]
+        concern: column-scoped backfill against a live table
+      - table: equities_scalp.intraday_metrics
+        writers: ["scalp/compute.py (INSERT)", "migrations/rebuild_intraday_metrics.sql (TRUNCATE)", "scalp/prune.py --intraday --delete (DROP TABLE on partitions)"]
+        concern: three different mutators, two of them destructive, in two different directories
+      - table: open_interest.metric_classification
+        writers: ["sql/06_25d_skew_metrics.sql:47 INSERT", "whatever external codebase created it"]
+        see: section3.metric_classification
+
+  name_vs_behaviour:
+    - {n: 1,  where: "build_bin_tables.py:2",              says: "Build / refresh wf_bins and tt_thresholds", does: "also builds is_bins (:266) and tt_bins (:377)"}
+    - {n: 2,  where: "build_bin_tables.py flags",          says: "--build-tt / --build-tt-bins",              does: "nearly identical names for different tables; --build-tt writes the legacy tt_thresholds, --build-tt-bins writes the tt_bins the dashboard reads; cron passes only the first"}
+    - {n: 3,  where: "build_bin_tables.py --tier",         says: "pick a tier",                               does: "writes two tables per invocation, wf_bins and is_bins; neither flag name nor help text says so"}
+    - {n: 4,  where: "validate_bins.py:2",                 says: "8-check validation suite for wf_bins and tt_thresholds", does: "accurate to its name, but is_bins and tt_bins now exist and are validated by nothing"}
+    - {n: 5,  where: "diagnose_transform.py:4",            says: "Read-only diagnostic",                      does: "writes probe parquet to CHAIN_INTRADAY_DIR/_diag/ (:263-267) and to system temp"}
+    - {n: 6,  where: "fetch_oi.py / fetch_oi_snapshot.py", says: "two names suggest two destinations",        does: "both write the same OI_RAW_DIR store with the same dedupe key; documented only at run_pipeline.py:204-207"}
+    - {n: 7,  where: "scalp/update_universe.py:1",         says: "Nightly candidate list.",                   does: "nothing runs nightly - scalp/ has no cron entry"}
+    - {n: 8,  where: "migrations/rebuild_intraday_metrics.sql", says: "sits in the root migrations/ beside open_interest migrations", does: "targets equities_scalp.intraday_metrics - only file there pointing at the other database"}
+    - {n: 9,  where: "Cowork/metrics_panel",               says: "name suggests a dashboard panel asset",     does: "is a year-partitioned export of open_interest.daily_features"}
+    - {n: 10, where: "fetch_chain_eod.py:4",               says: "Replaces both fetch_volume_eod.py and fetch_iv_chain.py", does: "both replaced scripts are still present, runnable, and able to write their tables"}
+    - {n: 11, where: "daily_features_data_dictionary.md",  says: "CLAUDE.md:8 points at the docs/ copy",       does: "two copies exist - docs/ (40543 bytes, 2026-06-08) and repo root (40543 bytes, 2026-05-30, untracked); same size, different mtimes", uncertain: true, uncertain_reason: not diffed}
+
+  dead_code_paths:
+    - {n: 1, what: [fetch_iv_chain.py, fetch_volume_eod.py], superseded_by: fetch_chain_eod.py, still_present_as: both files runnable with live target tables}
+    - {n: 2, what: [CHAIN_INTRADAY_DIR, fetch_chain_intraday.py, "build_equity_surface.py --source intraday"], superseded_by: "CHAIN_LIVE_DIR / fetch_live_surface.py per vps_state/README.md:50-52", still_present_as: env var set, code intact, directory absent}
+    - {n: 3, what: open_interest.tt_thresholds, superseded_by: "open_interest.tt_bins per build_bin_tables.py:571-572", still_present_as: "the legacy table is the one cron refreshes nightly; the current one has not been built since 2026-08-14"}
+    - {n: 4, what: "legacy {YYYY}.parquet chain_snapshots layout", superseded_by: "{YYYYMM}.parquet via migrate_chain_snapshots_to_monthly.py", still_present_as: "build_equity_surface.py:381 still calls list_legacy_year_files"}
+    - {n: 5, what: open_interest.option_oi_raw, superseded_by: OI_RAW_DIR parquet, still_present_as: "table dropped; migrations/export_raw_to_parquet.py still references it and cannot run"}
+    - {n: 6, what: open_interest.option_oi_surface, superseded_by: dropped outright, still_present_as: "migrations/README.md:66 still shows an INSERT INTO example"}
+    - {n: 7, what: ["scalp/db.py:787 write_ranking()", equities_scalp.rankings], superseded_by: "nothing - never wired up", still_present_as: function and table both exist, both unused}
+    - {n: 8, what: build_features.py working tree, superseded_by: null, still_present_as: "1755 lines replaced by the character q, uncommitted; HEAD intact"}
+
+  metric_classification:
+    table: open_interest.metric_classification
+    rows: 172
+    why_its_own_entry: the only two-way dependency where an externally-owned table controls this repo's schema
+    direction_1_table_controls_repo:
+      mechanism: "lib/bin_schema.py:44,51 reads SELECT metric, tier FROM metric_classification WHERE eligible_as_metric = TRUE"
+      effect: that result set determines at runtime which frac_<m>/bin20_<m> column pairs sync_wf_bins_schema, sync_is_bins_schema and sync_tt_bins_schema create
+      downstream: which columns build_bin_tables.py writes into open_interest.wf_bins, .is_bins and .tt_bins on every cron run
+      stated_at: "sql/05_bin_tables.sql:7 - the bin tables' column set is driven by metric_classification (eligible_as_metric = TRUE)"
+    direction_2_repo_mutates_table:
+      mechanism: "sql/06_25d_skew_metrics.sql:47 INSERT INTO metric_classification"
+      detail: "sql/06_25d_skew_metrics.sql:5,10 - flips metric_classification.eligible_as_metric via a conditional INSERT + UPDATE"
+      applied_by: init_db.py
+    what_is_missing:
+      no_create_table_in_repo: true
+      detail: sql/ creates 20 tables and this is not one of them; the DDL comes from outside
+    why_review:
+      summary: a table this repo does not own, cannot recreate, and whose other writers it cannot see decides the column set of three tables that three cron runs a weekday write into
+      failure_mode: a row appearing externally, or eligible_as_metric flipping externally, changes what the pipeline produces with no signal in this repo
+      partial_mitigation: "lib/bin_schema.py:159,208,263 logs 'Skipped N metric(s) listed in metric_classification but absent [from daily_features]' - drift in that direction is noticed; the reverse is not"
+
+  structural_inconsistencies:
+    - what: open_interest.equity_surface_diagnostics is not partitioned
+      detail: its siblings written by the same lib/surface_store.write_snapshot call (equity_surface, equity_atm) are PARTITION BY RANGE (trade_date) monthly; this one is a single 3979247-row / 937 MB table
+      evidence: "lib/surface_store.py:97-98 calls ensure_equity_surface_partition and ensure_equity_atm_partition; there is no diagnostics equivalent"
+    - what: daily_features upsert churn
+      detail: 1204779 inserts ever against 200677 live rows, 6x turnover
+      note: expected from the three-cron upsert design; recorded so it is not mistaken for a defect later
+    - what: docs/vps_state/ staged as empty blobs
+      detail: all nine files are in git's index at blob e69de29 (empty), with content present only in the working tree
+      consequence: a git commit now would commit nine empty files
