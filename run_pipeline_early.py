@@ -18,7 +18,10 @@ Steps (in order):
                              endpoint lags ~1 day.
     5. build_features MORNING — only MORNING_COLS; uses the premarket open
                              as the spot price anchor.
-    6. build_bin_tables MORNING — per-ticker MORNING-tier bin assignments.
+    6. build_bin_tables MORNING — per-ticker MORNING-tier bin assignments
+                             (wf_bins + is_bins), plus an incremental tt_bins
+                             rebuild so the train-test bins the dashboard reads
+                             are current for today BEFORE the open.
 
 Deliberately omitted vs. the 9:35 MORNING run (run_pipeline.py --tier MORNING):
     - fetch_ohlc (regular daily bar) — regular-session open not yet printed.
@@ -100,16 +103,38 @@ def _discover_tickers(conn) -> tuple[set, set, set]:
 # ---------------------------------------------------------------------------
 
 def _run_bin_build() -> int:
-    """Subprocess to build_bin_tables.py --tier MORNING.
+    """Subprocess to build_bin_tables.py --tier MORNING
+    --build-tt-bins-incremental.
 
     Returns the subprocess return code.  Non-zero is logged but does NOT
     roll back daily_features — those writes are already committed via the
     connection block above.  The pipeline's cron exit status reflects the
     bin-build outcome so cron mail surfaces the failure; the next run
     re-fires the build (which is idempotent), so the table self-heals.
+
+    Why tt_bins is built here, and why incrementally
+    ------------------------------------------------
+    tt_bins is what the dashboard reads, and a pre-open decision needs it
+    current for today.  The 9:35 MORNING run is five minutes too late for
+    that; the EVENING run is too early, because today's row exists then with
+    its MORNING columns still NULL and would bin to the (NULL, 0) sentinel.
+    This run is the last point in the sequence that is still pre-open.
+
+    Incremental rather than --build-tt-bins because the full rebuild rewrites
+    all ~228k rows (~9 minutes) to add one day, which does not fit in this
+    run's budget.  The train-test ruler is frozen at the cutoff, so the rows
+    outside the window would only be rewritten to the values they already
+    hold — see _build_tt_bins_incremental.
+
+    The values written here are proxy-based, and deliberately not final: the
+    9:35 MORNING run overwrites `open` with the official print, rebuilds
+    MORNING_COLS, and re-runs this same incremental tt build over the same
+    default window.  Today's tt rows are therefore upgraded from the premarket
+    proxy to the authoritative open within the same trading day.
     """
     script_path = Path(__file__).resolve().parent / "build_bin_tables.py"
-    cmd = [sys.executable, str(script_path), "--tier", "MORNING"]
+    cmd = [sys.executable, str(script_path), "--tier", "MORNING",
+           "--build-tt-bins-incremental"]
     log.info("--- bin build: %s ---", " ".join(str(c) for c in cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:

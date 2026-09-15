@@ -18,7 +18,7 @@ daily_features (and that tier's bin assignments).
         2. fetch_oi    (history) (rolling 10d refresh)
         3. fetch_oi_snapshot     (today's just-published OI chain)
         4. build_features --tier MORNING  (only MORNING_UPSERT_SQL fires)
-        5. build_bin_tables --tier MORNING
+        5. build_bin_tables --tier MORNING --build-tt-bins-incremental
 
 Two-cron write contract (see build_features.py:1325-...):
     The two tiers' upserts touch DISJOINT columns of the same
@@ -223,8 +223,21 @@ def run_morning(conn, today: date) -> None:
 # ---------------------------------------------------------------------------
 
 def _run_bin_build(tier: str) -> int:
-    """Subprocess to build_bin_tables.py for this tier. EVENING also rebuilds
-    tt_thresholds (--build-tt).
+    """Subprocess to build_bin_tables.py for this tier.
+
+    EVENING also rebuilds tt_thresholds (--build-tt).  MORNING also rebuilds
+    tt_bins incrementally (--build-tt-bins-incremental), so the train-test
+    bins are recomputed from the authoritative 9:30 open rather than left on
+    the premarket proxy that run_pipeline_early.py's 7am build wrote them
+    from.  Both runs use the same default window, so the 9:35 build overwrites
+    exactly the rows the 7am build wrote.
+
+    EVENING deliberately does NOT build tt_bins.  By then this evening's
+    build_features has created the row for the NEXT trading day with its
+    MORNING columns still NULL, and binning it would write the (NULL, 0)
+    sentinel for every MORNING metric — indistinguishable, to any reader, from
+    a metric that genuinely could not be ranked.  Leaving that row unbuilt
+    until 7am keeps tt_bins free of rows that are structurally incomplete.
 
     Returns the subprocess return code. Non-zero is logged but does NOT roll
     back daily_features — that's already committed via the conn-scoped block
@@ -235,6 +248,8 @@ def _run_bin_build(tier: str) -> int:
     cmd = [sys.executable, str(script_path), "--tier", tier]
     if tier == "EVENING":
         cmd.append("--build-tt")
+    else:
+        cmd.append("--build-tt-bins-incremental")
     log.info("--- bin build: %s ---", " ".join(cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:
