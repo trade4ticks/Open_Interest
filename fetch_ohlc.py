@@ -17,6 +17,7 @@ import psycopg2.extras
 import yfinance as yf
 
 from db import get_connection
+from lib.split_repairs import record_new_splits
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,6 +126,11 @@ def run(conn, ticker: str, start: date, end: date) -> int:
         return 0
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, UPSERT_SQL, rows, page_size=500)
+        # Same transaction as the upsert, deliberately. Once a split row is
+        # stored it is no longer "new" by any comparison against this table,
+        # so a detection committed separately could be lost to a crash in
+        # between and the repair would never run. See lib/split_repairs.py.
+        record_new_splits(cur, ticker, rows)
     conn.commit()
     return len(rows)
 

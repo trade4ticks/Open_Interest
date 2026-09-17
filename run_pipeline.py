@@ -8,6 +8,7 @@ daily_features (and that tier's bin assignments).
     EVENING run — after market close on T:
         python run_pipeline.py --tier EVENING
         1. fetch_ohlc            (today's finalized session: open + close)
+           1a. split repair stages 1-2, if a split is pending
         2. fetch_chain_eod       (today's EOD greeks chain → parquet)
         3. build_features --tier EVENING  (only EVENING_UPSERT_SQL fires)
         4. build_bin_tables --tier EVENING --build-tt
@@ -15,10 +16,18 @@ daily_features (and that tier's bin assignments).
     MORNING run — before / shortly after market open on T:
         python run_pipeline.py --tier MORNING
         1. fetch_ohlc            (today's morning print — for spot_co = O_T)
+           1a. split repair stages 1-2, if a split is pending
         2. fetch_oi    (history) (rolling 10d refresh)
         3. fetch_oi_snapshot     (today's just-published OI chain)
         4. build_features --tier MORNING  (only MORNING_UPSERT_SQL fires)
         5. build_bin_tables --tier MORNING --build-tt-bins-incremental
+           — or, when split repair stage 3 is pending, --build-tt-bins (full)
+           plus a second --tier EVENING pass
+
+Split repair: see lib/split_repairs.py. A split first seen by the rolling OHLC
+fetch leaves underlying_ohlc in two price bases, which every strike/spot metric
+downstream silently inherits. Stages 1-3 run here; stage 4 (trade_paths) runs
+in run_nightly_paths.py, the only writer of that table.
 
 Two-cron write contract (see build_features.py:1325-...):
     The two tiers' upserts touch DISJOINT columns of the same
@@ -51,6 +60,7 @@ import argparse
 import logging
 import subprocess
 import sys
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -60,6 +70,7 @@ from fetch_chain_eod import fetch_ticker as run_chain_fetch
 from fetch_ohlc import run as run_ohlc_fetch
 from fetch_oi import fetch_ticker as run_oi_history_fetch
 from fetch_oi_snapshot import fetch_ticker as run_oi_snapshot_fetch
+from lib import split_repairs
 from lib.market_hours import get_trading_days, last_trading_day, next_trading_day
 from lib.parquet_store import list_tickers as list_oi_tickers
 from lib.thetadata import test_connection as test_thetadata
@@ -104,6 +115,24 @@ def _discover_tickers(conn) -> tuple[set, set, set]:
 
 
 # ---------------------------------------------------------------------------
+# Split repair (lib/split_repairs.py)
+# ---------------------------------------------------------------------------
+
+def _split_repair_stages_1_2(conn, ohlc_tickers: set, feature_tickers: set) -> None:
+    """Full-history OHLC refetch, then full build_features, for any ticker with
+    a pending split.  Both no-ops when nothing is pending.
+
+    Per-ticker failures are logged and left unstamped rather than raised: one
+    ticker's repair must not take down the day's pipeline for 120 others, and
+    the next run retries it."""
+    refetched = split_repairs.refetch_ohlc(conn, ohlc_tickers)
+    rebuilt = split_repairs.rebuild_features(conn, feature_tickers)
+    if refetched or rebuilt:
+        log.warning("split repair: OHLC refetched %s; features rebuilt %s",
+                    refetched or "-", rebuilt or "-")
+
+
+# ---------------------------------------------------------------------------
 # EVENING run
 # ---------------------------------------------------------------------------
 
@@ -121,6 +150,11 @@ def run_evening(conn, today: date) -> None:
     log.info("--- OHLC fetch: %s → %s ---", ohlc_start, ohlc_end)
     for t in sorted(ohlc_tickers):
         run_ohlc_fetch(conn, t, ohlc_start, ohlc_end)
+
+    # 1a. Split repair, stages 1-2.  After the rolling fetch, because that is
+    #     what queues a newly landed split; before build_features, so the
+    #     windowed build below reads a single-basis underlying_ohlc.
+    _split_repair_stages_1_2(conn, ohlc_tickers, feature_tickers)
 
     # 2. fetch_chain_eod — today's session's full EOD greeks chain. By
     #    evening (post-17:15 ET) ThetaData has T's chain. The fetcher is
@@ -172,6 +206,9 @@ def run_morning(conn, today: date) -> None:
     for t in sorted(ohlc_tickers):
         run_ohlc_fetch(conn, t, ohlc_start, ohlc_end)
 
+    # 1a. Split repair, stages 1-2 — same placement and reason as EVENING.
+    _split_repair_stages_1_2(conn, ohlc_tickers, feature_tickers)
+
     # 2. OI history — fills/refreshes the rolling window from the ThetaData
     #    history endpoint up THROUGH YESTERDAY'S TRADING SESSION (not today).
     #
@@ -222,7 +259,7 @@ def run_morning(conn, today: date) -> None:
 # Bin build attachment
 # ---------------------------------------------------------------------------
 
-def _run_bin_build(tier: str) -> int:
+def _run_bin_build(tier: str, split_repair_tickers: list | None = None) -> int:
     """Subprocess to build_bin_tables.py for this tier.
 
     EVENING also rebuilds tt_thresholds (--build-tt).  MORNING also rebuilds
@@ -243,20 +280,43 @@ def _run_bin_build(tier: str) -> int:
     back daily_features — that's already committed via the conn-scoped block
     above. The cron's exit status reflects the bin build outcome so cron mail
     surfaces the failure; the next run re-fires the bin build (which is
-    idempotent), so the table self-heals."""
+    idempotent), so the table self-heals.
+
+    Split repair stage 3 (MORNING only; `split_repair_tickers` is non-empty):
+    the tt_bins build becomes FULL, because a repaired ticker's pre-cutoff
+    rows changed and the frozen ruler moved with them — incremental cannot see
+    that.  A second `--tier EVENING` pass follows, because the repair rebuilt
+    both tiers' daily_features columns and this run otherwise refreshes only
+    MORNING's wf_bins / is_bins.  The full tt build adds ~9 minutes to this
+    run on the day it fires.  Stamped only if both subprocesses succeed."""
     script_path = Path(__file__).resolve().parent / "build_bin_tables.py"
     cmd = [sys.executable, str(script_path), "--tier", tier]
     if tier == "EVENING":
         cmd.append("--build-tt")
+    elif split_repair_tickers:
+        cmd.append("--build-tt-bins")
     else:
         cmd.append("--build-tt-bins-incremental")
     log.info("--- bin build: %s ---", " ".join(cmd))
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
         log.error("bin build exited with code %d "
-                  "(daily_features data preserved; re-run will recover)",
-                  result.returncode)
-    return result.returncode
+                  "(daily_features data preserved; re-run will recover)", rc)
+
+    if tier != "MORNING" or not split_repair_tickers:
+        return rc
+
+    other = [sys.executable, str(script_path), "--tier", "EVENING"]
+    log.warning("--- split repair 3/4 (%s): %s ---",
+                ",".join(split_repair_tickers), " ".join(other))
+    rc_other = subprocess.run(other).returncode
+    if rc == 0 and rc_other == 0:
+        with closing(get_connection()) as conn:
+            split_repairs.mark_done(conn, split_repair_tickers, "bins_rebuilt_at")
+    else:
+        log.error("split repair 3/4 NOT marked (rc=%d, EVENING pass rc=%d); "
+                  "retried next MORNING run", rc, rc_other)
+    return rc or rc_other
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +344,14 @@ def main() -> int:
             run_evening(conn, today)
         else:
             run_morning(conn, today)
+        # Read after the tier's own work, so a split queued and taken through
+        # stages 1-2 in THIS run is binned in this run too.
+        bin_repairs = (split_repairs.pending(conn, "bins_rebuilt_at")
+                       if args.tier == "MORNING" else [])
 
     # Conn closed; daily_features writes are committed. Safe to invoke the
     # bin build as a subprocess (it opens its own connection).
-    rc = _run_bin_build(args.tier)
+    rc = _run_bin_build(args.tier, bin_repairs)
     log.info("Pipeline complete (tier = %s, bin_build_rc = %d)", args.tier, rc)
     return rc
 
