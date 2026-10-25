@@ -130,6 +130,14 @@ bucket over its full history window. Together they grow roughly 1.8 GB/month
 
 ## Known open issues
 
+- **Postgres container `/dev/shm` is the Docker default 64 MB** (host has
+  7.9 GB). Any parallel maintenance on a large table fails with "could not
+  resize shared memory segment" — seen 2026-10-25 on a parallel VACUUM of the
+  2 GB `equity_surface_diagnostics`. `lib/surface_retention.vacuum` sets
+  `max_parallel_maintenance_workers = 0` so the nightly purge does not depend
+  on it; anything else running VACUUM or CREATE INDEX by hand should do the
+  same until the container's `shm_size` is raised.
+
 - **Pre-cutoff backfill obligation.** `--build-tt-bins-incremental` cannot
   detect edits to `daily_features` rows before 2024-01-01 — there is no
   timestamp column to detect them from. Such an edit moves the train-test

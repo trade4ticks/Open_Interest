@@ -208,6 +208,29 @@ if conn is not None:
             ("2026-08-24", "0945", 5), ("2026-08-24", "1545", 5),
             ("2026-09-30", "0945", 5), ("2026-09-30", "1015", 5),
             ("2026-09-30", "1300", 5), ("2026-09-30", "1545", 5)])
+
+        # The first --delete run crashed here: VACUUM went out on the caller's
+        # connection, inside `with conn:` — a transaction block under psycopg2
+        # 2.9 even with autocommit on. Reproduce that state exactly.
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT count(*) FROM {DIAG}")
+            try:
+                R.vacuum(DIAG)
+                vac = "ok"
+            except Exception as exc:                          # noqa: BLE001
+                vac = f"{type(exc).__name__}: {exc}"
+        check("VACUUM runs while the caller is mid-transaction", vac, "ok")
+
+        mc = R.maintenance_connection()
+        try:
+            with mc.cursor() as cur:
+                cur.execute("SHOW max_parallel_maintenance_workers")
+                got = (mc.autocommit, cur.fetchone()[0])
+        finally:
+            mc.close()
+        check("maintenance connection: autocommit, no parallel workers "
+              "(64 MB /dev/shm)", got, (True, "0"))
     except Exception as exc:                                  # noqa: BLE001
         FAIL.append(f"database tests raised {type(exc).__name__}")
         print(f"  [FAIL] database tests raised {type(exc).__name__}: {exc}")

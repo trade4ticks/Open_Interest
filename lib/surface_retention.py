@@ -310,12 +310,36 @@ def _log(cur, partition, start, end, method, rows_before, rows_after,
          bytes_before, bytes_after))
 
 
-def vacuum(conn, table: str, full: bool = False) -> None:
-    """VACUUM cannot run inside a transaction block."""
-    prev = conn.autocommit
+def maintenance_connection():
+    """A fresh autocommit connection for VACUUM, never the caller's.
+
+    VACUUM cannot run inside a transaction block, and the caller's connection
+    cannot be switched out of one: prune_equity_surface.main holds it in
+    `with get_connection() as conn`, and since psycopg2 2.9 that block is a
+    transaction even with autocommit on. Flipping autocommit on the caller's
+    connection is what failed in the first --delete run, and its finally-clause
+    restore then failed too, masking the original error. A separate
+    connection, autocommit before its first statement and never entered with
+    `with`, cannot inherit a transaction.
+
+    max_parallel_maintenance_workers = 0: Postgres runs in Docker with the
+    default 64 MB /dev/shm, and a parallel index vacuum on the 2 GB
+    diagnostics table failed with "could not resize shared memory segment".
+    Serial is slower but needs no shared memory, so the nightly run does not
+    depend on the container's shm_size.
+    """
+    from db import get_connection
+    conn = get_connection()
     conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("SET max_parallel_maintenance_workers = 0")
+    return conn
+
+
+def vacuum(table: str, full: bool = False) -> None:
+    conn = maintenance_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(f"VACUUM ({'FULL, ' if full else ''}ANALYZE) {table}")
     finally:
-        conn.autocommit = prev
+        conn.close()

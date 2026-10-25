@@ -93,8 +93,13 @@ def vacuum_full_diagnostics(conn, apply: bool) -> int:
         print(f"\nRefusing: {now:%a %H:%M} ET is inside 09:00-16:30 on a "
               f"weekday, and this would stall run_live_pipeline.py.")
         return 2
+    # End this connection's transaction first. relation_bytes above took an
+    # ACCESS SHARE lock on the table, held until commit, and VACUUM FULL —
+    # on its own connection — needs ACCESS EXCLUSIVE. Left open, the two
+    # wait on each other forever; Postgres sees no deadlock across sessions.
+    conn.commit()
     t0 = time.monotonic()
-    R.vacuum(conn, R.DIAG_TABLE, full=True)
+    R.vacuum(R.DIAG_TABLE, full=True)
     after = R.relation_bytes(conn, R.DIAG_TABLE)
     print(f"\nrewritten in {time.monotonic() - t0:.0f}s: {_gb(size)} -> "
           f"{_gb(after)}")
@@ -229,8 +234,9 @@ def main() -> int:
         if deleted:
             print()
             print("[3] VACUUM (ANALYZE) diagnostics")
+            conn.commit()          # hold no locks while VACUUM runs elsewhere
             t0 = time.monotonic()
-            R.vacuum(conn, R.DIAG_TABLE)
+            R.vacuum(R.DIAG_TABLE)
             print(f"    done in {time.monotonic() - t0:.0f}s")
 
         print()
