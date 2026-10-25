@@ -100,12 +100,26 @@ def build_range(conn, days: list, tickers: list | None = None,
                 snapshots: list | None = None, rebuild: bool = False,
                 with_z: bool = True) -> dict:
     """Batch backfill. Base rows for the whole range first, then z-scores."""
+    from lib.surface_retention import is_purged, slimmed_ranges
+
     cache = HistoryCache(conn)
-    stats = {"days": 0, "metrics": 0, "z": 0, "skipped": 0, "errors": 0}
+    stats = {"days": 0, "metrics": 0, "z": 0, "skipped": 0, "errors": 0,
+             "purged": 0}
     series = defaultdict(list)          # (ticker, snapshot) -> [trade_date]
+    # RETENTION GUARD. In a month prune_equity_surface.py has slimmed, only the
+    # retained slices still have a surface, but equity_atm still has every
+    # bucket — so compute_metrics returns an ATM-only row with every skew and
+    # delta-node column NULL, and the upsert writes it over the good row.
+    # Diagnostics are pruned first, so _targets should never offer such a
+    # pair; this is the backstop for a prune that died between its two steps.
+    purged = slimmed_ranges(conn)
 
     for day in days:
         pairs = _targets(conn, day, tickers, snapshots, rebuild)
+        if purged:
+            keep = [p for p in pairs if not is_purged(day, p[1], purged)]
+            stats["purged"] += len(pairs) - len(keep)
+            pairs = keep
         if not pairs:
             log.info("%s  nothing to do", day)
             continue
@@ -138,6 +152,12 @@ def build_range(conn, days: list, tickers: list | None = None,
             stats["z"] += write_zscores(conn,
                                         zscore_rows(conn, ticker, snap, dates))
         log.info("  %d z row(s)  %.1fs", stats["z"], time.monotonic() - t0)
+    if stats["purged"]:
+        log.warning("RETENTION GUARD: skipped %d (ticker, snapshot) target(s) "
+                    "whose surface was pruned by prune_equity_surface.py. "
+                    "Their existing equity_metrics rows were left untouched; "
+                    "recomputing them would write NULL skew over good values.",
+                    stats["purged"])
     return stats
 
 
@@ -237,8 +257,9 @@ def main() -> int:
         stats = build_range(conn, days, tickers, snaps, args.rebuild,
                             with_z=not args.no_z)
         log.info("done  %d metric row(s), %d z row(s), %d skipped, "
-                 "%d error(s)  %.1fs", stats["metrics"], stats["z"],
-                 stats["skipped"], stats["errors"], time.monotonic() - t0)
+                 "%d purged-surface skip(s), %d error(s)  %.1fs",
+                 stats["metrics"], stats["z"], stats["skipped"],
+                 stats["purged"], stats["errors"], time.monotonic() - t0)
         return 1 if stats["errors"] else 0
 
 

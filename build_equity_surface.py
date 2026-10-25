@@ -411,6 +411,23 @@ def main() -> int:
             print("No trading days to process.")
             return 0
 
+        # An intraday-source fit into a month prune_equity_surface.py has
+        # slimmed would put back the very rows retention removed — and since
+        # diagnostics no longer list those snapshots, nothing would stop it.
+        # The snapshots store only holds the retained 0945/1545 slices, so it
+        # is allowed through.
+        if args.source == SOURCE_INTRADAY:
+            from lib.surface_retention import slimmed_ranges
+            ranges = slimmed_ranges(conn)
+            hit = [d for d in days if any(s <= d < e for s, e in ranges)]
+            if hit:
+                raise SystemExit(
+                    f"{len(hit)} day(s) fall in month(s) slimmed by "
+                    f"prune_equity_surface.py ({hit[0]} .. {hit[-1]}). "
+                    f"Refusing --source intraday there: it would restore "
+                    f"intraday rows retention removed. See "
+                    f"equity_retention_log.")
+
         print(f"{len(tickers)} ticker(s) x {len(days)} day(s), "
               f"source={args.source}")
         print(f"{days[0]} .. {days[-1]}\n")

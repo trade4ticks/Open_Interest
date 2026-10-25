@@ -426,8 +426,9 @@ scripts:
     reads:
       parquet: [CHAIN_SNAPSHOTS_DIR, CHAIN_INTRADAY_DIR]
       parquet_note: CHAIN_SNAPSHOTS_DIR is the default; CHAIN_INTRADAY_DIR only with --source intraday
-      tables: [open_interest.equity_surface_diagnostics]
+      tables: [open_interest.equity_surface_diagnostics, open_interest.equity_retention_log]
     writes: {tables: [open_interest.equity_surface, open_interest.equity_atm, open_interest.equity_surface_diagnostics]}
+    retention_guard: "build_equity_surface.py:421 - refuses --source intraday into a month logged in equity_retention_log"
 
   - path: build_equity_metrics.py
     group: builder
@@ -437,8 +438,9 @@ scripts:
     invoked_by: [run_live_pipeline.py, cron, manual]
     invoked_detail: run_live_pipeline.py:75 imports run_for_snapshot
     git: 2026-08-25
-    reads: {tables: [open_interest.equity_surface_diagnostics, open_interest.equity_surface, open_interest.equity_atm, open_interest.underlying_ohlc, open_interest.earnings_calendar]}
+    reads: {tables: [open_interest.equity_surface_diagnostics, open_interest.equity_surface, open_interest.equity_atm, open_interest.underlying_ohlc, open_interest.earnings_calendar, open_interest.equity_retention_log]}
     writes: {tables: [open_interest.equity_metrics, open_interest.equity_metrics_z, open_interest.equity_metrics_catalog]}
+    retention_guard: "build_equity_metrics.py:115 - batch skips (date, snapshot) pairs purged by prune_equity_surface.py; logs RETENTION GUARD"
 
   - path: build_trade_paths.py
     group: builder
@@ -450,6 +452,23 @@ scripts:
     reads: {tables: [open_interest.daily_features, open_interest.tt_bins], parquet: [EQUITY_1MIN_DIR]}
     writes: {tables: [open_interest.trade_paths, open_interest.trade_paths_manifest, open_interest.trade_path_rules]}
     note: reads open_interest.tt_bins, which nothing refreshes
+
+  - path: prune_equity_surface.py
+    group: maintenance
+    purpose: "retention for equity_surface and its diagnostics. DRY-RUN BY DEFAULT"
+    kind: entry
+    flags: ["--days", "--before", "--delete", "--vacuum-full-diagnostics"]
+    invoked_by: intended_cron
+    invoked_detail: "03:30 ET Tue-Sat per its docstring; not yet in vps_state/crontab.txt"
+    git: 2026-10-25
+    destructive: true
+    reads: {tables: [open_interest.equity_surface_diagnostics, open_interest.equity_surface, open_interest.equity_retention_log]}
+    writes:
+      deletes_rows: "open_interest.equity_surface_diagnostics intraday rows older than today-30 (lib/surface_retention.py:204), then VACUUM (:319)"
+      rewrites_partitions: "open_interest.equity_surface monthly partitions wholly older than the cutoff, to snapshot IN ('0945','1545'), via detach/drop/rename/attach (lib/surface_retention.py:266-270)"
+      tables: [open_interest.equity_retention_log]
+      guard: dry-run unless --delete; cutoff never later than today-7; diagnostics step must succeed before the surface step runs
+    added: rev_ret
 
   - path: backfill_call_price.py
     group: backfill
@@ -810,6 +829,17 @@ scripts:
     purpose: "Canonical-type enforcement for every parquet store in this project."
     kind: lib
     git: 2026-08-26
+
+  - path: lib/surface_retention.py
+    group: lib
+    purpose: "Retention for equity_surface and equity_surface_diagnostics."
+    kind: lib
+    git: 2026-10-25
+    used_by: [prune_equity_surface.py, build_equity_metrics.py, build_equity_surface.py]
+    reads: {tables: [open_interest.equity_retention_log, open_interest.equity_surface, open_interest.equity_surface_diagnostics]}
+    writes: {tables: [open_interest.equity_surface, open_interest.equity_surface_diagnostics, open_interest.equity_retention_log]}
+    applies_sql: [sql/16_equity_retention.sql]
+    added: rev_ret
 
   - path: lib/surface_store.py
     group: lib
@@ -1284,6 +1314,8 @@ tables:
     unique: [ticker, trade_date, snapshot, dte, put_delta]
     partitioning: {by: RANGE, column: trade_date, granularity: monthly}
     rows_202609: 19101023
+    rows_note: "_202608 and _202609 slimmed by hand to snapshot IN ('0945','1545') on 2026-10-25"
+    retention: {script: prune_equity_surface.py, keeps_intraday_days: "30-61", older: "snapshot IN ('0945','1545')", mechanism: monthly partition rewrite}
 
   - name: open_interest.equity_atm
     owner: in-repo
@@ -1301,6 +1333,18 @@ tables:
     partitioning: none
     rows: 3979247
     note: not partitioned unlike its three siblings - 937 MB in a single table
+    retention: {script: prune_equity_surface.py, keeps_intraday_days: 30, mechanism: batched DELETE + VACUUM, ordering: always before the equity_surface step}
+
+  - name: open_interest.equity_retention_log
+    owner: in-repo
+    written_by: [{script: prune_equity_surface.py, helper: "lib/surface_retention.py:299"}]
+    ddl: sql/16_equity_retention.sql
+    read_by: [build_equity_metrics.py, build_equity_surface.py, lib/surface_retention.py]
+    pk: [partition_name]
+    rows: null
+    rows_note: not yet created on the VPS as of 2026-10-25
+    role: guard - builders skip or refuse work inside a logged range
+    added: rev_ret
 
   - name: open_interest.equity_metrics
     owner: in-repo
@@ -1937,12 +1981,14 @@ section3:
 
     no_stated_contract:
       - table: open_interest.equity_surface
-        writers: ["fetch_live_surface.py (cron, every 5 min)", "build_equity_surface.py (manual)", "backfill_call_price.py (UPDATE call_price)"]
+        writers: ["fetch_live_surface.py (cron, every 5 min)", "build_equity_surface.py (manual)", "backfill_call_price.py (UPDATE call_price)", "prune_equity_surface.py --delete (partition rewrite)"]
         concern: three writers on one UNIQUE key; writers 1 and 2 can target the same partitions, one live and one hand-run, with nothing documenting precedence
+        retention_contract: "prune_equity_surface.py touches only months wholly before a cutoff >=7 days back (lib/surface_retention.py docstring); build_equity_surface.py refuses --source intraday into those months"
       - table: open_interest.equity_atm
         writers: [fetch_live_surface.py, build_equity_surface.py]
       - table: open_interest.equity_surface_diagnostics
-        writers: [fetch_live_surface.py, build_equity_surface.py]
+        writers: [fetch_live_surface.py, build_equity_surface.py, "prune_equity_surface.py --delete (DELETE)"]
+        concern: destructive mutator whose ordering against the equity_surface step is load-bearing (diagnostics first)
       - table: open_interest.equity_metrics
         writers: ["build_equity_metrics.py (cron)", "backfill_days_to_earnings.py (UPDATE)"]
         concern: column-scoped backfill against a live table

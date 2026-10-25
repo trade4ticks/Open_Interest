@@ -249,3 +249,18 @@ W_FLOOR = 1e-12
 # --- Stores -----------------------------------------------------------------
 SOURCE_SNAPSHOTS = "snapshots"
 SOURCE_INTRADAY = "intraday"
+
+# --- Retention (prune_equity_surface.py) ------------------------------------
+# Full 5-minute surface is kept for this many calendar days. Older than that,
+# only RETAINED_SNAPSHOTS survive — the twice-daily slices the store held
+# before the live 5-minute capture began on 2026-08-24.
+#
+# equity_surface is pruned a WHOLE MONTHLY PARTITION at a time, once every day
+# in it is older than the cutoff, so it actually holds 30-61 days of intraday.
+# Diagnostics are pruned daily at exactly this cutoff. Diagnostics always lead,
+# which is what keeps build_equity_metrics from targeting a purged snapshot.
+SURFACE_RETENTION_DAYS = 30
+RETAINED_SNAPSHOTS = ("0945", "1545")
+# Floor on any cutoff, whatever --days / --before say. The live pipeline only
+# ever writes today, so this is a guard against a typo, not a race.
+RETENTION_MIN_DAYS = 7

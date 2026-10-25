@@ -268,6 +268,42 @@ written even when a snapshot produced no surface rows — that is precisely the
 case they exist to explain, and it is what stops an incremental run retrying a
 date forever.
 
+## Retention
+
+`prune_equity_surface.py` keeps the full 5-minute surface for 30 days
+(`SURFACE_RETENTION_DAYS`) and only the `0945`/`1545` slices
+(`RETAINED_SNAPSHOTS`) before that. Dry-run by default; `--delete` to act.
+
+| Table | Mechanism | Cadence |
+|---|---|---|
+| `equity_surface_diagnostics` | batched `DELETE` + `VACUUM (ANALYZE)` | daily, exactly 30 days |
+| `equity_surface` | rewrite a monthly partition to the kept slices (copy, then detach/drop/rename/attach) | once the whole month is past the cutoff, so 30-61 days of intraday |
+
+A `DELETE` on `equity_surface` would return no space: freed space is reusable
+only inside the same partition, and new rows always land in the current month.
+Diagnostics are not partitioned, so there it works.
+
+Diagnostics are pruned **first**. `build_equity_metrics` picks targets from
+diagnostics; a snapshot whose surface is gone but whose diagnostics remain
+would be rebuilt from `equity_atm` alone, overwriting good metrics with NULL
+skew. Every slimmed partition is recorded in `equity_retention_log`, and two
+guards read it:
+
+- `build_equity_metrics.py batch` skips purged `(date, snapshot)` pairs and
+  logs a `RETENTION GUARD` warning with the count.
+- `build_equity_surface.py --source intraday` refuses dates in a slimmed month.
+
+Out of scope: `equity_atm`, `equity_metrics`, `equity_metrics_z`. The
+dashboard's intraday `/series` reads them at every bucket over its whole
+history window.
+
+```
+30 3 * * 2-6 flock -n /tmp/equity_retention.lock /Open_Interest/.venv/bin/python /Open_Interest/prune_equity_surface.py --delete >> /Open_Interest/logs/equity_retention.log 2>&1
+```
+
+`--vacuum-full-diagnostics --delete` is a one-time shrink after the first
+purge. It blocks writes, refuses during the session, and is never cron'd.
+
 NumPy sanitisation on write is not optional: psycopg2 has no adapter for
 `numpy.float64` and falls back to `repr()`, emitting literals like
 `np.float64(2.46)` that Postgres rejects. NaN/Inf become NULL for the same
