@@ -13,10 +13,12 @@ NO NEW OI FETCH LOGIC
 ---------------------
 OI goes through fetch_oi.fetch_ticker unchanged — the same call
 run_pipeline.py makes for the 120 tickers. The only difference is the
-destination: config.OI_RAW_DIR is re-pointed at SPX_OI_RAW_DIR before
-lib.parquet_store is imported, so every write lands in
-{SPX_OI_RAW_DIR}/{root}/{year}.parquet and nothing in this process can touch
-the production OI tree. The root is the directory name, as the ticker is
+destination: _redirect_oi_store() re-points lib.parquet_store.OI_RAW_DIR (the
+global its writer reads at call time) at SPX_OI_RAW_DIR, so every write lands
+in {SPX_OI_RAW_DIR}/{root}/{year}.parquet. _assert_oi_target() re-checks the
+writer's resolved path before every OI fetch call, and
+_assert_prod_tree_clean() fails the run if SPX/ or SPXW/ ever appears under
+the production OI_RAW_DIR, before and after the fetch. The root is the directory name, as the ticker is
 there; it is materialised as a column at read time.
 
 SPX cannot simply be added to OI_RAW_DIR: that directory's listing IS the
@@ -57,16 +59,6 @@ is 1 — both roots carry OI and volume every session, so a gap is a failure.
 from __future__ import annotations
 
 # --- Destination redirect: must run before anything imports lib.parquet_store.
-import config
-
-_PROD_OI_RAW_DIR = config.OI_RAW_DIR
-for _name, _dir in (("SPX_OI_RAW_DIR", config.SPX_OI_RAW_DIR),
-                    ("SPX_VOLUME_DIR", config.SPX_VOLUME_DIR)):
-    if _dir == _PROD_OI_RAW_DIR or _PROD_OI_RAW_DIR in _dir.parents:
-        raise SystemExit(f"{_name}={_dir} is inside OI_RAW_DIR={_PROD_OI_RAW_DIR}; "
-                         "it would join the 120-ticker universe. Refusing.")
-config.OI_RAW_DIR = config.SPX_OI_RAW_DIR
-
 import argparse
 import logging
 import sys
@@ -78,6 +70,7 @@ from itertools import groupby
 import pandas as pd
 import pyarrow.parquet as pq
 
+import config
 import fetch_oi
 import fetch_oi_snapshot
 import lib.parquet_store as oi_store
@@ -96,12 +89,10 @@ from lib.thetadata import (
     today_et,
 )
 
-if oi_store.OI_RAW_DIR != config.SPX_OI_RAW_DIR:
-    raise SystemExit(f"lib.parquet_store resolved OI_RAW_DIR={oi_store.OI_RAW_DIR}, "
-                     f"expected {config.SPX_OI_RAW_DIR}: it was imported before the "
-                     "redirect. Refusing to write.")
-
 log = logging.getLogger(__name__)
+
+# The production OI tree, captured before anything redirects it.
+_PROD_OI_RAW_DIR = config.OI_RAW_DIR
 
 MAX_WORKERS = 4
 # A full SPXW chain for one session is ~20-40k rows; the default 60s is
@@ -140,6 +131,57 @@ def _dates_in_store(root_dir, start: date, end: date) -> set[date]:
         col = pq.read_table(p, columns=["trade_date"]).column("trade_date").to_pylist()
         out.update(d for d in col if start <= d <= end)
     return out
+
+
+# --- OI destination redirect -------------------------------------------------
+#
+# lib.parquet_store does `from config import OI_RAW_DIR`, which copies the
+# path into its own namespace at import time; ticker_dir() — and through it
+# every write — reads that module global at CALL time. So the redirect sets
+# lib.parquet_store.OI_RAW_DIR directly, at run time, after every import has
+# happened. That makes it independent of import order: re-pointing
+# config.OI_RAW_DIR alone is a no-op whenever lib.parquet_store was imported
+# first, and an import tidy-up must not be able to change where OI lands.
+
+def _redirect_oi_store() -> None:
+    for name, d in (("SPX_OI_RAW_DIR", config.SPX_OI_RAW_DIR),
+                    ("SPX_VOLUME_DIR", config.SPX_VOLUME_DIR)):
+        if d == _PROD_OI_RAW_DIR or _PROD_OI_RAW_DIR in d.parents:
+            raise SystemExit(f"{name}={d} is inside OI_RAW_DIR={_PROD_OI_RAW_DIR}; "
+                             "it would join the 120-ticker universe. Refusing.")
+    config.OI_RAW_DIR = config.SPX_OI_RAW_DIR
+    oi_store.OI_RAW_DIR = config.SPX_OI_RAW_DIR
+
+
+def _assert_oi_target(root: str) -> None:
+    """Abort unless an OI write for `root` would land under SPX_OI_RAW_DIR.
+    Checks the path the writer will actually use, not just config."""
+    spx = config.SPX_OI_RAW_DIR
+    problems = []
+    if config.OI_RAW_DIR != spx:
+        problems.append(f"config.OI_RAW_DIR={config.OI_RAW_DIR}")
+    if oi_store.OI_RAW_DIR != spx:
+        problems.append(f"lib.parquet_store.OI_RAW_DIR={oi_store.OI_RAW_DIR}")
+    target = oi_store.ticker_dir(root)
+    if target.parent != spx:
+        problems.append(f"lib.parquet_store.ticker_dir({root!r})={target}")
+    if problems:
+        raise SystemExit("OI redirect not in effect — refusing to fetch. Expected "
+                         f"SPX_OI_RAW_DIR={spx}, got: " + "; ".join(problems)
+                         + f". Production OI_RAW_DIR is {_PROD_OI_RAW_DIR}.")
+
+
+def _assert_prod_tree_clean() -> None:
+    """The failure signature is an SPX/ or SPXW/ directory in the production
+    OI tree. Checks only those names; never walks the 120-ticker tree."""
+    leaked = [_PROD_OI_RAW_DIR / r for r in config.SPX_ROOTS
+              if (_PROD_OI_RAW_DIR / r).exists()]
+    if leaked:
+        raise SystemExit("SPX data in the PRODUCTION OI tree: "
+                         + ", ".join(map(str, leaked))
+                         + ". These directories enrol SPX into the 120-ticker "
+                         "pipeline (chain_eod greeks fetch included) — remove "
+                         "them before the next cron run.")
 
 
 # --- Volume ----------------------------------------------------------------
@@ -189,6 +231,8 @@ def fetch_volume_month(root: str, days: list[date]) -> int:
 # --- fetch command ---------------------------------------------------------
 
 def cmd_fetch(args) -> int:
+    _redirect_oi_store()
+    _assert_prod_tree_clean()
     now_et = datetime.now(_ET)
     t_et = today_et()
 
@@ -225,6 +269,7 @@ def cmd_fetch(args) -> int:
             requested[("oi", root)] = days
             for month in _months(days):
                 print(f"--- OI {root} {month[0]:%Y-%m} ({len(month)} days) ---")
+                _assert_oi_target(root)
                 fetched[("oi", root)] += fetch_oi.fetch_ticker(root, month)
 
     if "oi" in args.data and args.oi_snapshot_today:
@@ -234,6 +279,7 @@ def cmd_fetch(args) -> int:
         elif args.start <= t_et <= args.end:
             for root in args.roots:
                 print(f"--- OI {root} snapshot, trade_date {t_et} ---")
+                _assert_oi_target(root)
                 n = fetch_oi_snapshot.fetch_ticker(root, t_et)
                 fetched[("oi", root)] += n
                 requested[("oi", root)] = requested.get(("oi", root), []) + [t_et]
@@ -250,6 +296,13 @@ def cmd_fetch(args) -> int:
             for month in _months(days):
                 print(f"--- volume {root} {month[0]:%Y-%m} ({len(month)} days) ---")
                 fetched[("volume", root)] += fetch_volume_month(root, month)
+
+    # Where did the OI go? Both halves fail loudly.
+    _assert_prod_tree_clean()
+    for (data, root), days in requested.items():
+        if data == "oi" and days and not any(oi_store.ticker_dir(root).glob("*.parquet")):
+            raise SystemExit(f"OI fetched for {root} but no parquet under "
+                             f"{config.SPX_OI_RAW_DIR / root}.")
 
     # Report from the store, not from the fetch: what matters is what landed.
     print("\n=== Summary (read back from the stores) ===")

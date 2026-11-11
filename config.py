@@ -70,6 +70,13 @@ _default_chain_live_dir = CHAIN_INTRADAY_DIR.parent / "chain_live"
 CHAIN_LIVE_DIR          = Path(os.environ.get("CHAIN_LIVE_DIR",
                                               str(_default_chain_live_dir))).resolve()
 
+# --- Parquet store for 1-minute equity bars (Polygon/Massive) ---------------
+# Same sibling-of-chain_eod derivation as the two stores above, for the same
+# reason: PROJECT_ROOT is not where bulk data lives on the VPS.
+_default_equity_1min_dir = CHAIN_EOD_DIR.parent / "equity_1min"
+EQUITY_1MIN_DIR          = Path(os.environ.get("EQUITY_1MIN_DIR",
+                                               str(_default_equity_1min_dir))).resolve()
+
 # --- SPX index options (OI + trade-based volume) -----------------------------
 # Both roots are required and are NOT duplicates: SPX is the AM-settled
 # monthly/quarterly book, SPXW the PM-settled weeklys, and ~2,900 contracts a
@@ -88,10 +95,3 @@ SPX_OI_RAW_DIR      = Path(os.environ.get("SPX_OI_RAW_DIR",
 _default_spx_vol_dir = OI_RAW_DIR.parent / "spx_volume_eod"
 SPX_VOLUME_DIR       = Path(os.environ.get("SPX_VOLUME_DIR",
                                            str(_default_spx_vol_dir))).resolve()
-
-# --- Parquet store for 1-minute equity bars (Polygon/Massive) ---------------
-# Same sibling-of-chain_eod derivation as the two stores above, for the same
-# reason: PROJECT_ROOT is not where bulk data lives on the VPS.
-_default_equity_1min_dir = CHAIN_EOD_DIR.parent / "equity_1min"
-EQUITY_1MIN_DIR          = Path(os.environ.get("EQUITY_1MIN_DIR",
-                                               str(_default_equity_1min_dir))).resolve()
