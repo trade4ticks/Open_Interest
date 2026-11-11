@@ -492,20 +492,27 @@ prices**, stored under T. The entire family is EVENING-tier and prev-close
 consistent. `atm_iv_*` is an interpolated value (bracket two expirations around
 the target DTE, interpolate IV across the two strikes bracketing spot, then
 interpolate by DTE) — the "formula" below is descriptive; the true definition is
-the interpolation algorithm in `fetch_iv_chain.py`, which has boundary-fallback
-branches.
+`IV_FEATURES_SQL` in `build_features.py`, which has **no** boundary fallback
+(NULL when strikes or expirations do not bracket the target; the legacy
+nearest-strike fallback in `fetch_iv_chain.py` is retired).
+
+The 25-delta columns locate strikes by the chain's stored EOD `delta`
+(adjacent strikes bracketing ±0.25, linear in delta, then linear in DTE). They
+were NULL until 2026-06-09 (commit `d16eb4c`) and have been populated since,
+from the same EOD greeks chain — see "IV data quality" below for what that
+implies.
 
 | Column | Formula / meaning | Tier |
 |---|---|---|
 | `atm_iv_7d` | ATM-interpolated IV at 7-day target DTE | EVENING |
 | `atm_iv_30d` | ATM-interpolated IV at 30-day target DTE | EVENING |
 | `atm_iv_90d` | ATM-interpolated IV at 90-day target DTE | EVENING |
-| `iv_25d_call_30d` | **NULL** — not populated (EOD OTM IV too noisy) | EVENING |
-| `iv_25d_put_30d` | **NULL** — not populated | EVENING |
-| `rr_25d_30d` | `iv_25d_call_30d − iv_25d_put_30d` — **NULL** (inputs NULL) | EVENING |
-| `bf_25d_30d` | `0.5·(iv_25d_call_30d + iv_25d_put_30d) − atm_iv_30d` — **NULL** | EVENING |
-| `skew_25p_atm_30d` | `iv_25d_put_30d − atm_iv_30d` — **NULL** | EVENING |
-| `skew_atm_25c_30d` | `atm_iv_30d − iv_25d_call_30d` — **NULL** | EVENING |
+| `iv_25d_call_7d` / `iv_25d_put_7d` | 25-delta call / put IV at 7-day target DTE (EOD delta locator) | EVENING |
+| `iv_25d_call_30d` / `iv_25d_put_30d` | 25-delta call / put IV at 30-day target DTE (EOD delta locator) | EVENING |
+| `rr_25d_7d` / `rr_25d_30d` | `iv_25d_call − iv_25d_put` at that tenor | EVENING |
+| `bf_25d_7d` / `bf_25d_30d` | `0.5·(iv_25d_call + iv_25d_put) − atm_iv` at that tenor | EVENING |
+| `skew_25p_atm_7d` / `skew_25p_atm_30d` | `iv_25d_put − atm_iv` at that tenor | EVENING |
+| `skew_atm_25c_7d` / `skew_atm_25c_30d` | `atm_iv − iv_25d_call` at that tenor | EVENING |
 | `term_7d_30d` | `atm_iv_7d − atm_iv_30d` | EVENING |
 | `term_30d_90d` | `atm_iv_30d − atm_iv_90d` | EVENING |
 | `vrp_30d` | `atm_iv_30d − rv_20d` — volatility risk premium | EVENING |
@@ -517,7 +524,7 @@ branches.
 | `zscore_iv_7d` | 60-day z-score of `atm_iv_7d` | EVENING |
 | `zscore_iv_30d` | 60-day z-score of `atm_iv_30d` | EVENING |
 | `zscore_iv_90d` | 60-day z-score of `atm_iv_90d` | EVENING |
-| `zscore_rr_25d_30d` | 60-day z-score of `rr_25d_30d` — **NULL** (input NULL) | EVENING |
+| `zscore_rr_25d_7d` / `zscore_rr_25d_30d` | 60-day z-score of `rr_25d_7d` / `rr_25d_30d` | EVENING |
 | `zscore_term_7d_30d` | 60-day z-score of `term_7d_30d` | EVENING |
 | `zscore_term_30d_90d` | 60-day z-score of `term_30d_90d` | EVENING |
 | `zscore_vrp_30d` | 60-day z-score of `vrp_30d` | EVENING |
@@ -726,9 +733,25 @@ new split) is keyed on the `splits` column only.
 
 ### IV data quality
 
-EOD implied vol is an after-hours snapshot with wide spreads; it is accepted as
-adequate for ATM interpolation but is unreliable in the OTM wings (the
-`delta` values for far-OTM contracts are unreliable, which is why the
-25-delta skew metrics — `iv_25d_*`, `rr_25d_30d`, `bf_25d_30d`,
-`skew_*` — remain NULL by design pending a future intraday/15:45-endpoint
-migration). 2020 is a known vendor bad-batch period for the IV feed.
+Every Family 13 column is built from the **EOD greeks chain**
+(`/v3/option/history/greeks/eod` → `chain_eod`). EOD implied vol is an
+after-hours snapshot taken while spreads are widening into and past the close;
+it is accepted as adequate for ATM interpolation but is unreliable in the OTM
+wings, and the far-OTM `delta` values are unreliable too. 2020 is a known
+vendor bad-batch period for the IV feed.
+
+This section previously said the 25-delta metrics stayed NULL "pending a
+future intraday/15:45-endpoint migration", implying that endpoint was
+unavailable. Both halves are stale:
+
+- **The intraday endpoints work.** The equity pipeline fetches 09:45 and 15:45
+  chain snapshots (`fetch_chain_snapshots.py` → `CHAIN_SNAPSHOTS_DIR`), full-day
+  5-minute bars (`fetch_chain_intraday.py`) and live 5-minute captures
+  (`run_live_pipeline.py`). Those feed the separate surface pipeline —
+  `equity_surface` → `equity_metrics` (`docs/equity_surface.md`) — **not**
+  `daily_features`. No Family 13 column has been migrated to them.
+- **The 25-delta metrics are no longer NULL.** Since 2026-06-09 (`d16eb4c`)
+  they are populated from the EOD chain, using the EOD delta as the strike
+  locator — i.e. from exactly the wing data this section calls unreliable.
+  Treat `iv_25d_*`, `rr_25d_*`, `bf_25d_*`, `skew_*` and `zscore_rr_25d_*`
+  with that in mind until they are rebuilt on intraday data or retired.

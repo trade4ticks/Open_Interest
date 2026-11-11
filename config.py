@@ -70,6 +70,25 @@ _default_chain_live_dir = CHAIN_INTRADAY_DIR.parent / "chain_live"
 CHAIN_LIVE_DIR          = Path(os.environ.get("CHAIN_LIVE_DIR",
                                               str(_default_chain_live_dir))).resolve()
 
+# --- SPX index options (OI + trade-based volume) -----------------------------
+# Both roots are required and are NOT duplicates: SPX is the AM-settled
+# monthly/quarterly book, SPXW the PM-settled weeklys, and ~2,900 contracts a
+# day share (expiration, strike, right) across them. The root is the per-root
+# directory name in each store, exactly as the ticker is in OI_RAW_DIR.
+SPX_ROOTS = ("SPX", "SPXW")
+
+# Separate trees, never inside OI_RAW_DIR: the 120-ticker pipeline discovers
+# its universe by listing OI_RAW_DIR (lib.parquet_store.list_tickers), so an
+# SPX directory there would enrol SPX into the chain_eod greeks fetch, the
+# snapshot/intraday/live chain fetchers, equity_1min and trade_paths.
+# Sibling-of-OI_RAW_DIR fallback for the same reason as the chain stores above.
+_default_spx_oi_dir = OI_RAW_DIR.parent / "spx_oi_raw"
+SPX_OI_RAW_DIR      = Path(os.environ.get("SPX_OI_RAW_DIR",
+                                          str(_default_spx_oi_dir))).resolve()
+_default_spx_vol_dir = OI_RAW_DIR.parent / "spx_volume_eod"
+SPX_VOLUME_DIR       = Path(os.environ.get("SPX_VOLUME_DIR",
+                                           str(_default_spx_vol_dir))).resolve()
+
 # --- Parquet store for 1-minute equity bars (Polygon/Massive) ---------------
 # Same sibling-of-chain_eod derivation as the two stores above, for the same
 # reason: PROJECT_ROOT is not where bulk data lives on the VPS.
