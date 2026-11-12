@@ -177,11 +177,17 @@ def _assert_prod_tree_clean() -> None:
     leaked = [_PROD_OI_RAW_DIR / r for r in config.SPX_ROOTS
               if (_PROD_OI_RAW_DIR / r).exists()]
     if leaked:
-        raise SystemExit("SPX data in the PRODUCTION OI tree: "
-                         + ", ".join(map(str, leaked))
-                         + ". These directories enrol SPX into the 120-ticker "
-                         "pipeline (chain_eod greeks fetch included) — remove "
-                         "them before the next cron run.")
+        quarantine = (_PROD_OI_RAW_DIR.parent
+                      / f"spx_leak_quarantine_{datetime.now():%Y%m%d_%H%M%S}")
+        moves = "\n".join(f"  mv '{p}' '{quarantine}/'" for p in leaked)
+        raise SystemExit(
+            "SPX data in the PRODUCTION OI tree: "
+            + ", ".join(map(str, leaked))
+            + ".\nThese directories enrol SPX into the 120-ticker pipeline "
+            "(chain_eod greeks fetch included). Before the next cron run, MOVE "
+            "them out of the tree — do not delete them; keep what was written "
+            "so it can be inspected:\n"
+            f"  mkdir -p '{quarantine}'\n{moves}")
 
 
 # --- Volume ----------------------------------------------------------------
