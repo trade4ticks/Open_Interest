@@ -12,7 +12,7 @@ HARD checks (exit 1 on failure):
   * every NYSE session in range present, per root, per store
   * (root, expiration, strike, right, trade_date) unique in both stores
   * root is load-bearing: dropping it from the key collides, with differing OI
-  * no stored volume <= 0; trade_count on every row, 1 <= trade_count <= volume
+  * no stored volume <= 0; trade_count on every row; trade_count <= volume
   * SPX holds OI at DTE <= 7 only in its monthly expiry (SPXW carries the
     short-dated book on every other week)
   * split factors resolve to exactly 1.0 for both roots
@@ -20,7 +20,9 @@ HARD checks (exit 1 on failure):
 REPORTED for eyeballing (never fail the run):
   * rows / sessions / expirations / OI by root by year
   * book split per year: SPXW share of DTE <= 7 OI, SPX share of DTE > 90 OI
-  * average trade size (volume / trade_count) by root by year
+  * rows with volume > 0 but trade_count = 0 (count and rate per root per year)
+  * average trade size (volume / trade_count, count > 0 rows only) by root by
+    year; by month with --trade-size-monthly
   * SPXW expiration cadence (expirations per week, weekday mix) by year
   * the §3 table (rows, total OI, expirations, OI at DTE<=7 / >90) for --dates
   * bytes on disk and a projection for the full backfill
@@ -325,7 +327,11 @@ def main() -> int:
                         "(default: 20261026 if in range, plus first and last session)")
     p.add_argument("--project-sessions", type=int, default=1510,
                    help="sessions to project disk use to (default ~6 years)")
+    p.add_argument("--trade-size-monthly", action="store_true",
+                   help="also print average trade size by month per root, to "
+                        "tell a step change from a gradual slide")
     args = p.parse_args()
+    trade_size_monthly = args.trade_size_monthly
 
     sessions = get_trading_days(args.start, args.end)
     if not sessions:
@@ -354,18 +360,36 @@ def main() -> int:
         common_checks(con, "vol", "volume", sessions)
         nonpos = con.execute("SELECT count(*) FROM vol WHERE v <= 0").fetchone()[0]
         check(nonpos == 0, f"volume: no rows with volume <= 0 ({nonpos:,})")
-        n_null, n_bad, null_days = con.execute("""
+        n_null, n_over, null_days = con.execute("""
             SELECT count(*) FILTER (WHERE trade_count IS NULL),
-                   count(*) FILTER (WHERE trade_count < 1 OR trade_count > v),
+                   count(*) FILTER (WHERE trade_count > v),
                    count(DISTINCT trade_date) FILTER (WHERE trade_count IS NULL)
             FROM vol
         """).fetchone()
         check(n_null == 0, f"volume: trade_count present on every row ({n_null:,} NULL "
               f"on {null_days} sessions — written before trade_count was stored; "
               "re-fetch those sessions)")
-        check(n_bad == 0, f"volume: 1 <= trade_count <= volume on every row "
-              f"({n_bad:,} violations — each trade is at least one contract)")
-        section("volume: average trade size (volume / trade_count) by root by year")
+        check(n_over == 0, f"volume: trade_count <= volume on every row "
+              f"({n_over:,} violations — a trade is at least one contract)")
+
+        # trade_count = 0 with volume > 0 is a legitimate vendor state, not an
+        # error: volume can carry trades whose conditions add size without
+        # adding a counted trade (packages / blocks seen in Oct 2026). The rows
+        # stay; only volume / trade_count is undefined for them.
+        section("volume: rows with volume > 0 and trade_count = 0 (report only)")
+        print(con.execute("""
+            SELECT root, year(trade_date) AS year,
+                   count(*) FILTER (WHERE trade_count = 0) AS rows_zero_count,
+                   round(100.0 * count(*) FILTER (WHERE trade_count = 0) / count(*), 4) AS pct_rows,
+                   coalesce(sum(v) FILTER (WHERE trade_count = 0), 0) AS volume_zero_count,
+                   round(100.0 * coalesce(sum(v) FILTER (WHERE trade_count = 0), 0) / sum(v), 4) AS pct_volume
+            FROM vol WHERE trade_count IS NOT NULL
+            GROUP BY 1, 2 ORDER BY 1, 2
+        """).df().to_string(index=False))
+
+        # Same rule phase 2 uses: rows with trade_count = 0 leave BOTH
+        # numerator and denominator, so their volume cannot inflate the size.
+        section("volume: average trade size (volume / trade_count, count > 0 rows) by root by year")
         print(con.execute("""
             SELECT root, year(trade_date) AS year,
                    round(sum(v) / sum(trade_count), 2) AS avg_trade_size,
@@ -374,9 +398,21 @@ def main() -> int:
                    round(sum(v) FILTER (WHERE option_type = 'P')
                          / sum(trade_count) FILTER (WHERE option_type = 'P'), 2) AS put,
                    round(sum(trade_count) / count(DISTINCT trade_date)) AS trades_per_session
-            FROM vol WHERE trade_count IS NOT NULL
+            FROM vol WHERE trade_count > 0
             GROUP BY 1, 2 ORDER BY 1, 2
         """).df().to_string(index=False))
+        if trade_size_monthly:
+            section("volume: average trade size by root by month (step vs slide)")
+            m = con.execute("""
+                SELECT strftime(date_trunc('month', trade_date), '%Y-%m') AS month, root,
+                       round(sum(v) / sum(trade_count), 2) AS avg_trade_size
+                FROM vol WHERE trade_count > 0
+                GROUP BY 1, 2
+            """).df()
+            wide = m.pivot(index="month", columns="root", values="avg_trade_size").sort_index()
+            for r in wide.columns:
+                wide[f"{r}_mom_pct"] = (wide[r].pct_change() * 100).round(1)
+            print(wide.to_string())
         section("volume: put/call split by root by year")
         print(con.execute("""
             SELECT root, year(trade_date) AS year,
