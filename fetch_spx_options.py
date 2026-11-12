@@ -33,7 +33,8 @@ which is out of scope here. Volume comes from the trade-based
 /v3/option/history/eod endpoint via lib.thetadata.fetch_volume_eod, unchanged.
 That function's only existing caller (fetch_volume_eod.py) aggregates against
 a spot price and writes Postgres; nothing stored the raw rows, so they get a
-new store: lib/spx_volume_store.py.
+new store: lib/spx_volume_store.py. Only volume and trade count are kept;
+the feed's bid / ask / OHLC are end-of-day quotes and are not stored.
 
 Each request covers ONE session (start_date = end_date = day) and every row is
 stamped with that day, exactly as fetch_oi pins OI rows to the requested day.
@@ -199,11 +200,13 @@ def _fetch_volume_day(root: str, day: date) -> tuple[pd.DataFrame, int]:
     raw = fetch_volume_eod(root, day, day, timeout=VOL_TIMEOUT)
     if raw.empty:
         return raw, 0
-    raw = raw[raw["volume"] > 0].copy()
+    raw = raw[raw["volume"] > 0].rename(columns={"count": "trade_count"})
+    if "trade_count" not in raw.columns:
+        raw["trade_count"] = pd.NA
     n_off = int((raw["trade_date"] != day).sum())
     raw["trade_date"] = day
     n = len(raw)
-    raw = raw.groupby(vol_store.KEYS, as_index=False)["volume"].max()
+    raw = raw.groupby(vol_store.KEYS, as_index=False)[["volume", "trade_count"]].max()
     if len(raw) < n:
         log.warning("  DEDUP   %s %s volume: %d -> %d rows (max kept)",
                     root, day, n, len(raw))

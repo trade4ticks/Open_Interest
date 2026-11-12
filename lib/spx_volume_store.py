@@ -11,6 +11,12 @@ Schema per file (root is implied by path, as ticker is in lib.parquet_store):
     option_type   STRING  ('C'/'P')
     volume        INT64   > 0 only; zero-volume contracts add nothing to any
                           volume aggregate and are not stored
+    trade_count   INT64   number of trades (the feed's `count`); NULL only in
+                          files written before it was stored — re-fetch those
+
+Only volume and trade count are kept from the EOD feed. Its bid / ask / OHLC
+are end-of-day quotes (2020 SPX rows carry zero bid and ask) and are not
+stored.
 
 Write semantics differ from lib.parquet_store on purpose: a write REPLACES
 every trade_date it carries rather than merging contract by contract. A
@@ -36,6 +42,7 @@ _SCHEMA = pa.schema([
     ("strike",      pa.float64()),
     ("option_type", pa.string()),
     ("volume",      pa.int64()),
+    ("trade_count", pa.int64()),
 ])
 
 COLUMNS = [f.name for f in _SCHEMA]
@@ -63,6 +70,9 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
     out["strike"]      = pd.to_numeric(out["strike"], errors="coerce").astype("float64")
     out["option_type"] = out["option_type"].astype("string")
     out["volume"]      = pd.to_numeric(out["volume"], errors="coerce").astype("int64")
+    if "trade_count" not in out.columns:
+        out["trade_count"] = pd.NA
+    out["trade_count"] = pd.to_numeric(out["trade_count"], errors="coerce").astype("Int64")
     return out[COLUMNS]
 
 
@@ -89,7 +99,7 @@ def write_year(root: str, year: int, new_df: pd.DataFrame) -> int:
 
     existing = read_year(root, year)
     if not existing.empty:
-        existing["trade_date"] = pd.to_datetime(existing["trade_date"]).dt.date
+        existing = _coerce(existing)
         existing = existing[~existing["trade_date"].isin(set(new_df["trade_date"]))]
         merged = pd.concat([existing, new_df], ignore_index=True)
     else:

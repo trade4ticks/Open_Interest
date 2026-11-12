@@ -447,7 +447,8 @@ def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
     Endpoint: /v3/option/history/eod with expiration=* (all expirations).
     Report is available at 17:15 ET, well before the 7am pipeline run.
 
-    Returns DataFrame[trade_date, expiration, strike, option_type, volume].
+    Returns DataFrame[trade_date, expiration, strike, option_type, volume,
+    count] — count is the number of trades, <NA> if the response omits it.
     Empty DataFrame if terminal returned no data.
     """
     params = {
@@ -510,6 +511,9 @@ def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
             "strike":      row.get("strike"),
             "option_type": option_type,
             "volume":      vol,
+            # Number of trades. Additive column: fetch_volume_eod.py reads
+            # by name and ignores it; fetch_spx_options stores it.
+            "count":       row.get("count"),
         })
 
     if not records:
@@ -518,6 +522,7 @@ def fetch_volume_eod(symbol: str, start_date: date, end_date: date,
     df = pd.DataFrame(records)
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+    df["count"]  = pd.to_numeric(df["count"],  errors="coerce").astype("Int64")
     df = df.dropna(subset=["strike", "volume"])
     df = df.drop_duplicates(subset=["trade_date", "expiration", "strike", "option_type"])
     return df

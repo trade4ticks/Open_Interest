@@ -12,12 +12,15 @@ HARD checks (exit 1 on failure):
   * every NYSE session in range present, per root, per store
   * (root, expiration, strike, right, trade_date) unique in both stores
   * root is load-bearing: dropping it from the key collides, with differing OI
-  * no stored volume <= 0
+  * no stored volume <= 0; trade_count on every row, 1 <= trade_count <= volume
+  * SPX holds OI at DTE <= 7 only in its monthly expiry (SPXW carries the
+    short-dated book on every other week)
   * split factors resolve to exactly 1.0 for both roots
 
 REPORTED for eyeballing (never fail the run):
   * rows / sessions / expirations / OI by root by year
-  * SPX OI at DTE <= 7, with each expiration classed monthly or not
+  * book split per year: SPXW share of DTE <= 7 OI, SPX share of DTE > 90 OI
+  * average trade size (volume / trade_count) by root by year
   * SPXW expiration cadence (expirations per week, weekday mix) by year
   * the §3 table (rows, total OI, expirations, OI at DTE<=7 / >90) for --dates
   * bytes on disk and a projection for the full backfill
@@ -65,20 +68,23 @@ def _files(store_dir, roots) -> list[str]:
     return sorted(str(p) for r in roots for p in (store_dir / r).glob("*.parquet"))
 
 
-def _register(con, name: str, store_dir, value_col: str, start: date, end: date) -> bool:
+def _register(con, name: str, store_dir, value_col: str, start: date, end: date,
+              extra: str = "") -> bool:
     files = _files(store_dir, SPX_ROOTS)
     if not files:
         print(f"  no files under {store_dir} for {SPX_ROOTS}")
         return False
     # Views cannot hold prepared parameters, so the literals are inlined.
     # root = the directory above {year}.parquet; the regexp accepts / and \.
+    # union_by_name: volume files written before trade_count existed read it
+    # as NULL instead of failing the whole scan.
     file_list = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
     con.execute(f"""
         CREATE OR REPLACE VIEW {name} AS
         SELECT regexp_extract(filename, '([^/\\\\]+)[/\\\\][0-9]{{4}}\\.parquet$', 1) AS root,
                trade_date, expiration, strike, option_type, {value_col} AS v,
-               (expiration - trade_date) AS dte
-        FROM read_parquet([{file_list}], filename = true)
+               (expiration - trade_date) AS dte{extra}
+        FROM read_parquet([{file_list}], filename = true, union_by_name = true)
         WHERE trade_date BETWEEN DATE '{start.isoformat()}' AND DATE '{end.isoformat()}'
     """)
     return True
@@ -168,34 +174,61 @@ def common_checks(con, view: str, label: str, sessions: list[date]) -> None:
 
 # --- OI-only reports ---------------------------------------------------------
 
-def oi_reports(con, dates: list[date]) -> None:
-    section("OI: SPX root at DTE <= 7 (AM-settled monthlies in expiration week)")
-    spx_short = con.execute("""
-        SELECT expiration, count(DISTINCT trade_date) AS sessions,
-               min(dte) AS min_dte, max(dte) AS max_dte, sum(v) AS oi_summed
-        FROM oi WHERE root = 'SPX' AND dte <= 7
-        GROUP BY 1 ORDER BY 1
+def oi_book_split(con) -> None:
+    """SPX holds OI inside 7 days only in a monthly-expiration week (its
+    AM-settled monthly runs to settlement); on every other week SPXW carries
+    the whole short-dated book. SPX carries the long-dated book throughout."""
+    section("OI: SPX / SPXW book split")
+    exps = con.execute("""
+        SELECT DISTINCT expiration FROM oi WHERE root = 'SPX' AND dte <= 7
     """).df()
-    if spx_short.empty:
-        print("  none — SPX holds no OI within 7 days anywhere in range")
-    else:
-        spx_short["expiration"] = pd.to_datetime(spx_short["expiration"]).dt.date
-        spx_short["is_monthly"] = [e == _monthly_expiry(e) for e in spx_short["expiration"]]
-        n_sessions = con.execute(
-            "SELECT count(DISTINCT trade_date) FROM oi WHERE root='SPX' AND dte <= 7"
-        ).fetchone()[0]
-        non_monthly = spx_short[~spx_short["is_monthly"]]
-        print(f"  {n_sessions} sessions carry SPX OI at DTE <= 7, across "
-              f"{len(spx_short)} expirations; {len(non_monthly)} are NOT the "
-              "monthly (third-Friday) expiry.")
-        print("  Expected: the SPX root holds the monthly right up to its AM "
-              "settlement, so OI inside 7 days appears every expiration week. "
-              "Only non-monthly expirations here would be surprising.")
-        if not non_monthly.empty:
-            print(non_monthly.to_string(index=False))
-        else:
-            print(spx_short.tail(6).to_string(index=False))
+    exps["expiration"] = pd.to_datetime(exps["expiration"]).dt.date
+    non_monthly = sorted(e for e in exps["expiration"] if e != _monthly_expiry(e))
+    check(not non_monthly,
+          "SPX holds OI at DTE <= 7 only in its monthly (third-Friday) expiry"
+          + (f" — {len(non_monthly)} other expirations: "
+             f"{', '.join(map(str, non_monthly[:10]))}" if non_monthly else ""))
 
+    per = con.execute("""
+        SELECT trade_date, root,
+               coalesce(sum(v) FILTER (WHERE dte <= 7), 0) AS short_oi,
+               coalesce(sum(v) FILTER (WHERE dte > 90), 0) AS long_oi
+        FROM oi GROUP BY 1, 2
+    """).df()
+    if per.empty:
+        return
+    per["trade_date"] = pd.to_datetime(per["trade_date"]).dt.date
+    wide = per.pivot(index="trade_date", columns="root",
+                     values=["short_oi", "long_oi"]).fillna(0)
+    out = pd.DataFrame(index=wide.index)
+    # A third Friday is on day 15-21, so only the current month's monthly can
+    # fall within 7 days of a session.
+    out["monthly_week"] = [0 <= (_monthly_expiry(d) - d).days <= 7 for d in wide.index]
+    short_tot = wide["short_oi"].sum(axis=1)
+    long_tot = wide["long_oi"].sum(axis=1)
+    out["spxw_short_share"] = wide["short_oi"].get("SPXW", 0) / short_tot.where(short_tot > 0)
+    out["spx_long_share"] = wide["long_oi"].get("SPX", 0) / long_tot.where(long_tot > 0)
+    out["year"] = [d.year for d in out.index]
+
+    rows = []
+    for y, g in out.groupby("year"):
+        nm, mw = g[~g["monthly_week"]], g[g["monthly_week"]]
+        rows.append({
+            "year": y,
+            "non_monthly_wks": len(nm),
+            "spxw_short_share_min": round(nm["spxw_short_share"].min(), 4) if len(nm) else None,
+            "monthly_wks": len(mw),
+            "spxw_short_share_median": round(mw["spxw_short_share"].median(), 4) if len(mw) else None,
+            "spx_long_share_median": round(g["spx_long_share"].median(), 4),
+            "spx_long_share_min": round(g["spx_long_share"].min(), 4),
+        })
+    print("  Per session: SPXW share of OI at DTE <= 7, SPX share of OI at DTE > 90.")
+    print("  Expected: spxw_short_share_min = 1.0 on non-monthly weeks (the hard check")
+    print("  above, seen per session); SPX the large majority of DTE > 90 every year.")
+    print(pd.DataFrame(rows).to_string(index=False))
+
+
+def oi_reports(con, dates: list[date]) -> None:
     section("OI: SPXW expiration cadence by year (expirations listed in that year)")
     cad = con.execute("""
         WITH e AS (SELECT DISTINCT expiration FROM oi WHERE root = 'SPXW')
@@ -311,14 +344,39 @@ def main() -> int:
     con = duckdb.connect()
     if _register(con, "oi", SPX_OI_RAW_DIR, "open_interest", args.start, args.end):
         common_checks(con, "oi", "OI", sessions)
+        oi_book_split(con)
         oi_reports(con, dates)
     else:
         FAILURES.append("OI store empty")
 
-    if _register(con, "vol", SPX_VOLUME_DIR, "volume", args.start, args.end):
+    if _register(con, "vol", SPX_VOLUME_DIR, "volume", args.start, args.end,
+                 extra=", trade_count"):
         common_checks(con, "vol", "volume", sessions)
         nonpos = con.execute("SELECT count(*) FROM vol WHERE v <= 0").fetchone()[0]
         check(nonpos == 0, f"volume: no rows with volume <= 0 ({nonpos:,})")
+        n_null, n_bad, null_days = con.execute("""
+            SELECT count(*) FILTER (WHERE trade_count IS NULL),
+                   count(*) FILTER (WHERE trade_count < 1 OR trade_count > v),
+                   count(DISTINCT trade_date) FILTER (WHERE trade_count IS NULL)
+            FROM vol
+        """).fetchone()
+        check(n_null == 0, f"volume: trade_count present on every row ({n_null:,} NULL "
+              f"on {null_days} sessions — written before trade_count was stored; "
+              "re-fetch those sessions)")
+        check(n_bad == 0, f"volume: 1 <= trade_count <= volume on every row "
+              f"({n_bad:,} violations — each trade is at least one contract)")
+        section("volume: average trade size (volume / trade_count) by root by year")
+        print(con.execute("""
+            SELECT root, year(trade_date) AS year,
+                   round(sum(v) / sum(trade_count), 2) AS avg_trade_size,
+                   round(sum(v) FILTER (WHERE option_type = 'C')
+                         / sum(trade_count) FILTER (WHERE option_type = 'C'), 2) AS call,
+                   round(sum(v) FILTER (WHERE option_type = 'P')
+                         / sum(trade_count) FILTER (WHERE option_type = 'P'), 2) AS put,
+                   round(sum(trade_count) / count(DISTINCT trade_date)) AS trades_per_session
+            FROM vol WHERE trade_count IS NOT NULL
+            GROUP BY 1, 2 ORDER BY 1, 2
+        """).df().to_string(index=False))
         section("volume: put/call split by root by year")
         print(con.execute("""
             SELECT root, year(trade_date) AS year,
