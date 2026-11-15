@@ -282,7 +282,7 @@ def check_regression(chk: F.Checker) -> None:
 
 def reports(db: pd.DataFrame) -> None:
     year = pd.to_datetime(db["trade_date"]).dt.year
-    cols = F.STORED_ONLY_A[:1] + F.SURFACED_A + F.INGREDIENTS_A
+    cols = F.COLUMNS_A[2:]   # every stored column, surfaced or not
 
     section("Report: min / median / max / NULLs by year (every column)")
     print(f"{'column':<44}{'year':>6}{'min':>14}{'median':>14}{'max':>14}{'nulls':>7}{'rows':>6}")

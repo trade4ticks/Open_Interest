@@ -117,16 +117,30 @@ def derivative_names(m: str) -> list[str]:
     return [f"d1_{m}_change", f"d5_{m}_change", f"zscore_{m}_3m"]
 
 
-SURFACED_LEVELS_A = [m for m in CORE_A if m != "total_oi"]
+# Raw levels stored in the table but NOT surfaced in the catalog: their values
+# do not overlap enough year over year for a fixed threshold to mean the same
+# thing across 2020-2026 (measured by the user in Postgres). Their d1, d5 and
+# z-score columns stay surfaced; the levels stay in the table to interpret a
+# z-score hit. Reversible: remove a name here to surface it again.
+UNSURFACED_LEVELS_A = [
+    "pct_vol_front_expiry", "pct_oi_top5_strikes",
+    "vol_oi_ratio_call", "vol_oi_ratio_all", "vol_oi_ratio_put",
+    "pct_vol_spxw", "pct_vol_0_30d",
+    "weighted_avg_dte_oi", "weighted_avg_dte_vol",
+]
+SURFACED_LEVELS_A = [m for m in CORE_A if m != "total_oi" and m not in UNSURFACED_LEVELS_A]
 DERIVATIVES_A = [d for m in CORE_A for d in derivative_names(m)]
 SURFACED_A = SURFACED_LEVELS_A + DERIVATIVES_A
-STORED_ONLY_A = ["total_oi"] + INGREDIENTS_A
+STORED_ONLY_A = ["total_oi", *UNSURFACED_LEVELS_A, *INGREDIENTS_A]
 META_A = ["vol_session"]
 COLUMNS_A = ["trade_date", *META_A, *CORE_A, *DERIVATIVES_A, *INGREDIENTS_A]
 # Carried on the compute result for the checks; not written.
 DIAGNOSTICS_A = ["n_vol_sessions", "vol_roots", "vol_rows_neg_dte", "oi_roots", "oi_rows_neg_dte"]
 
-assert len(CORE_A) == 18 and len(SURFACED_A) == 71 and len(INGREDIENTS_A) == 13
+assert len(CORE_A) == 18 and len(INGREDIENTS_A) == 13
+assert set(UNSURFACED_LEVELS_A) <= set(CORE_A) and len(UNSURFACED_LEVELS_A) == 9
+assert len(SURFACED_A) == 62 and len(STORED_ONLY_A) == 23
+assert sorted(SURFACED_A + STORED_ONLY_A) == sorted(COLUMNS_A[2:])
 assert not any(c.endswith(("_pc", "_co")) for c in COLUMNS_A)
 
 # Catalog descriptions (table C, phase 4, reads these). Seeded with the ones
@@ -158,6 +172,18 @@ CATALOG_DESCRIPTIONS = {
         "reflects T-1's close). Lookahead-free."
     ),
 }
+
+_NOT_SURFACED_NOTE = (
+    "Raw level not surfaced: its values do not overlap enough year over year for a fixed "
+    "threshold to mean the same thing across 2020-2026. Use its d1, d5 and z-score columns, "
+    "which are surfaced; the level is stored to interpret a z-score hit."
+)
+_ZERO_OVERLAP_NOTE = " No 2026 value falls in the range of values 2020 produced: zero overlap."
+for _m in UNSURFACED_LEVELS_A:
+    _note = _NOT_SURFACED_NOTE + (_ZERO_OVERLAP_NOTE if _m in ("pct_vol_front_expiry",
+                                                                "pct_oi_top5_strikes") else "")
+    CATALOG_DESCRIPTIONS[_m] = (CATALOG_DESCRIPTIONS[_m] + " " + _note
+                                if _m in CATALOG_DESCRIPTIONS else _note)
 
 # Columns read from build_features.OI_FEATURES_SQL, renamed to the spec's names.
 _FACTOR_OI_COLS = {

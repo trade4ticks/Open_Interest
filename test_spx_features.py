@@ -114,7 +114,7 @@ def main() -> int:
         full = F.compute_table_a(SESSIONS[0], SESSIONS[-1], **kw)
         df = full.frame.set_index("trade_date")
         ok(list(full.frame.columns[:len(F.COLUMNS_A)]) == F.COLUMNS_A, "column order = COLUMNS_A")
-        ok(len(F.SURFACED_A) == 71 and len(F.STORED_ONLY_A) == 14, "71 surfaced + 14 stored-only")
+        ok(len(F.SURFACED_A) == 62 and len(F.STORED_ONLY_A) == 23, "62 surfaced + 23 stored-only")
         ok(full.bad_split_factors == 0, "split factors all 1.0")
 
         r = df.loc[T]
