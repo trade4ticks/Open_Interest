@@ -38,7 +38,21 @@ would carry dte = -1 and drop out of every DTE bucket.
 So pct_vol_front_expiry and pct_oi_front_expiry are NOT a symmetric pair:
 different reference days, different expiries. See CATALOG_DESCRIPTIONS.
 
-OI dte = expiration - trade_date, as in the factor project.
+OI dte = expiration - trade_date, as in the factor project. Open interest is a
+stock: the position is still open on the row date, so today's expiry is 0DTE.
+Volume is a flow: a trade's DTE was fixed when it happened. Both bases are
+correct; they differ by the session gap (1 day, 3 across a weekend).
+
+EXPIRED CONTRACTS ARE DROPPED (user decision, 2026-11-15)
+-----------------------------------------------------------
+The `oi` view keeps only expiration >= trade_date. A contract that expired
+before the row date is a position that no longer exists, yet both vendor
+endpoints sometimes still list it: the history files on the first session after
+monthly / quarterly opex (19-30% of total OI, mostly SPX-root AM monthlies,
+2020-2025), the snapshot endpoint on ~75% of Tue-Fri. Kept, it inflated
+total_oi and every share built on it. Every table A metric and table B's
+per-strike sums read this one view. The rows dropped per day are reported in
+the diagnostics oi_rows_expired_dropped / oi_expired_share_dropped.
 
 SHARED SQL
 ----------
@@ -135,7 +149,8 @@ STORED_ONLY_A = ["total_oi", *UNSURFACED_LEVELS_A, *INGREDIENTS_A]
 META_A = ["vol_session"]
 COLUMNS_A = ["trade_date", *META_A, *CORE_A, *DERIVATIVES_A, *INGREDIENTS_A]
 # Carried on the compute result for the checks; not written.
-DIAGNOSTICS_A = ["n_vol_sessions", "vol_roots", "vol_rows_neg_dte", "oi_roots", "oi_rows_neg_dte"]
+DIAGNOSTICS_A = ["n_vol_sessions", "vol_roots", "vol_rows_neg_dte", "oi_roots", "oi_rows_neg_dte",
+                 "oi_rows_expired_dropped", "oi_expired_share_dropped"]
 
 assert len(CORE_A) == 18 and len(INGREDIENTS_A) == 13
 assert set(UNSURFACED_LEVELS_A) <= set(CORE_A) and len(UNSURFACED_LEVELS_A) == 9
@@ -206,6 +221,12 @@ _FACTOR_OI_COLS = {
 # --- SQL ---------------------------------------------------------------------
 
 OI_EXTRA_SQL = """
+WITH dropped AS (
+    SELECT trade_date, COUNT(*) AS n, SUM(open_interest) AS q
+    FROM oi_raw WHERE expiration < trade_date GROUP BY trade_date
+),
+raw_tot AS (SELECT trade_date, SUM(open_interest) AS q FROM oi_raw GROUP BY trade_date),
+kept AS (
 SELECT trade_date,
        SUM(CASE WHEN option_type = 'P' AND dte BETWEEN 0 AND 30 THEN open_interest ELSE 0 END)::DOUBLE
          / NULLIF(SUM(CASE WHEN option_type = 'C' AND dte BETWEEN 0 AND 30 THEN open_interest ELSE 0 END), 0)
@@ -216,6 +237,13 @@ SELECT trade_date,
        COUNT(*) FILTER (WHERE dte < 0)                         AS oi_rows_neg_dte
 FROM (SELECT *, (expiration - trade_date)::INTEGER AS dte FROM oi)
 GROUP BY trade_date
+)
+SELECT k.*,
+       COALESCE(d.n, 0)                               AS oi_rows_expired_dropped,
+       COALESCE(d.q, 0)::DOUBLE / NULLIF(r.q, 0)      AS oi_expired_share_dropped
+FROM kept k
+LEFT JOIN dropped d USING (trade_date)
+LEFT JOIN raw_tot r USING (trade_date)
 """
 
 # Keyed by feature_date (the row it feeds); vol_session is carried through
@@ -276,7 +304,7 @@ LEFT JOIN top5      t  USING (feature_date)
 LEVELS_SQL = """
 SELECT s.trade_date,
        v.vol_session, v.n_vol_sessions, v.vol_roots, v.vol_rows_neg_dte,
-       o.oi_roots, o.oi_rows_neg_dte,
+       o.oi_roots, o.oi_rows_neg_dte, o.oi_rows_expired_dropped, o.oi_expired_share_dropped,
        f.total_oi,
        f.oi_put_call_ratio,
        o.oi_put_call_ratio_0_30d,
@@ -470,6 +498,7 @@ def compute_table_a(start: date, end: date, *, oi_store: Path, vol_store: Path,
                raw.open_interest / COALESCE(sf.adj_factor, 1.0) AS open_interest
         FROM oi_raw raw
         LEFT JOIN split_factors sf ON sf.root = raw.root AND sf.trade_date = raw.trade_date
+        WHERE raw.expiration >= raw.trade_date
     """)
     bad_sf = con.execute("SELECT COUNT(*) FROM split_factors WHERE adj_factor <> 1.0").fetchone()[0]
 
@@ -569,6 +598,13 @@ def _show(df: pd.DataFrame, mask, cols, n: int = 5) -> str:
 PCT_COLS = [c for c in CORE_A if c.startswith("pct_")]
 
 
+def vol_dte_rebased(df: pd.DataFrame) -> pd.Series:
+    """weighted_avg_dte_vol re-measured from the row date instead of the volume
+    session, so it compares with weighted_avg_dte_oi on one base."""
+    gap = (pd.to_datetime(df["trade_date"]) - pd.to_datetime(df["vol_session"])).dt.days
+    return df["weighted_avg_dte_vol"] - gap
+
+
 def check_table_a(df: pd.DataFrame, *, sessions: list[date], vol_first: date,
                   chk: Checker, full: pd.DataFrame | None = None) -> None:
     """Hard checks on table A rows. `sessions` = the NYSE sessions the rows
@@ -597,6 +633,11 @@ def check_table_a(df: pd.DataFrame, *, sessions: list[date], vol_first: date,
     if pre:
         chk.report(f"{pre} row(s) precede volume coverage (prior session < {vol_first}); volume NULL there")
 
+    # The `oi` view drops expired contracts; nothing downstream may see one.
+    if "oi_rows_neg_dte" in df.columns:
+        n_neg = int(df["oi_rows_neg_dte"].fillna(0).sum())
+        chk.check(n_neg == 0, f"no OI row with expiration < trade_date reaches a metric ({n_neg} do)")
+
     # LOOKAHEAD — the hard check of spec §2.
     has_vol = df["total_vol"].notna()
     vs = df["vol_session"]
@@ -621,12 +662,19 @@ def check_table_a(df: pd.DataFrame, *, sessions: list[date], vol_first: date,
     chk.check(bool((s > 0).all()), f"weighted_avg_dte_oi > 0  [min {s.min():.4g}]")
     # REPORT, not a hard check: reliably true, but one thin-volume session with
     # a large LEAP block could flip it. List every such day; never fail the run.
-    both = df["weighted_avg_dte_oi"].notna() & df["weighted_avg_dte_vol"].notna()
-    flipped = both & ~(df["weighted_avg_dte_oi"] > df["weighted_avg_dte_vol"])
-    chk.report(f"weighted_avg_dte_oi > weighted_avg_dte_vol: holds on {int((both & ~flipped).sum())} "
-               f"of {int(both.sum())} rows; {int(flipped.sum())} day(s) where it does not"
-               + ("" if not flipped.any() else "\n" + df.loc[
-                   flipped, ["trade_date", "vol_session", "weighted_avg_dte_oi", "weighted_avg_dte_vol",
+    # Volume DTE is measured from the volume session (a flow), OI DTE from the
+    # row date (a stock): both correct, one session gap apart (1 day, 3 across a
+    # weekend). Volume is rebased to the row date before comparing; unrebased,
+    # the comparison leans one way by construction.
+    vol_rb = vol_dte_rebased(df)
+    both = df["weighted_avg_dte_oi"].notna() & vol_rb.notna()
+    flipped = both & ~(df["weighted_avg_dte_oi"] > vol_rb)
+    shown = df.assign(weighted_avg_dte_vol_rebased=vol_rb)
+    chk.report(f"weighted_avg_dte_oi > weighted_avg_dte_vol rebased to the row date: holds on "
+               f"{int((both & ~flipped).sum())} of {int(both.sum())} rows; {int(flipped.sum())} day(s) "
+               f"where it does not"
+               + ("" if not flipped.any() else "\n" + shown.loc[
+                   flipped, ["trade_date", "vol_session", "weighted_avg_dte_oi", "weighted_avg_dte_vol_rebased",
                              "total_vol"]].to_string(index=False)))
     for c in ("oi_put_call_ratio", "vol_put_call_ratio"):
         s = df[c].dropna()

@@ -105,6 +105,7 @@ def recompute_day(day: date) -> pd.DataFrame:
     lo = day - timedelta(days=170)
     oi = VA._read(config.SPX_OI_RAW_DIR, lo, day,
                   ["trade_date", "expiration", "strike", "option_type", "open_interest"])
+    oi = oi[oi["expiration"] >= oi["trade_date"]]          # expired contracts are not positions
     vol = VA._read(config.SPX_VOLUME_DIR, lo - timedelta(days=10), day - timedelta(days=1),
                    ["trade_date", "expiration", "strike", "option_type", "volume"])
     oi_days = sorted(oi["trade_date"].unique())

@@ -81,7 +81,12 @@ def build_store(base: Path) -> None:
                 ("SPXW", T, T,   4900.0, "P", 300),
                 ("SPX",  T, E30, 5100.0, "C", 200),
                 ("SPX",  T, E60, 4900.0, "P", 400),
-            ] + [("SPX", T, E60, float(k), "C", 10) for k in range(5200, 5800, 100)]
+            ] + [("SPX", T, E60, float(k), "C", 10) for k in range(5200, 5800, 100)] + [
+                # Expired before T (vendor purge lag / post-opex): not positions. Must be dropped,
+                # or every hand-computed value below moves.
+                ("SPX",  T, P, 5000.0, "C", 50_000),
+                ("SPXW", T, P, 4000.0, "P", 80_000),
+            ]
             # THE TRAP: T's own session volume. Belongs to row T+1, never T.
             vol += [("SPXW", T, T, 5000.0, "C", 999_000, 1), ("SPX", T, E30, 5100.0, "P", 1_000, 1)]
         elif s == P:
@@ -120,7 +125,10 @@ def main() -> int:
         r = df.loc[T]
         print(f"\n--- hand-computed row T = {T} (volume session P = {P}) ---")
         ok(r["vol_session"] == P, f"vol_session = {r['vol_session']}")
-        close(r["total_oi"], 1060, "total_oi")
+        close(r["total_oi"], 1060, "total_oi (two expired contracts, 130,000 OI, dropped)")
+        ok(r["oi_rows_expired_dropped"] == 2 and r["oi_rows_neg_dte"] == 0,
+           f"diagnostics: {r['oi_rows_expired_dropped']} expired rows dropped, {r['oi_rows_neg_dte']} reach a metric")
+        close(r["oi_expired_share_dropped"], 130_000 / 131_060, "oi_expired_share_dropped")
         close(r["call_oi"], 360, "call_oi")
         close(r["put_oi"], 700, "put_oi")
         close(r["oi_put_call_ratio"], 700 / 360, "oi_put_call_ratio")

@@ -135,7 +135,11 @@ def main() -> int:
     print(f"  rows computed  : {len(df)}  ({res.start} → {res.end_eff})")
     print(f"  lead-in        : {res.lead_in_used} of {res.lead_in_wanted} sessions before {res.start} carry OI")
     print(f"  volume store   : first session {res.vol_first}")
-    print(f"  OI rows with expiration < trade_date : {int(df['oi_rows_neg_dte'].fillna(0).sum()):,}")
+    exp = df[df["oi_rows_expired_dropped"].fillna(0) > 0]
+    print(f"  expired OI dropped (expiration < trade_date): {int(exp['oi_rows_expired_dropped'].sum()):,} rows "
+          f"on {len(exp)} day(s)" + (f"; largest {exp['oi_expired_share_dropped'].max():.1%} of a day's raw OI "
+                                     f"on {exp.loc[exp['oi_expired_share_dropped'].idxmax(), 'trade_date']}"
+                                     if len(exp) else ""))
     print(f"  volume rows with expiration < session: {int(df['vol_rows_neg_dte'].fillna(0).sum()):,}")
     print(f"  computed in {time.time() - t0:.1f}s\n")
 

@@ -22,8 +22,9 @@ HARD checks (exit 1 on failure):
     change to build_features.OI_FEATURES_SQL alters SPX.
 
 REPORTED (never fail the run):
-  * every date where weighted_avg_dte_oi <= weighted_avg_dte_vol (reliably
-    true, but a thin session with a large LEAP block can flip it)
+  * every date where weighted_avg_dte_oi <= weighted_avg_dte_vol, the volume
+    side rebased to the row date first (reliably true, but a thin session with
+    a large LEAP block can flip it)
   * every metric's min / median / max / NULL count by year
   * the level metrics ranked by how little they move
   * pct_vol_0_30d by year
@@ -136,6 +137,7 @@ def recompute(day: date) -> dict:
     lo = day - timedelta(days=130)
     oi = _read(config.SPX_OI_RAW_DIR, lo, day,
                ["trade_date", "expiration", "strike", "option_type", "open_interest"])
+    oi = oi[oi["expiration"] >= oi["trade_date"]]          # expired contracts are not positions
     vol = _read(config.SPX_VOLUME_DIR, lo - timedelta(days=10), day - timedelta(days=1),
                 ["trade_date", "expiration", "strike", "option_type", "volume"])
     oi_days = sorted(oi["trade_date"].unique())
@@ -315,12 +317,13 @@ def reports(db: pd.DataFrame) -> None:
         q = x.quantile([0.05, 0.5, 0.95])
         print(f"{y:>6}{len(x):>6}{x.min():>10.4f}{q[0.05]:>10.4f}{q[0.5]:>10.4f}{q[0.95]:>10.4f}{x.max():>10.4f}")
 
-    section("Report: weighted_avg_dte, OI vs volume, median by year")
-    print(f"{'year':>6}{'dte_oi':>10}{'dte_vol':>10}")
+    section("Report: weighted_avg_dte, OI vs volume (volume rebased to the row date), median by year")
+    rb = F.vol_dte_rebased(db)
+    print(f"{'year':>6}{'dte_oi':>10}{'dte_vol':>10}{'vol_rebased':>13}")
     for y in sorted(year.unique()):
         m = year == y
         print(f"{y:>6}{db.loc[m, 'weighted_avg_dte_oi'].median():>10.2f}"
-              f"{db.loc[m, 'weighted_avg_dte_vol'].median():>10.2f}")
+              f"{db.loc[m, 'weighted_avg_dte_vol'].median():>10.2f}{rb[m].median():>13.2f}")
 
 
 # --- main --------------------------------------------------------------------------------
