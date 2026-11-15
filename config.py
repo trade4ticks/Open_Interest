@@ -95,3 +95,8 @@ SPX_OI_RAW_DIR      = Path(os.environ.get("SPX_OI_RAW_DIR",
 _default_spx_vol_dir = OI_RAW_DIR.parent / "spx_volume_eod"
 SPX_VOLUME_DIR       = Path(os.environ.get("SPX_VOLUME_DIR",
                                            str(_default_spx_vol_dir))).resolve()
+
+# Destination for the SPX OI / volume metric tables (build_spx_features.py).
+# A libpq connection string or postgresql:// URL. No default: the build refuses
+# to run without it rather than guess a database.
+SPX_FEATURES_DSN = os.environ.get("SPX_FEATURES_DSN")
