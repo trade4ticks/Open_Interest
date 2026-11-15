@@ -100,3 +100,7 @@ SPX_VOLUME_DIR       = Path(os.environ.get("SPX_VOLUME_DIR",
 # A libpq connection string or postgresql:// URL. No default: the build refuses
 # to run without it rather than guess a database.
 SPX_FEATURES_DSN = os.environ.get("SPX_FEATURES_DSN")
+
+# Read-only source of SPX 5-minute bar opens (public.index_ohlc.spx_open) for
+# table B. May be a different database from SPX_FEATURES_DSN. No default.
+SPX_INDEX_OHLC_DSN = os.environ.get("SPX_INDEX_OHLC_DSN")

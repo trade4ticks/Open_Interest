@@ -398,11 +398,19 @@ class TableA:
     split_events: dict = field(default_factory=dict)
     bad_split_factors: int = 0         # (root, trade_date) pairs whose factor is not 1.0
     notes: list = field(default_factory=list)
+    # keep_strikes=True only (table B): per-strike sums over both roots, all
+    # expirations and both types, for every spine row incl. lead-in.
+    #   strike_oi  [trade_date, strike, oi]      OI labelled trade_date
+    #   strike_vol [feature_date, strike, vol]   volume of the session BEFORE feature_date
+    strike_oi: pd.DataFrame | None = None
+    strike_vol: pd.DataFrame | None = None
 
 
 def compute_table_a(start: date, end: date, *, oi_store: Path, vol_store: Path,
-                    splits: dict[str, pd.DataFrame], memory_limit: str = "3GB") -> TableA:
-    """Compute table A for [start, end]. `splits` is {root: load_splits(...)}."""
+                    splits: dict[str, pd.DataFrame], memory_limit: str = "3GB",
+                    keep_strikes: bool = False) -> TableA:
+    """Compute table A for [start, end]. `splits` is {root: load_splits(...)}.
+    keep_strikes=True also returns per-strike OI / volume sums (table B)."""
     notes: list[str] = []
 
     # Cap at the last OI date both roots carry.
@@ -495,6 +503,18 @@ def compute_table_a(start: date, end: date, *, oi_store: Path, vol_store: Path,
 
     con.execute("CREATE TABLE levels AS " + LEVELS_SQL)
     full = con.execute(derivatives_sql("levels") + "\nORDER BY trade_date").df()
+    strike_oi = strike_vol = None
+    if keep_strikes:
+        # Same `oi` and `vol` views as every table A metric: split-adjusted OI,
+        # volume keyed by feature_date only. No trade_date on the volume side.
+        strike_oi = con.execute(
+            "SELECT trade_date, strike, SUM(open_interest)::DOUBLE AS oi FROM oi "
+            "GROUP BY trade_date, strike ORDER BY trade_date, strike").df()
+        strike_vol = con.execute(
+            "SELECT feature_date, strike, SUM(volume)::DOUBLE AS vol FROM vol "
+            "GROUP BY feature_date, strike ORDER BY feature_date, strike").df()
+        strike_oi["trade_date"] = pd.to_datetime(strike_oi["trade_date"]).dt.date
+        strike_vol["feature_date"] = pd.to_datetime(strike_vol["feature_date"]).dt.date
     con.close()
 
     full = full[COLUMNS_A + DIAGNOSTICS_A].copy()
@@ -510,7 +530,8 @@ def compute_table_a(start: date, end: date, *, oi_store: Path, vol_store: Path,
     res = TableA(frame=frame, full=full, start=start, end_requested=end, end_eff=end_eff,
                  lead_in_wanted=LEAD_IN_SESSIONS, lead_in_used=lead_in_used,
                  vol_first=vol_first, split_events=split_events,
-                 bad_split_factors=int(bad_sf), notes=notes)
+                 bad_split_factors=int(bad_sf), notes=notes,
+                 strike_oi=strike_oi, strike_vol=strike_vol)
     return res
 
 
