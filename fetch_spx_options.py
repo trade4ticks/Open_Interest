@@ -4,7 +4,6 @@ the SPX and SPXW index-option roots.
 
     python fetch_spx_options.py fetch --start 20200102 --end 20201231
     python fetch_spx_options.py fetch --start 20200102 --end 20201231 --data oi
-    python fetch_spx_options.py fetch --start 20261030 --end 20261030 --data oi --oi-snapshot-today
     python fetch_spx_options.py probe --date 20261026          # endpoint check, writes nothing
 
 Then: python verify_spx_fetch.py --start ... --end ...
@@ -73,7 +72,6 @@ import pyarrow.parquet as pq
 
 import config
 import fetch_oi
-import fetch_oi_snapshot
 import lib.parquet_store as oi_store
 import lib.spx_volume_store as vol_store
 from lib.market_hours import get_trading_days, last_trading_day
@@ -102,8 +100,6 @@ VOL_TIMEOUT = 120
 # The EOD report is generated ~17:15 ET; before that the current session's
 # request is refused (HTTP 400).
 EOD_READY_ET = dtime(17, 30)
-# OI for T is published ~06:30 ET on T.
-OI_READY_ET = dtime(7, 0)
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -253,8 +249,9 @@ def cmd_fetch(args) -> int:
     print(f"  SPX_VOLUME_DIR : {config.SPX_VOLUME_DIR}")
     print(f"  (production OI_RAW_DIR {_PROD_OI_RAW_DIR} is not written)")
 
-    # OI history for today's date is refused by the wildcard endpoint; today's
-    # OI comes only from --oi-snapshot-today.
+    # OI history for today's date is refused by the wildcard endpoint. Today's
+    # OI comes only from run_spx_pipeline.py --tier PREOPEN, which writes the
+    # snapshot only after lib.spx_oi_freshness says it is today's publication.
     oi_end = min(args.end, last_trading_day(t_et - timedelta(days=1)))
     vol_end = min(args.end, last_trading_day(t_et))
     if vol_end == t_et and now_et.time() < EOD_READY_ET:
@@ -281,20 +278,6 @@ def cmd_fetch(args) -> int:
                 print(f"--- OI {root} {month[0]:%Y-%m} ({len(month)} days) ---")
                 _assert_oi_target(root)
                 fetched[("oi", root)] += fetch_oi.fetch_ticker(root, month)
-
-    if "oi" in args.data and args.oi_snapshot_today:
-        if last_trading_day(t_et) != t_et or now_et.time() < OI_READY_ET:
-            print(f"--oi-snapshot-today skipped: {t_et} is not a trading day or "
-                  f"it is before {OI_READY_ET:%H:%M} ET")
-        elif args.start <= t_et <= args.end:
-            for root in args.roots:
-                print(f"--- OI {root} snapshot, trade_date {t_et} ---")
-                _assert_oi_target(root)
-                n = fetch_oi_snapshot.fetch_ticker(root, t_et)
-                fetched[("oi", root)] += n
-                requested[("oi", root)] = requested.get(("oi", root), []) + [t_et]
-        else:
-            print(f"--oi-snapshot-today skipped: {t_et} is outside --start/--end")
 
     if "volume" in args.data:
         days = get_trading_days(args.start, vol_end) if vol_end >= args.start else []
@@ -403,9 +386,6 @@ def main() -> int:
                    type=lambda s: [x.strip() for x in s.split(",") if x.strip()])
     f.add_argument("--roots", default=",".join(config.SPX_ROOTS),
                    type=lambda s: [x.strip().upper() for x in s.split(",") if x.strip()])
-    f.add_argument("--oi-snapshot-today", action="store_true",
-                   help="also capture today's OI from the snapshot endpoint "
-                        "(the history endpoint has no row for today yet)")
 
     pr = sub.add_parser("probe", help="print raw endpoint fields for one day; writes nothing")
     pr.add_argument("--date", type=_parse_day, required=True)
