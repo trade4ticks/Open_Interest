@@ -245,7 +245,8 @@ def cmd_fetch(args) -> int:
     now_et = datetime.now(_ET)
     t_et = today_et()
 
-    print("=== SPX / SPXW fetch ===")
+    print(f"=== SPX / SPXW fetch  {now_et:%Y-%m-%d %H:%M:%S} ET  "
+          f"[{args.start} → {args.end}] ===")
     print(f"  roots          : {', '.join(args.roots)}")
     print(f"  data           : {', '.join(args.data)}")
     print(f"  SPX_OI_RAW_DIR : {config.SPX_OI_RAW_DIR}")
