@@ -310,6 +310,18 @@ LEFT JOIN vol_agg   v ON v.feature_date = s.trade_date
 """
 
 
+def zscore_sql(m: str, w: str = "w60") -> str:
+    """The z-score expression every SPX table uses (table A, the price
+    tables): COUNT(x) >= 60 gate, AVG / STDDEV_SAMP, NULLIF denominator.
+    `w` names a window of the last Z_WINDOW rows inclusive (W60_SQL)."""
+    return (f"CASE WHEN COUNT({m}) OVER {w} >= {Z_WINDOW}"
+            f" THEN ({m} - AVG({m}) OVER {w}) / NULLIF(STDDEV_SAMP({m}) OVER {w}, 0)"
+            f" ELSE NULL END AS zscore_{m}_3m")
+
+
+W60_SQL = f"w60 AS (ORDER BY trade_date ROWS BETWEEN {Z_WINDOW - 1} PRECEDING AND CURRENT ROW)"
+
+
 def derivatives_sql(source: str = "levels") -> str:
     """d1 / d5 / 60-session z over the calendar spine. Same z construction as
     build_features: COUNT(x) >= 60 gate, STDDEV_SAMP, NULLIF denominator."""
@@ -322,12 +334,10 @@ def derivatives_sql(source: str = "levels") -> str:
         else:
             for n in (1, 5):
                 cols.append(f"{m} - LAG({m}, {n}) OVER w AS d{n}_{m}_change")
-        cols.append(f"CASE WHEN COUNT({m}) OVER w60 >= {Z_WINDOW}"
-                    f" THEN ({m} - AVG({m}) OVER w60) / NULLIF(STDDEV_SAMP({m}) OVER w60, 0)"
-                    f" ELSE NULL END AS zscore_{m}_3m")
+        cols.append(zscore_sql(m))
     return (f"SELECT *,\n       " + ",\n       ".join(cols) + f"\nFROM {source}\n"
             f"WINDOW w AS (ORDER BY trade_date),\n"
-            f"       w60 AS (ORDER BY trade_date ROWS BETWEEN {Z_WINDOW - 1} PRECEDING AND CURRENT ROW)")
+            f"       {W60_SQL}")
 
 
 # --- Reading -----------------------------------------------------------------
