@@ -141,9 +141,9 @@ def _adx_by_segments(H, L, C, n=P.ADX_N):
     return out
 
 
-def independent_levels(before: date, raw: pd.DataFrame | None = None):
-    """Levels for every row up to and including row `before`, from bars strictly
-    earlier. Returns (row dates, {metric: [values]}, ohlc sessions)."""
+def daily_series(before: date, raw: pd.DataFrame | None = None):
+    """(sessions with their bar times, H, L, C) for every session from the seed
+    to the one before `before`, from bars strictly earlier; None = unknown."""
     raw = _bars_independent(before) if raw is None else raw
     px = {}
     for r in raw.itertuples(index=False):
@@ -159,6 +159,13 @@ def independent_levels(before: date, raw: pd.DataFrame | None = None):
         H.append(max(hs) if hs else None)
         L.append(min(ls) if ls else None)
         C.append(rows[-1][3])
+    return sched, H, L, C
+
+
+def independent_levels(before: date, raw: pd.DataFrame | None = None):
+    """Levels for every row up to and including row `before`, from bars strictly
+    earlier. Returns (row dates, {metric: [values]}, ohlc sessions)."""
+    sched, H, L, C = daily_series(before, raw)
     m = len(C)
     R = [None] + [math.log(C[j] / C[j - 1]) if None not in (C[j], C[j - 1]) else None for j in range(1, m)]
     ma20 = [_mean(C[j - 19:j + 1]) if j >= 19 else None for j in range(m)]
@@ -234,9 +241,9 @@ def check_recompute(db: pd.DataFrame, day: date, chk: F.Checker) -> None:
 
 # --- reports -------------------------------------------------------------------------------
 
-def reports(db: pd.DataFrame) -> None:
+def reports(db: pd.DataFrame, cols: list[str] | None = None) -> None:
     year = pd.to_datetime(db["trade_date"]).dt.year
-    cols = P.COLUMNS_PD[2:]
+    cols = cols or P.COLUMNS_PD[2:]
     section("Report: min / median / max / NULLs by year (every column)")
     print(f"{'column':<34}{'year':>6}{'min':>14}{'median':>14}{'max':>14}{'nulls':>7}{'rows':>6}")
     for c in cols:

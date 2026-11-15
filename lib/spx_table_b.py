@@ -96,7 +96,8 @@ _DIV_SPOT = {
     "max_oi_strike_put_div_spot": "max_oi_strike_put",
 }
 
-# Intra-session gaps measured by the user (spec §7.1). Anything else is NEW.
+# Intra-session gaps measured by the user (spec §7.1; 2024-05-30 and 2026-08-14 added 2026-11-15
+# after the daily OHLC report). Anything else is labelled NEW, and should be rare enough to look at.
 KNOWN_GAPS = {
     date(2020, 3, 9): "COVID circuit breaker",
     date(2020, 3, 12): "COVID circuit breaker",
@@ -104,6 +105,8 @@ KNOWN_GAPS = {
     date(2020, 3, 18): "COVID circuit breaker",
     date(2019, 6, 14): "known, unexplained",
     date(2019, 8, 13): "known, unexplained",
+    date(2024, 5, 30): "known, unexplained",
+    date(2026, 8, 14): "known, unexplained",
 }
 CIRCUIT_BREAKERS = {d for d, why in KNOWN_GAPS.items() if "circuit" in why}
 
@@ -293,18 +296,23 @@ def compute_table_b(start: date, end: date, *, oi_store, vol_store,
                   table_a=A, spot_df=spot_df, total_mismatch=mismatch, notes=notes)
 
 
-def _derivatives(lv: pd.DataFrame) -> pd.DataFrame:
-    con = duckdb.connect(database=":memory:")
-    con.register("lv_df", lv)
-    con.execute("CREATE TABLE lv AS SELECT * REPLACE (CAST(trade_date AS DATE) AS trade_date, "
-                "CAST(quote_time AS TIME) AS quote_time) FROM lv_df")
+def same_bar_derivatives_sql(spec: dict, known: str = "spot") -> str:
+    """Same-bar-of-day derivatives over table `lv` (trade_date, quote_time,
+    sess_n = calendar session ordinal, `known` = the bar's price, NULL when
+    unknown, plus each metric). spec = {metric: kinds}, kinds from
+    ("d1", "d5", "z"):
+      d1 / d5: minus the same quote_time 1 / 5 sessions earlier (NULL if absent)
+      z: over the last 60 rows at that quote_time whose `known` is not NULL,
+         lib.spx_features.zscore_sql (COUNT >= 60, STDDEV_SAMP, NULLIF)."""
     dcols, zcols = [], []
-    for m in CORE_B:
-        dcols.append(f"c.{m} - p1.{m} AS d1_{m}_change")
-        dcols.append(f"c.{m} - p5.{m} AS d5_{m}_change")
-        zcols.append(f"CASE WHEN COUNT({m}) OVER w >= {Z_WINDOW} THEN ({m} - AVG({m}) OVER w)"
-                     f" / NULLIF(STDDEV_SAMP({m}) OVER w, 0) ELSE NULL END AS zscore_{m}_3m")
-    sql = f"""
+    for m, kinds in spec.items():
+        if "d1" in kinds:
+            dcols.append(f"c.{m} - p1.{m} AS d1_{m}_change")
+        if "d5" in kinds:
+            dcols.append(f"c.{m} - p5.{m} AS d5_{m}_change")
+        if "z" in kinds:
+            zcols.append(F.zscore_sql(m, "w"))
+    return f"""
     WITH d AS (
         SELECT c.*, {", ".join(dcols)}
         FROM lv c
@@ -314,15 +322,26 @@ def _derivatives(lv: pd.DataFrame) -> pd.DataFrame:
     z AS (
         SELECT trade_date, quote_time, {", ".join(zcols)}
         FROM lv
-        WHERE spot IS NOT NULL
+        WHERE {known} IS NOT NULL
         WINDOW w AS (PARTITION BY quote_time ORDER BY trade_date
                      ROWS BETWEEN {Z_WINDOW - 1} PRECEDING AND CURRENT ROW)
     )
     SELECT * FROM d LEFT JOIN z USING (trade_date, quote_time)
     """
-    out = con.execute(sql).df()
+
+
+def run_same_bar_derivatives(lv: pd.DataFrame, spec: dict, known: str = "spot") -> pd.DataFrame:
+    con = duckdb.connect(database=":memory:")
+    con.register("lv_df", lv)
+    con.execute("CREATE TABLE lv AS SELECT * REPLACE (CAST(trade_date AS DATE) AS trade_date, "
+                "CAST(quote_time AS TIME) AS quote_time) FROM lv_df")
+    out = con.execute(same_bar_derivatives_sql(spec, known)).df()
     con.close()
     return out
+
+
+def _derivatives(lv: pd.DataFrame) -> pd.DataFrame:
+    return run_same_bar_derivatives(lv, {m: ("d1", "d5", "z") for m in CORE_B})
 
 
 # --- Checks & reports ------------------------------------------------------------
@@ -444,7 +463,7 @@ def spot_report(grid: pd.DataFrame, spot_df: pd.DataFrame, sessions: list[date])
     if len(bad):
         print("  sessions with bars of unknown spot:")
         for d, g in bad.groupby("trade_date"):
-            label = KNOWN_GAPS.get(d, "NEW — not one of the six measured gaps")
+            label = KNOWN_GAPS.get(d, "NEW — not one of the measured gaps")
             if d not in KNOWN_GAPS:
                 new.append(d)
             times = "; ".join(f"{why}: {_ranges(list(gg['quote_time']))}"
