@@ -108,10 +108,14 @@ class Mock:
         return df.assign(trade_date=today)
 
 
-def run(script, dry=False):
+SPOT = 6000.0
+
+
+def run(script, dry=False, close=(SPOT, "")):
     builds = []
     mock = Mock(script)
     real = R._spx
+    R._prev_close = lambda day: close
 
     def patched():
         c, fs, store, fr, vs, _, _ = real()
@@ -199,6 +203,17 @@ def measurement_tests() -> None:
         ok((st["identical_share"] == 1.0).all() and (st["contracts"] > 0).all(),
            f"{root}: the stale day joins on the front and scores 100%")
 
+    print("\n--measure-freshness report runs end to end (index_ohlc mocked)")
+    import lib.spx_price as P
+    orig = (P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN)
+    P.load_ohlc = lambda dsn, lo, hi: pd.DataFrame()
+    P.daily_ohlc = lambda bars, ss: pd.DataFrame({"trade_date": ss, "close": 6000.0})
+    config.SPX_INDEX_OHLC_DSN = "mocked"
+    try:
+        ok(R.measure_freshness(0, date(2026, 11, 14), 100) == 0, "report completes")
+    finally:
+        P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN = orig
+
     # The front comes from T-1's chain, not the arriving one: an arriving chain that lacks
     # T's expiry entirely (as a stale chain would, where T-1's expiry stands in) scores 0
     # contracts on the front rather than switching to its own nearest expiration.
@@ -214,17 +229,6 @@ def measurement_tests() -> None:
     fa = m[(m["variant"] == "front_all") & (m["trade_date"] == d2)]
     ok(fa.empty or ((fa["front"] == d2).all() and (fa["contracts"] == 0).all()),
        "front fixed by the T-1 chain: no fallback to the arriving chain's nearest expiry")
-
-    print("\n--measure-freshness report runs end to end (index_ohlc mocked)")
-    import lib.spx_price as P
-    orig = (P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN)
-    P.load_ohlc = lambda dsn, lo, hi: pd.DataFrame()
-    P.daily_ohlc = lambda bars, ss: pd.DataFrame({"trade_date": ss, "close": 6000.0})
-    config.SPX_INDEX_OHLC_DSN = "mocked"
-    try:
-        ok(R.measure_freshness(0, date(2026, 11, 14), 100) == 0, "report completes")
-    finally:
-        P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN = orig
 
 
 def main() -> int:
@@ -256,7 +260,7 @@ def main() -> int:
         ok(len(back) == len(fresh[r]), f"{r}: {len(back):,} rows labelled {TODAY} in the store")
     ok(len(builds) == 1 and builds[0][0].endswith("build_spx_features.py") and builds[0][-1] == "20261117",
        f"spx_oi_daily built through today: {builds[0][1:] if builds else None}")
-    v = FR.assess("SPXW", fresh["SPXW"], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV)
+    v = FR.assess("SPXW", fresh["SPXW"], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
     ok(0.4 < v.identical_share < 0.7, f"fresh identical share {v.identical_share:.1%} (calibrated 40-60%)")
 
     print("\ntruncated snapshot")
@@ -264,6 +268,39 @@ def main() -> int:
     cut = {r: evolve(ch[r][1], TODAY).sample(frac=0.3, random_state=1) for r in ch}
     rc, builds, n = run([cut])
     ok(rc == 1 and today_rows("SPXW").empty, "30% of the chain -> shared count out of band, nothing written")
+
+    print("\nthe spot dependency is loud: no T-1 close -> fail, nothing requested or written")
+    ch = reset_store()
+    rc, builds, n = run([{r: evolve(ch[r][1], TODAY) for r in ch}], close=(None, "index_ohlc has no usable close"))
+    ok(rc == 1 and n == 0 and not builds and today_rows("SPX").empty and today_rows("SPXW").empty,
+       "exit 1 before any snapshot request; nothing written; no spot-free fallback")
+    try:
+        FR.assess("SPXW", ch["SPXW"][1], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, None)
+        raised = False
+    except ValueError:
+        raised = True
+    ok(raised, "assess() refuses to score without a spot")
+
+    print("\nfront_5pct: front from the stored T-1 chain, strikes within 5% of the T-1 close")
+    v = FR.assess("SPXW", fresh["SPXW"], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
+    exp_n = 2 * int(sum(abs(k / SPOT - 1) <= 0.05 for k in np.arange(5000, 7000, 25.0)))
+    ok(v.front == TODAY and v.front_contracts == exp_n,
+       f"SPXW front = {v.front} (T itself), scored on {v.front_contracts} contracts (expected {exp_n})")
+    vs = FR.assess("SPX", ch["SPX"][1], ch["SPX"][1], ch["SPX"][0], TODAY, PREV, SPOT)
+    ok(not vs.fresh and vs.identical_share == 1.0 and "STALE" in vs.reason,
+       f"a stale SPX chain scores 100% on its front ({vs.front}, {vs.front_contracts} contracts): refused")
+    ok(FR.STALE_IDENTICAL_SHARE == 0.70, "one threshold, 70%, both roots")
+
+    print("\nfront-contract floor")
+    ch = reset_store()
+    fr_spx = evolve(ch["SPX"][1], TODAY)
+    w = evolve(ch["SPXW"][1], TODAY)
+    no_front = w[w["expiration"] != TODAY]                 # the arriving SPXW chain lacks T's expiry
+    v = FR.assess("SPXW", no_front, ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
+    ok(not v.fresh and v.front == TODAY and v.front_contracts == 0 and "too few" in v.reason,
+       f"front taken from T-1's chain, not the arriving one; 0 contracts -> refused ({v.reason[:60]}...)")
+    rc, builds, n = run([{"SPX": fr_spx, "SPXW": no_front}])
+    ok(rc == 1 and today_rows("SPX").empty and today_rows("SPXW").empty, "neither root written")
 
     print("\none root stale, the other fresh")
     ch = reset_store()

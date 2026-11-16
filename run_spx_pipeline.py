@@ -176,6 +176,25 @@ def _spx():
     return config, FS, oi_store, FR, vol_store, fetch_oi_snapshot, test_connection
 
 
+def _prev_close(day: date) -> tuple[float | None, str]:
+    """The close of session `day` from index_ohlc — the last grid bar's spx_close,
+    exactly as the price tables derive it. (close, '') or (None, why)."""
+    import config
+    import lib.spx_price as P
+    if not config.SPX_INDEX_OHLC_DSN:
+        return None, "SPX_INDEX_OHLC_DSN is not set"
+    try:
+        bars = P.load_ohlc(config.SPX_INDEX_OHLC_DSN, day, day)
+    except Exception as exc:
+        return None, f"index_ohlc could not be read: {exc}"
+    d = P.daily_ohlc(bars, [day]).iloc[0]
+    c = d["close"]
+    if c is None or c != c:                                  # None or NaN
+        return None, (f"index_ohlc has no usable close for {day}: the session's last grid bar has no "
+                      f"positive spx_close ({len(bars)} index_ohlc rows that day, {int(d['n_bars'])} grid bars)")
+    return float(c), ""
+
+
 def _volume_present(vol_store, root: str, day: date) -> bool:
     df = vol_store.read_year(root, day.year)
     return not df.empty and (df["trade_date"] == day).any()
@@ -226,6 +245,16 @@ def run_preopen(today: date, dry_run: bool) -> int:
                   "yesterday. Nothing fetched, nothing written.", "; ".join(missing))
         return 1
 
+    # 0b. The freshness test needs T-1's close. No close, no test, no write — and no
+    #     fallback to a spot-free comparison: a missing close must be found out about.
+    spot, why = _prev_close(prev)
+    if spot is None:
+        log.error("PREOPEN cannot run: no spot for the freshness test. %s. index_ohlc is filled by the "
+                  "/Thetadata_Raw_SPX pipeline; the close of %s must be there before today's OI can be "
+                  "checked. Nothing fetched, nothing written; spx_oi_daily has no row for %s.", why, prev, today)
+        return 1
+    log.info("  spot for the freshness test: %s close %.2f (index_ohlc)", prev, spot)
+
     # 1. Poll until fresh.
     if not test_connection():
         log.error("ThetaData terminal not reachable at start; will keep trying on schedule")
@@ -236,14 +265,16 @@ def run_preopen(today: date, dry_run: bool) -> int:
         log.info("PREOPEN snapshot attempt %d/%d", attempt, attempts)
         try:
             got = {r: _snapshot(r, today, fetch_oi_snapshot, FR) for r in config.SPX_ROOTS}
-            verdicts = [FR.assess(r, got[r], prev_chain[r], prev2_chain[r], today, prev) for r in config.SPX_ROOTS]
+            verdicts = [FR.assess(r, got[r], prev_chain[r], prev2_chain[r], today, prev, spot)
+                        for r in config.SPX_ROOTS]
         except Exception as exc:                      # transport / terminal errors: retry
             log.warning("  snapshot request failed: %s", exc)
             got, verdicts = None, []
         for v in verdicts:
             (log.info if v.fresh else log.warning)(
-                "  %-5s %s  [rows %s, shared %s vs yesterday's %s, identical %.1f%%]", v.root, v.reason,
-                f"{v.rows:,}", f"{v.shared:,}", f"{v.ref_shared:,}", 100 * v.identical_share)
+                "  %-5s %s  [rows %s; front %s, %d contracts, identical %.1f%%; all-alive shared %s vs "
+                "yesterday's %s]", v.root, v.reason, f"{v.rows:,}", v.front, v.front_contracts,
+                100 * v.identical_share, f"{v.shared:,}", f"{v.ref_shared:,}")
         if verdicts and all(v.fresh for v in verdicts):
             snaps = got
             break
@@ -353,6 +384,28 @@ def measure_freshness(n_days: int, today: date, min_contracts: int) -> int:
             if len(v):
                 log.info("    %-15s %s", k, ", ".join(f"{d} {s:.1%} (n={c:,})" for d, s, c in
                                                      zip(v["trade_date"], v["identical_share"], v["contracts"])))
+        # The live test's two sanity checks, against the full history.
+        prev_map = {sessions[i]: sessions[i - 1] for i in range(1, len(sessions))}
+        a = m[m["variant"] == "a_all"].set_index("trade_date")["contracts"]
+        pairs = [(d, a[d] / a[prev_map[d]]) for d in a.index if prev_map.get(d) in a.index and a[prev_map[d]] > 0]
+        if pairs:
+            r = pd.Series([x for _, x in pairs], index=[d for d, _ in pairs])
+            q = r.quantile([0.0, 0.01, 0.05, 0.5, 0.95, 0.99, 1.0]).to_numpy()
+            lo, hi = FR.SHARED_BAND
+            log.info("  truncation check — all-alive shared count, today's pair / yesterday's pair (%d ratios):", len(r))
+            log.info("    min %.3f  p01 %.3f  p05 %.3f  median %.3f  p95 %.3f  p99 %.3f  max %.3f", *q)
+            log.info("    lowest : %s", ", ".join(f"{d} {x:.3f}" for d, x in r.nsmallest(5).items()))
+            log.info("    highest: %s", ", ".join(f"{d} {x:.3f}" for d, x in r.nlargest(5).items()))
+            out = int(((r < lo) | (r > hi)).sum())
+            log.info("    the provisional band %.2f-%.2f would have refused %d fresh day(s)%s", lo, hi, out,
+                     (": " + ", ".join(str(d) for d in r[(r < lo) | (r > hi)].index[:10])) if out else "")
+        f5 = m[m["variant"] == "front_5pct"].set_index("trade_date")["contracts"]
+        low = f5[f5 < FR.FRONT_MIN_CONTRACTS]
+        log.info("  front-contract floor — front_5pct contracts: min %d, p01 %d, p05 %d; the provisional floor %d "
+                 "would have refused %d fresh day(s)%s", f5.min(), int(f5.quantile(0.01)), int(f5.quantile(0.05)),
+                 FR.FRONT_MIN_CONTRACTS, len(low), (": " + ", ".join(f"{d} ({n})" for d, n in low.items())[:400])
+                 if len(low) else "")
+        log.info("    fewest: %s", ", ".join(f"{d} {n}" for d, n in f5.nsmallest(5).items()))
         sk = m[(m["contracts"] < min_contracts)]
         if len(sk):
             log.info("  skipped pairs by variant and year (< %d contracts):", min_contracts)

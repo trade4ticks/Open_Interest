@@ -3,27 +3,40 @@ lib/spx_oi_freshness.py — is a same-day SPX/SPXW OI snapshot today's
 publication, or still yesterday's? The pre-open tier of run_spx_pipeline.py
 writes a snapshot only when this says fresh.
 
-THE TEST (the user's rule, measured on the VPS)
------------------------------------------------
-Join the snapshot to the stored T-1 chain on (expiration, strike,
-option_type) and take the share of shared contracts whose open_interest is
-identical. Across 52 consecutive SPXW day pairs from 2026-09-01 that share
-ran 40.6% - 60.4% (median 55.5%), on 12,900 - 14,500 shared contracts a day.
-A stale snapshot IS the T-1 chain, so it scores ~100%.
+THE TEST — front_5pct, the user's choice from the full-history measurement
+--------------------------------------------------------------------------
+Compare the snapshot with the stored T-1 chain on ONE expiration and the
+strikes near the money:
 
-    identical share > STALE_IDENTICAL_SHARE (0.85)      -> stale, do not write
-    shared count outside SHARED_BAND x yesterday's      -> malformed / truncated, do not write
+    front  = the nearest expiration >= T in the STORED T-1 chain (never taken
+             from the arriving snapshot: a stale chain's own front is
+             yesterday's expiry, a different contract set)
+    strikes within FRONT_MONEYNESS (5%) of spot, spot = the close of the
+             session before T from index_ohlc (the last grid bar's close)
 
-"Yesterday's" shared count is the same join between the stored T-1 and T-2
-chains, so a truncated response cannot pass on a small sample.
+and take the share of those contracts whose open_interest is identical on both
+sides. Near-the-money strikes in the front expiration trade every day, so on a
+fresh chain their OI moves; a stale snapshot IS the T-1 chain and scores 100%.
 
-Only contracts still alive on the day are compared (expiration >= that day):
-the snapshot endpoint keeps yesterday's expiries for a while (vendor purge
-lag, ~75% of Tue-Fri in the 120-ticker store) while the history files mostly
-do not, and those contracts would sit in the join with frozen, identical OI.
-Zero OI is excluded on both sides; neither endpoint parser keeps it anyway.
+Measured on the stored history, 2019-2026, worst fresh day (2019-10-10, a
+genuine vendor duplicate, excluded): SPX 46.1% (contracts min 65, p05 116,
+median 172); SPXW 35.3% (min 35, p05 107, median 162). One threshold for both
+roots:
 
-No clock time appears anywhere: content is the only gate.
+    front identical share > STALE_IDENTICAL_SHARE (70%)        -> stale, do not write
+    front contracts < FRONT_MIN_CONTRACTS                       -> too few to score, do not write
+    all-alive shared count outside SHARED_BAND x yesterday's    -> truncated / malformed, do not write
+
+"Yesterday's" shared count is the same all-alive join between the stored T-1
+and T-2 chains. SHARED_BAND and FRONT_MIN_CONTRACTS are provisional until set
+from the full-history distribution --measure-freshness reports.
+
+The spot dependency is deliberate and must be LOUD: with no index_ohlc close
+for the session before T the pre-open job fails and writes nothing. There is
+no fallback to a spot-free variant.
+
+Only contracts alive on the day with OI > 0 are compared. No clock time
+appears anywhere: content is the only gate.
 
 Store schema: {SPX_OI_RAW_DIR}/{ROOT}/{YEAR}.parquet with columns trade_date,
 expiration, strike, option_type, open_interest. Root is the directory.
@@ -37,8 +50,10 @@ from pathlib import Path
 
 import pandas as pd
 
-STALE_IDENTICAL_SHARE = 0.85
-SHARED_BAND = (0.80, 1.25)
+STALE_IDENTICAL_SHARE = 0.70      # one threshold, both roots (user, from the measurement)
+FRONT_MONEYNESS = 0.05            # strikes within 5% of the T-1 close
+FRONT_MIN_CONTRACTS = 30          # provisional: below the fewest any fresh day had (SPXW 35)
+SHARED_BAND = (0.80, 1.25)        # provisional: set from --measure-freshness's day-over-day ratios
 KEYS = ["expiration", "strike", "option_type"]
 COLS = ["trade_date", "expiration", "strike", "option_type", "open_interest"]
 
@@ -75,13 +90,32 @@ class Overlap:
         return self.identical / self.shared if self.shared else math.nan
 
 
-def overlap(new: pd.DataFrame, old: pd.DataFrame, alive_on: date) -> Overlap:
-    """Contracts alive on `alive_on` with OI > 0 in both chains."""
+def _join(new: pd.DataFrame, old: pd.DataFrame, keep) -> Overlap:
     def live(df):
         df = normalise(df)
-        return df[(df["expiration"] >= alive_on) & (df["open_interest"] > 0)][KEYS + ["open_interest"]]
+        df = df[(df["open_interest"] > 0) & keep(df)]
+        return df[KEYS + ["open_interest"]]
     m = live(new).merge(live(old), on=KEYS, suffixes=("_new", "_old"))
     return Overlap(shared=len(m), identical=int((m["open_interest_new"] == m["open_interest_old"]).sum()))
+
+
+def overlap(new: pd.DataFrame, old: pd.DataFrame, alive_on: date) -> Overlap:
+    """Contracts alive on `alive_on` with OI > 0 in both chains."""
+    return _join(new, old, lambda df: df["expiration"] >= alive_on)
+
+
+def front_expiration(prev_chain: pd.DataFrame, today: date) -> date | None:
+    """The nearest expiration >= today in the STORED T-1 chain (OI > 0)."""
+    c = normalise(prev_chain)
+    c = c[(c["expiration"] >= today) & (c["open_interest"] > 0)]
+    return None if c.empty else min(c["expiration"])
+
+
+def front_overlap(new: pd.DataFrame, old: pd.DataFrame, front: date, spot: float,
+                  moneyness: float = FRONT_MONEYNESS) -> Overlap:
+    """Contracts of expiration `front` with |strike / spot - 1| <= moneyness, OI > 0 on both sides."""
+    return _join(new, old, lambda df: (df["expiration"] == front)
+                 & ((df["strike"] / spot - 1.0).abs() <= moneyness))
 
 
 @dataclass
@@ -90,31 +124,49 @@ class Verdict:
     fresh: bool
     reason: str
     rows: int
-    shared: int
-    identical_share: float
-    ref_shared: int
+    shared: int                 # all-alive shared contracts (the truncation check)
+    ref_shared: int             # the same join for T-2 -> T-1
+    front: date | None
+    front_contracts: int        # what the score is computed from
+    identical_share: float      # THE score: front, within 5% of spot
 
 
 def assess(root: str, snap: pd.DataFrame, prev_chain: pd.DataFrame, prev2_chain: pd.DataFrame,
-           today: date, prev_day: date) -> Verdict:
-    """snap = today's snapshot; prev_chain / prev2_chain = stored T-1 / T-2 chains."""
+           today: date, prev_day: date, spot: float) -> Verdict:
+    """snap = today's snapshot; prev_chain / prev2_chain = stored T-1 / T-2 chains;
+    spot = the close of the session before today (index_ohlc). The caller must
+    have failed already if spot is unknown — this never runs without it."""
+    if spot is None or not (spot > 0):
+        raise ValueError(f"assess() needs the T-1 close; got {spot!r}")
+    front = front_expiration(prev_chain, today)
+    v = dict(root=root, rows=len(snap), shared=0, ref_shared=0, front=front, front_contracts=0,
+             identical_share=math.nan)
     if snap.empty:
-        return Verdict(root, False, "empty snapshot", 0, 0, math.nan, 0)
+        return Verdict(fresh=False, reason="empty snapshot", **v)
     now = overlap(snap, prev_chain, alive_on=today)
     ref = overlap(prev_chain, prev2_chain, alive_on=prev_day)
-    lo, hi = SHARED_BAND[0] * ref.shared, SHARED_BAND[1] * ref.shared
-    v = dict(root=root, rows=len(snap), shared=now.shared, identical_share=now.share, ref_shared=ref.shared)
+    v.update(shared=now.shared, ref_shared=ref.shared)
     if ref.shared == 0:
         return Verdict(fresh=False, reason="no reference: stored T-1 and T-2 chains share no contracts", **v)
+    lo, hi = SHARED_BAND[0] * ref.shared, SHARED_BAND[1] * ref.shared
     if not lo <= now.shared <= hi:
         return Verdict(fresh=False, reason=f"shared count {now.shared:,} outside {SHARED_BAND[0]:.2f}-"
                                            f"{SHARED_BAND[1]:.2f} x yesterday's {ref.shared:,} "
                                            f"(truncated or malformed response?)", **v)
-    if now.share > STALE_IDENTICAL_SHARE:
-        return Verdict(fresh=False, reason=f"STALE: {now.share:.1%} of shared contracts carry T-1's exact OI "
+    if front is None:
+        return Verdict(fresh=False, reason=f"the stored T-1 chain has no expiration on or after {today}", **v)
+    fo = front_overlap(snap, prev_chain, front, spot)
+    v.update(front_contracts=fo.shared, identical_share=fo.share)
+    if fo.shared < FRONT_MIN_CONTRACTS:
+        return Verdict(fresh=False, reason=f"only {fo.shared} front-expiration contracts ({front}) within "
+                                           f"{FRONT_MONEYNESS:.0%} of {spot:,.2f} on both sides "
+                                           f"(< {FRONT_MIN_CONTRACTS}); too few to score", **v)
+    if fo.share > STALE_IDENTICAL_SHARE:
+        return Verdict(fresh=False, reason=f"STALE: {fo.share:.1%} of {fo.shared} front contracts ({front}, "
+                                           f"within {FRONT_MONEYNESS:.0%} of spot) carry T-1's exact OI "
                                            f"(> {STALE_IDENTICAL_SHARE:.0%})", **v)
-    return Verdict(fresh=True, reason=f"fresh: {now.share:.1%} identical to T-1 "
-                                      f"(<= {STALE_IDENTICAL_SHARE:.0%})", **v)
+    return Verdict(fresh=True, reason=f"fresh: {fo.share:.1%} of {fo.shared} front contracts ({front}) "
+                                      f"identical to T-1 (<= {STALE_IDENTICAL_SHARE:.0%})", **v)
 
 
 def measure(store: Path, root: str, days: list[date]) -> pd.DataFrame:
