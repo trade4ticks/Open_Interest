@@ -28,8 +28,16 @@ roots:
     all-alive shared count outside SHARED_BAND x yesterday's    -> truncated / malformed, do not write
 
 "Yesterday's" shared count is the same all-alive join between the stored T-1
-and T-2 chains. SHARED_BAND and FRONT_MIN_CONTRACTS are provisional until set
-from the full-history distribution --measure-freshness reports.
+and T-2 chains. Both sanity values were set by the user from the full-history
+distribution --measure-freshness reports (neither refused a fresh day in seven
+years at its earlier, tighter setting):
+
+    SHARED_BAND floor 0.70: SPX's lowest ratios, 0.827-0.843, all fall on the
+        first session after monthly opex, when an expiry rolls out of the shared
+        set; a real truncation reads near 0.5. Ceiling 1.25.
+    FRONT_MIN_CONTRACTS 20: SPXW's fewest was 35, on the stress days the data
+        matters most (March 2020, 2022-06-14, 2025-04-07). At 20 contracts a
+        stale verdict still needs 14 frozen, against a worst fresh score of 35%.
 
 The spot dependency is deliberate and must be LOUD: with no index_ohlc close
 for the session before T the pre-open job fails and writes nothing. There is
@@ -52,8 +60,8 @@ import pandas as pd
 
 STALE_IDENTICAL_SHARE = 0.70      # one threshold, both roots (user, from the measurement)
 FRONT_MONEYNESS = 0.05            # strikes within 5% of the T-1 close
-FRONT_MIN_CONTRACTS = 30          # provisional: below the fewest any fresh day had (SPXW 35)
-SHARED_BAND = (0.80, 1.25)        # provisional: set from --measure-freshness's day-over-day ratios
+FRONT_MIN_CONTRACTS = 20          # user, from the measurement (fewest fresh: SPXW 35, on stress days)
+SHARED_BAND = (0.70, 1.25)        # user, from the measurement (lowest fresh: SPX 0.827, post-opex roll-off)
 KEYS = ["expiration", "strike", "option_type"]
 COLS = ["trade_date", "expiration", "strike", "option_type", "open_interest"]
 

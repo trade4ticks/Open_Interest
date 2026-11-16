@@ -397,11 +397,11 @@ def measure_freshness(n_days: int, today: date, min_contracts: int) -> int:
             log.info("    lowest : %s", ", ".join(f"{d} {x:.3f}" for d, x in r.nsmallest(5).items()))
             log.info("    highest: %s", ", ".join(f"{d} {x:.3f}" for d, x in r.nlargest(5).items()))
             out = int(((r < lo) | (r > hi)).sum())
-            log.info("    the provisional band %.2f-%.2f would have refused %d fresh day(s)%s", lo, hi, out,
+            log.info("    the band %.2f-%.2f would have refused %d fresh day(s)%s", lo, hi, out,
                      (": " + ", ".join(str(d) for d in r[(r < lo) | (r > hi)].index[:10])) if out else "")
         f5 = m[m["variant"] == "front_5pct"].set_index("trade_date")["contracts"]
         low = f5[f5 < FR.FRONT_MIN_CONTRACTS]
-        log.info("  front-contract floor — front_5pct contracts: min %d, p01 %d, p05 %d; the provisional floor %d "
+        log.info("  front-contract floor — front_5pct contracts: min %d, p01 %d, p05 %d; the floor %d "
                  "would have refused %d fresh day(s)%s", f5.min(), int(f5.quantile(0.01)), int(f5.quantile(0.05)),
                  FR.FRONT_MIN_CONTRACTS, len(low), (": " + ", ".join(f"{d} ({n})" for d, n in low.items())[:400])
                  if len(low) else "")
