@@ -128,3 +128,90 @@ def measure(store: Path, root: str, days: list[date]) -> pd.DataFrame:
         o = overlap(chains[b], chains[a], alive_on=b)
         rows.append({"day": b, "prev": a, "shared": o.shared, "identical_share": o.share})
     return pd.DataFrame(rows)
+
+
+# --- Measurement over the full history, by contract subset (read-only) -----------------
+#
+# The FRONT EXPIRATION of a day pair (T-1 -> T) is the nearest expiration >= T in
+# the STORED T-1 chain: the contracts still alive on T, chosen without looking at
+# the newer chain. A stale chain's own front is yesterday's expiry, a different
+# contract set, so selecting from the arriving chain would join on almost nothing
+# exactly when it matters. Both sides are then compared on that one expiration.
+# Moneyness is against the close of the session before T (index_ohlc), which no
+# stage of the morning run produces. Nothing here reads the volume store.
+
+VARIANTS = {
+    "a_all":       "TRUE",                                   # baseline: the current test
+    "front_1pct":  "is_front AND ABS(mny) <= 0.01",
+    "front_2pct":  "is_front AND ABS(mny) <= 0.02",
+    "front_5pct":  "is_front AND ABS(mny) <= 0.05",
+    "front_all":   "is_front",                               # no spot needed
+}
+
+
+def measure_variants(store: Path, root: str, spot: pd.DataFrame, sessions: list[date],
+                     memory_limit: str = "3GB") -> pd.DataFrame:
+    """One row per (day T, variant): contracts scored and identical share, for every
+    stored day T whose predecessor in the store is the previous NYSE session.
+    Also returns the front expiration chosen for each pair (column `front`).
+    spot = [trade_date T, spot] with spot = the close of the session before T."""
+    import duckdb
+    files = sorted(p.as_posix() for p in (Path(store) / root.upper()).glob("*.parquet") if p.stem.isdigit())
+    if not files:
+        return pd.DataFrame()
+    prev_of = pd.DataFrame({"trade_date": sessions[1:], "prev_session": sessions[:-1]})
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(f"SET memory_limit = '{memory_limit}'")
+        con.register("prev_df", prev_of)
+        con.register("spot_df", spot)
+        flist = "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in files) + "]"
+        cols = ",\n".join(
+            f"COUNT(*) FILTER (WHERE {cond}) AS n__{k}, "
+            f"SUM(CASE WHEN same THEN 1 ELSE 0 END) FILTER (WHERE {cond}) AS same__{k}"
+            for k, cond in VARIANTS.items())
+        sql = f"""
+        WITH c AS (
+            SELECT trade_date, expiration, strike, option_type, open_interest
+            FROM read_parquet({flist}) WHERE open_interest > 0
+        ),
+        days AS (
+            SELECT trade_date, LAG(trade_date) OVER (ORDER BY trade_date) AS prev
+            FROM (SELECT DISTINCT trade_date FROM c)
+        ),
+        fronts AS (
+            SELECT d.trade_date, MIN(o.expiration) AS front
+            FROM days d JOIN c o ON o.trade_date = d.prev AND o.expiration >= d.trade_date
+            GROUP BY d.trade_date
+        ),
+        j AS (
+            SELECT d.trade_date,
+                   (n.expiration - d.trade_date)            AS dte,
+                   n.strike / s.spot - 1.0                  AS mny,
+                   n.expiration = f.front                   AS is_front,
+                   n.open_interest = o.open_interest        AS same
+            FROM days d
+            JOIN prev_df p ON p.trade_date = CAST(d.trade_date AS DATE) AND p.prev_session = CAST(d.prev AS DATE)
+            JOIN spot_df s ON s.trade_date = CAST(d.trade_date AS DATE)
+            JOIN c n ON n.trade_date = d.trade_date AND n.expiration >= d.trade_date
+            JOIN fronts f ON f.trade_date = d.trade_date
+            JOIN c o ON o.trade_date = d.prev AND o.expiration = n.expiration
+                    AND o.strike = n.strike AND o.option_type = n.option_type
+        )
+        SELECT j.trade_date, ANY_VALUE(f.front) AS front, {cols}
+        FROM j JOIN fronts f USING (trade_date) GROUP BY j.trade_date ORDER BY j.trade_date
+        """
+        wide = con.execute(sql).df()
+        n_days = con.execute(f"SELECT COUNT(DISTINCT trade_date) - 1 FROM read_parquet({flist}) "
+                             f"WHERE open_interest > 0").fetchone()[0]
+    finally:
+        con.close()
+    rows = []
+    for k in VARIANTS:
+        n = wide[f"n__{k}"].fillna(0).astype(int)
+        same = wide[f"same__{k}"].fillna(0)
+        rows.append(pd.DataFrame({"trade_date": pd.to_datetime(wide["trade_date"]).dt.date, "variant": k,
+                                  "front": pd.to_datetime(wide["front"]).dt.date, "contracts": n, "identical_share": (same / n.where(n > 0)).astype(float)}))
+    out = pd.concat(rows, ignore_index=True)
+    out.attrs["stored_pairs"] = int(n_days)
+    return out

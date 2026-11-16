@@ -285,24 +285,80 @@ def run_preopen(today: date, dry_run: bool) -> int:
     return _summary("PREOPEN", today, results, t0)
 
 
-def measure_freshness(n_days: int, today: date) -> int:
-    """Read-only: identical share / shared count over the last n stored day pairs, per root."""
-    config, FS, oi_store, FR, vol_store, *_ = _spx()
-    days = get_trading_days(today - timedelta(days=2 * n_days + 10), today - timedelta(days=1))[-(n_days + 1):]
+def measure_freshness(n_days: int, today: date, min_contracts: int) -> int:
+    """Read-only. Identical share between consecutive stored chains, per root and
+    per contract subset (lib.spx_oi_freshness.VARIANTS), over the full history
+    (n_days = 0) or the last n_days pairs. Moneyness uses the close of the session
+    before each day from index_ohlc; nothing reads the volume store."""
+    import config
+    import lib.spx_features as F
+    import lib.spx_oi_freshness as FR
+    import lib.spx_price as P
+    import pandas as pd
+    if not config.SPX_INDEX_OHLC_DSN:
+        log.error("SPX_INDEX_OHLC_DSN is not set: the moneyness variants need index_ohlc closes")
+        return 2
+    store = config.SPX_OI_RAW_DIR
+    firsts = [d for d in (F.store_first_date(store, r) for r in config.SPX_ROOTS) if d]
+    lasts = [d for d in (F.store_last_date(store, r) for r in config.SPX_ROOTS) if d]
+    if not firsts:
+        log.error("no stored SPX OI under %s", store)
+        return 2
+    first, last = min(firsts), max(lasts)
+    sessions = get_trading_days(first - timedelta(days=10), last)
+    bars = P.load_ohlc(config.SPX_INDEX_OHLC_DSN, sessions[0], last)
+    daily = P.daily_ohlc(bars, sessions)
+    pd_frame = daily[["trade_date", "close"]].copy()
+    pd_frame["trade_date"] = list(sessions[1:]) + [next_trading_day(sessions[-1])]   # close of T-1 -> row T
+    spot = pd_frame.rename(columns={"close": "spot"}).dropna()
+    log.info("#" * 72)
+    log.info("Freshness measurement: stored SPX OI %s → %s; spot = close of the session before T "
+             "(index_ohlc); %s; a pair is scored only with >= %d contracts in the subset",
+             first, last, "full history" if not n_days else f"last {n_days} pairs", min_contracts)
+    log.info("A stale snapshot IS the T-1 chain: it scores 100% on every variant. The margin is 100% minus "
+             "the highest score a fresh day reached. front = the nearest expiration >= T in the stored T-1 "
+             "chain, applied to both sides.")
     for root in config.SPX_ROOTS:
-        m = FR.measure(config.SPX_OI_RAW_DIR, root, days)
+        m = FR.measure_variants(store, root, spot, sessions)
         if m.empty:
-            log.info("%s: no stored day pairs", root)
+            log.info("%s: no stored chains", root)
             continue
-        s, c = m["identical_share"], m["shared"]
-        log.info("%s: %d day pairs %s → %s", root, len(m), m["day"].min(), m["day"].max())
-        log.info("  identical share  min %.2f%%  median %.2f%%  max %.2f%%   (stale threshold %.0f%%)",
-                 100 * s.min(), 100 * s.median(), 100 * s.max(), 100 * FR.STALE_IDENTICAL_SHARE)
-        log.info("  shared contracts min %s  median %s  max %s", f"{c.min():,}", f"{int(c.median()):,}", f"{c.max():,}")
-        ratio = (c / c.shift(1)).dropna()
-        if len(ratio):
-            log.info("  day-over-day shared ratio  min %.3f  max %.3f   (band %.2f-%.2f)",
-                     ratio.min(), ratio.max(), *FR.SHARED_BAND)
+        stored_pairs = m.attrs["stored_pairs"]
+        days = sorted(m["trade_date"].unique())
+        if n_days:
+            days = days[-n_days:]
+            m = m[m["trade_date"].isin(set(days))]
+        log.info("=" * 72)
+        log.info("%s: %d day pairs in the store; %d scorable (previous stored day is the previous NYSE "
+                 "session, and a T-1 close exists); %s", root, stored_pairs, len(days),
+                 f"{days[0]} → {days[-1]}" if days else "none")
+        log.info("  %-15s %7s %7s  %7s %7s %7s %7s %7s  %7s %7s %7s %7s", "variant", "scored", "skipped",
+                 "min", "p01", "median", "p99", "max", "n_min", "n_p05", "n_med", "n_max")
+        for k in FR.VARIANTS:
+            v = m[m["variant"] == k]
+            ok_ = v[v["contracts"] >= min_contracts]
+            skipped = len(v) - len(ok_)
+            if ok_.empty:
+                log.info("  %-15s %7d %7d  no day has %d contracts in this subset (median %d)", k, 0, skipped,
+                         min_contracts, int(v["contracts"].median()) if len(v) else 0)
+                continue
+            q = ok_["identical_share"].quantile([0.0, 0.01, 0.5, 0.99, 1.0]).to_numpy() * 100
+            n = ok_["contracts"]
+            log.info("  %-15s %7d %7d  %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%%  %7s %7s %7s %7s", k, len(ok_),
+                     skipped, *q, f"{n.min():,}", f"{int(n.quantile(0.05)):,}", f"{int(n.median()):,}",
+                     f"{n.max():,}")
+        log.info("  highest-scoring fresh days per variant (the ones a threshold must clear):")
+        for k in FR.VARIANTS:
+            v = m[(m["variant"] == k) & (m["contracts"] >= min_contracts)].nlargest(3, "identical_share")
+            if len(v):
+                log.info("    %-15s %s", k, ", ".join(f"{d} {s:.1%} (n={c:,})" for d, s, c in
+                                                     zip(v["trade_date"], v["identical_share"], v["contracts"])))
+        sk = m[(m["contracts"] < min_contracts)]
+        if len(sk):
+            log.info("  skipped pairs by variant and year (< %d contracts):", min_contracts)
+            tab = sk.assign(year=pd.to_datetime(sk["trade_date"]).dt.year).groupby(["variant", "year"]).size()
+            for (k, y), c in tab.items():
+                log.info("    %-15s %d  %d", k, y, c)
     return 0
 
 
@@ -314,15 +370,18 @@ def main() -> int:
     ap.add_argument("--today", type=lambda s: datetime.strptime(s, "%Y%m%d").date(),
                     help="pretend today is this date (YYYYMMDD); EARLY --dry-run only")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--measure-freshness", type=int, metavar="DAYS",
-                    help="calibrate the freshness test on the last DAYS stored day pairs; read-only")
+    ap.add_argument("--measure-freshness", type=int, nargs="?", const=0, metavar="DAYS",
+                    help="read-only: identical share per root and contract subset over the full history "
+                         "(or the last DAYS pairs)")
+    ap.add_argument("--min-contracts", type=int, default=1,
+                    help="--measure-freshness: fewest contracts a subset needs for a pair to be scored")
     args = ap.parse_args()
 
     today = args.today or date.today()
-    if args.today and not (args.tier == "EARLY" and args.dry_run) and not args.measure_freshness:
+    if args.today and not (args.tier == "EARLY" and args.dry_run) and args.measure_freshness is None:
         ap.error("--today is only for EARLY --dry-run (PREOPEN fetches the live snapshot, which is always today's)")
-    if args.measure_freshness:
-        return measure_freshness(args.measure_freshness, today)
+    if args.measure_freshness is not None:
+        return measure_freshness(args.measure_freshness, today, args.min_contracts)
     log.info("#" * 72)
     log.info("SPX pipeline starting (tier = %s, today = %s)%s", args.tier, today, "  DRY RUN" if args.dry_run else "")
     return run_early(today, args.dry_run) if args.tier == "EARLY" else run_preopen(today, args.dry_run)

@@ -130,6 +130,103 @@ def today_rows(root):
     return FR.stored_chain(config.SPX_OI_RAW_DIR, root, TODAY)
 
 
+def third_fridays(after: date, n: int) -> list[date]:
+    out, y, mth = [], after.year, after.month
+    while len(out) < n:
+        first = date(y, mth, 1)
+        fri = first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+        if fri >= after:
+            out.append(fri)
+        y, mth = (y + 1, 1) if mth == 12 else (y, mth + 1)
+    return out
+
+
+def measurement_tests() -> None:
+    """lib.spx_oi_freshness.measure_variants and the --measure-freshness report on a synthetic store."""
+    print("\nmeasure_variants: full history, by contract subset")
+    shutil.rmtree(TMP, ignore_errors=True)
+    FS._redirect_oi_store()
+    sess = get_trading_days(date(2026, 9, 1), date(2026, 11, 13))
+    stale_day, gap_day = sess[20], sess[35]
+    strikes = np.arange(5000, 7025, 25.0)
+    chains = {"SPX": None, "SPXW": None}
+    for d in sess:
+        for root in chains:
+            exps = ([e for e in sess if e >= d][:10] + [d + timedelta(days=k) for k in (45, 90, 180)]
+                    if root == "SPXW" else third_fridays(d, 3))
+            prev = chains[root]
+            fresh = pd.DataFrame([(d, e, k, t, int(RNG.integers(1, 5000))) for e in exps for k in strikes
+                                  for t in ("C", "P")], columns=FR.COLS)
+            if prev is not None:
+                carried = prev.assign(trade_date=d)
+                carried = carried[carried["expiration"] >= d]
+                keyed = fresh.merge(carried, on=FR.KEYS, how="left", suffixes=("", "_old"))
+                keep = keyed["open_interest_old"].notna() & (RNG.random(len(keyed)) >= 0.45)
+                keyed.loc[keep, "open_interest"] = keyed.loc[keep, "open_interest_old"].astype(int)
+                fresh = keyed[FR.COLS]
+            if d == stale_day:
+                fresh = prev.assign(trade_date=d)                  # yesterday's chain, relabelled
+            chains[root] = FR.normalise(fresh)
+            if d != gap_day:
+                oi_store.write_rows(root, chains[root])
+    spot = pd.DataFrame({"trade_date": sess, "spot": 6000.0})
+    for root in ("SPXW", "SPX"):
+        m = FR.measure_variants(config.SPX_OI_RAW_DIR, root, spot, sess)
+        a = m[m["variant"] == "a_all"].set_index("trade_date")
+        ok(a.loc[stale_day, "identical_share"] == 1.0, f"{root}: the planted stale day scores 100% (a_all)")
+        st = m[(m["trade_date"] == stale_day) & (m["contracts"] > 0)]
+        ok((st["identical_share"] == 1.0).all(), f"{root}: ... and 100% on every variant with contracts")
+        normal = a.drop(index=stale_day)["identical_share"]
+        ok(normal.between(0.45, 0.65).all(), f"{root}: fresh days {normal.min():.1%} - {normal.max():.1%}")
+        ok(gap_day not in a.index and sess[36] not in a.index,
+           f"{root}: the missing session and the day after it (2-session gap) are not scored")
+    # Front = nearest expiration >= T in the STORED T-1 chain. Strike grid 5000..7000 step 25,
+    # spot 6000: +/-1% -> 5 strikes, +/-2% -> 9, +/-5% -> 25, both types.
+    for root in ("SPXW", "SPX"):
+        m = FR.measure_variants(config.SPX_OI_RAW_DIR, root, spot, sess)
+        exp_n = {f"front_{x}pct": 2 * int(sum(abs(k / 6000.0 - 1.0) <= x / 100 for k in strikes)) for x in (1, 2, 5)}
+        exp_n["front_all"] = 2 * len(strikes)
+        for k, n in exp_n.items():
+            v = m[(m["variant"] == k) & (m["trade_date"] != stale_day)]
+            ok((v["contracts"] == n).all(), f"{root} {k}: {n} contracts every scored day")
+        f = m[m["variant"] == "front_all"].drop_duplicates("trade_date")
+        if root == "SPXW":
+            ok((f["front"] == f["trade_date"]).all(), "SPXW: the front is T itself (an expiry every session)")
+        else:
+            ok(all(f0 == third_fridays(d, 1)[0] for d, f0 in zip(f["trade_date"], f["front"])),
+               "SPX: the front is the next third Friday on or after T")
+        st = m[(m["trade_date"] == stale_day) & m["variant"].str.startswith("front")]
+        ok((st["identical_share"] == 1.0).all() and (st["contracts"] > 0).all(),
+           f"{root}: the stale day joins on the front and scores 100%")
+
+    # The front comes from T-1's chain, not the arriving one: an arriving chain that lacks
+    # T's expiry entirely (as a stale chain would, where T-1's expiry stands in) scores 0
+    # contracts on the front rather than switching to its own nearest expiration.
+    shutil.rmtree(TMP, ignore_errors=True)
+    FS._redirect_oi_store()
+    d1, d2 = sess[40], sess[41]
+    old = FR.normalise(pd.DataFrame([(d1, e, k, t, 100) for e in (d1, d2, d2 + timedelta(days=7))
+                                     for k in strikes for t in ("C", "P")], columns=FR.COLS))
+    new = old[old["expiration"] != d2].assign(trade_date=d2)       # no row at T's own expiry
+    oi_store.write_rows("SPXW", old)
+    oi_store.write_rows("SPXW", new)
+    m = FR.measure_variants(config.SPX_OI_RAW_DIR, "SPXW", spot, sess)
+    fa = m[(m["variant"] == "front_all") & (m["trade_date"] == d2)]
+    ok(fa.empty or ((fa["front"] == d2).all() and (fa["contracts"] == 0).all()),
+       "front fixed by the T-1 chain: no fallback to the arriving chain's nearest expiry")
+
+    print("\n--measure-freshness report runs end to end (index_ohlc mocked)")
+    import lib.spx_price as P
+    orig = (P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN)
+    P.load_ohlc = lambda dsn, lo, hi: pd.DataFrame()
+    P.daily_ohlc = lambda bars, ss: pd.DataFrame({"trade_date": ss, "close": 6000.0})
+    config.SPX_INDEX_OHLC_DSN = "mocked"
+    try:
+        ok(R.measure_freshness(0, date(2026, 11, 14), 100) == 0, "report completes")
+    finally:
+        P.load_ohlc, P.daily_ohlc, config.SPX_INDEX_OHLC_DSN = orig
+
+
 def main() -> int:
     print("dependency on the EARLY run")
     reset_store(with_prev=False)
@@ -182,6 +279,8 @@ def main() -> int:
     print("\nmeasure on stored pairs")
     m = FR.measure(config.SPX_OI_RAW_DIR, "SPXW", [PREV2, PREV])
     ok(len(m) == 1 and 0.4 < m["identical_share"].iloc[0] < 0.7, f"SPXW pair share {m['identical_share'].iloc[0]:.1%}")
+
+    measurement_tests()
 
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURE(S)'}")
