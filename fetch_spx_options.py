@@ -250,7 +250,7 @@ def cmd_fetch(args) -> int:
     print(f"  (production OI_RAW_DIR {_PROD_OI_RAW_DIR} is not written)")
 
     # OI history for today's date is refused by the wildcard endpoint. Today's
-    # OI comes only from run_spx_pipeline.py --tier PREOPEN, which writes the
+    # OI comes only from run_spx_pipeline.py (its snapshot stage), which writes the
     # snapshot only after lib.spx_oi_freshness says it is today's publication.
     oi_end = min(args.end, last_trading_day(t_et - timedelta(days=1)))
     vol_end = min(args.end, last_trading_day(t_et))

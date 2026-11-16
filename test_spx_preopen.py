@@ -1,14 +1,18 @@
 """
-test_spx_preopen.py — run_spx_pipeline.py --tier PREOPEN offline: temporary
-SPX stores, the snapshot endpoint mocked, the build stage stubbed, no waiting.
+test_spx_preopen.py — run_spx_pipeline.py offline (the single daily run):
+temporary SPX stores, the snapshot endpoint mocked, the subprocess stages
+(fetch and the four builds) stubbed, no waiting.
 
-Covers: the EARLY-run dependency (missing T-1 chain / T-1 volume fails with
-nothing written); a stale snapshot (yesterday's chain) is refused on every
-attempt and nothing is written; stale-then-fresh writes on the fresh attempt
-and builds spx_oi_daily through today; a truncated snapshot is refused; a fresh
-snapshot still carrying yesterday's expiries (vendor purge lag) passes; one
-root stale and one fresh writes neither; dry run writes nothing; the
-freshness measure on stored pairs.
+Covers: the history fetch runs once, before the first snapshot request, and
+the four builds run after the snapshot stage whatever it did; the T-1 chain
+stage 1 writes is what stage 2 compares against; inputs missing after the
+fetch, a missing T-1 close, a crash inside stage 2, a snapshot that never goes
+fresh: nothing written, exit 1, builds still run (spx_oi_daily through
+yesterday); stale-then-fresh writes today and builds spx_oi_daily through
+today; a holiday weekday skips only the snapshot; front_5pct (front from the
+stored T-1 chain), the 0.70-1.25 band and the 20-contract floor; one root
+stale and one fresh writes neither; --check-freshness writes nothing; the
+freshness measurements on stored pairs.
 
 Run:  python test_spx_preopen.py     (exit 1 on any failure)
 """
@@ -53,13 +57,18 @@ RNG = np.random.default_rng(3)
 
 
 def evolve(chain: pd.DataFrame, day: date, keep_expired: bool = False) -> pd.DataFrame:
-    """The next day's chain: ~45% of contracts change OI, today's expiry rolls in,
+    """The next day's chain: near-the-money contracts of the front expiration
+    (within 5% of 6000) trade every day and ~90% of them change OI, as the
+    front_5pct test assumes; ~45% of all others change. A new expiry rolls in;
     contracts expiring before `day` drop out unless keep_expired (purge lag)."""
     c = chain.copy()
     c["trade_date"] = day
     if not keep_expired:
         c = c[c["expiration"] >= day]
-    chg = RNG.random(len(c)) < 0.45
+    alive = c.loc[c["expiration"] >= day, "expiration"]
+    front = alive.min() if len(alive) else None
+    near = (c["expiration"] == front) & ((c["strike"] / 6000.0 - 1).abs() <= 0.05)
+    chg = RNG.random(len(c)) < np.where(near, 0.90, 0.45)
     c.loc[chg, "open_interest"] = c.loc[chg, "open_interest"] + RNG.integers(1, 500, chg.sum())
     new_exp = day + timedelta(days=30)
     add = pd.DataFrame({"trade_date": day, "expiration": new_exp,
@@ -97,13 +106,14 @@ def reset_store(with_prev=True, with_prev_vol=True):
 
 
 class Mock:
-    """Snapshot endpoint: per attempt, per root, a frame (or a callable)."""
-    def __init__(self, script):
-        self.script, self.calls = script, 0
+    """Snapshot endpoint: per attempt, per root, a frame."""
+    def __init__(self, script, events=None):
+        self.script, self.calls, self.events = script, 0, events if events is not None else []
 
     def __call__(self, root, today):
         attempt = self.calls // 2
         self.calls += 1
+        self.events.append("snapshot_request")
         df = self.script[min(attempt, len(self.script) - 1)][root]
         return df.assign(trade_date=today)
 
@@ -111,23 +121,42 @@ class Mock:
 SPOT = 6000.0
 
 
-def run(script, dry=False, close=(SPOT, "")):
-    builds = []
-    mock = Mock(script)
+def run(script, close=(SPOT, ""), today=TODAY, fetch_writes=None, check_only=False, crash=False):
+    """Drive run_spx_pipeline.run_daily (or run_snapshot(check_only)) with the
+    subprocess stages stubbed and the snapshot endpoint mocked. Returns a dict:
+    rc, stages [(name, argv)], attempts, events (order of fetch / snapshot calls)."""
+    events, stages = [], []
+    mock = Mock(script, events)
     real = R._spx
-    R._prev_close = lambda day: close
 
     def patched():
         c, fs, store, fr, vs, _, _ = real()
         return c, fs, store, fr, vs, mock, (lambda: True)
+
+    def stage(i, n, name, argv, what):
+        stages.append((name, argv))
+        events.append(name)
+        if name == "fetch" and fetch_writes:
+            fetch_writes()
+        return 0, 0.0
+
+    def close_fn(day):
+        if crash:
+            raise RuntimeError("boom")
+        return close
     R._spx = patched
-    R.run_stage = lambda i, n, name, argv, what: (builds.append(argv) or (0, 0.0))
-    R.time.sleep = lambda s: None
+    R._prev_close = close_fn
+    R.run_stage = stage
+    R.time.sleep = lambda sec: None
     try:
-        rc = R.run_preopen(TODAY, dry)
+        rc = R.run_snapshot(today, check_only=True)[0] if check_only else R.run_daily(today)
     finally:
         R._spx = real
-    return rc, builds, mock.calls // 2
+    return {"rc": rc, "stages": stages, "attempts": mock.calls // 2, "events": events}
+
+
+def build_ends(res) -> dict:
+    return {name: argv[-1] for name, argv in res["stages"] if name != "fetch"}
 
 
 def today_rows(root):
@@ -232,48 +261,63 @@ def measurement_tests() -> None:
 
 
 def main() -> int:
-    print("dependency on the EARLY run")
-    reset_store(with_prev=False)
-    rc, builds, n = run([{}])
-    ok(rc == 1 and n == 0 and not builds and today_rows("SPXW").empty,
-       "T-1 chain missing -> exit 1, no snapshot requested, nothing written")
-    reset_store(with_prev_vol=False)
-    rc, builds, n = run([{}])
-    ok(rc == 1 and n == 0 and today_rows("SPX").empty, "T-1 volume missing -> exit 1, nothing requested")
+    YD = "20261116"                                   # yesterday, L
+    TD = "20261117"                                   # today
 
-    print("\nstale every attempt")
-    ch = reset_store()
-    stale = {r: ch[r][1] for r in ch}                       # yesterday's chain, as the endpoint would serve it
-    rc, builds, n = run([stale])
-    ok(rc == 1 and n == R.POLL_ATTEMPTS and not builds and today_rows("SPXW").empty,
-       f"refused on all {R.POLL_ATTEMPTS} attempts, nothing written, no build")
-
-    print("\nstale, stale, then fresh (fresh SPXW keeps yesterday's expiries: purge lag)")
+    print("one run: fetch once, then the snapshot, then all four builds")
     ch = reset_store()
     stale = {r: ch[r][1] for r in ch}
     fresh = {r: evolve(ch[r][1], TODAY, keep_expired=True) for r in ch}
     ok((fresh["SPXW"]["expiration"] < TODAY).any(), "the fresh SPXW snapshot carries contracts that expired yesterday")
-    rc, builds, n = run([stale, stale, fresh])
-    ok(rc == 0 and n == 3, f"written on attempt 3 (rc {rc}, attempts {n})")
+    res = run([stale, stale, fresh])
+    ok(res["rc"] == 0 and res["attempts"] == 3, f"written on attempt 3 (rc {res['rc']}, attempts {res['attempts']})")
+    ok(res["events"].count("fetch") == 1 and res["events"][0] == "fetch"
+       and res["events"].index("fetch") < res["events"].index("snapshot_request"),
+       "the history fetch runs once, before the first snapshot request, not on each retry")
+    ok([n for n, _ in res["stages"]] == ["fetch", "oi_daily", "oi_5min", "price_daily", "price_5min"]
+       and res["events"].index("oi_daily") > max(i for i, e in enumerate(res["events"]) if e == "snapshot_request"),
+       "builds after the snapshot stage, in order")
     for r in ch:
-        back = today_rows(r)
-        ok(len(back) == len(fresh[r]), f"{r}: {len(back):,} rows labelled {TODAY} in the store")
-    ok(len(builds) == 1 and builds[0][0].endswith("build_spx_features.py") and builds[0][-1] == "20261117",
-       f"spx_oi_daily built through today: {builds[0][1:] if builds else None}")
+        ok(len(today_rows(r)) == len(fresh[r]), f"{r}: {len(today_rows(r)):,} rows labelled {TODAY} in the store")
+    e = build_ends(res)
+    ok(e == {"oi_daily": TD, "oi_5min": YD, "price_daily": TD, "price_5min": YD},
+       f"oi_daily through today; oi_5min / price_5min through yesterday; price_daily through today: {e}")
     v = FR.assess("SPXW", fresh["SPXW"], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
-    ok(0.4 < v.identical_share < 0.7, f"fresh identical share {v.identical_share:.1%} (calibrated 40-60%)")
+    ok(v.fresh and v.identical_share < FR.STALE_IDENTICAL_SHARE,
+       f"the fresh chain scores {v.identical_share:.1%} on its front (< {FR.STALE_IDENTICAL_SHARE:.0%})")
 
-    print("\ntruncated snapshot")
-    ch = reset_store()
-    cut = {r: evolve(ch[r][1], TODAY).sample(frac=0.3, random_state=1) for r in ch}
-    rc, builds, n = run([cut])
-    ok(rc == 1 and today_rows("SPXW").empty, "30% of the chain -> shared count out of band, nothing written")
+    print("\nstep 1 is the dependency: the T-1 chain the fetch writes is what step 2 compares against")
+    ch = reset_store(with_prev=False)
+    res = run([{r: evolve(ch[r][1], TODAY) for r in ch}],
+              fetch_writes=lambda: [oi_store.write_rows(r, ch[r][1]) for r in ch])
+    ok(res["rc"] == 0 and len(today_rows("SPXW")) > 0, "T-1 chain absent before the run, written by stage 1, used by stage 2")
 
-    print("\nthe spot dependency is loud: no T-1 close -> fail, nothing requested or written")
+    print("\nstep 1 did not write what step 2 needs")
+    ch = reset_store(with_prev=False)
+    res = run([{}])
+    ok(res["rc"] == 1 and res["attempts"] == 0 and today_rows("SPXW").empty,
+       "T-1 chain missing after the fetch -> no snapshot request, nothing written, exit 1")
+    ok(build_ends(res) == {"oi_daily": YD, "oi_5min": YD, "price_daily": TD, "price_5min": YD},
+       "... and all four builds still ran (oi_daily through yesterday)")
+    reset_store(with_prev_vol=False)
+    res = run([{}])
+    ok(res["rc"] == 1 and res["attempts"] == 0 and len(res["stages"]) == 5, "T-1 volume missing -> same")
+
+    print("\nnever fresh: the late publication costs today's row only")
     ch = reset_store()
-    rc, builds, n = run([{r: evolve(ch[r][1], TODAY) for r in ch}], close=(None, "index_ohlc has no usable close"))
-    ok(rc == 1 and n == 0 and not builds and today_rows("SPX").empty and today_rows("SPXW").empty,
-       "exit 1 before any snapshot request; nothing written; no spot-free fallback")
+    res = run([{r: ch[r][1] for r in ch}])
+    ok(res["rc"] == 1 and res["attempts"] == R.POLL_ATTEMPTS and today_rows("SPXW").empty,
+       f"refused on all {R.POLL_ATTEMPTS} attempts, nothing written, exit 1")
+    ok(res["events"].count("fetch") == 1, "the fetch still ran exactly once")
+    ok(build_ends(res) == {"oi_daily": YD, "oi_5min": YD, "price_daily": TD, "price_5min": YD},
+       "all four builds ran and committed, oi_daily through yesterday")
+
+    print("\nthe spot dependency is loud")
+    ch = reset_store()
+    res = run([{r: evolve(ch[r][1], TODAY) for r in ch}], close=(None, "index_ohlc has no usable close"))
+    ok(res["rc"] == 1 and res["attempts"] == 0 and today_rows("SPX").empty and today_rows("SPXW").empty,
+       "no T-1 close -> no snapshot request, nothing written, exit 1; no spot-free fallback")
+    ok(len(res["stages"]) == 5, "... the builds still ran")
     try:
         FR.assess("SPXW", ch["SPXW"][1], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, None)
         raised = False
@@ -281,7 +325,25 @@ def main() -> int:
         raised = True
     ok(raised, "assess() refuses to score without a spot")
 
+    print("\na crash inside the snapshot stage does not take the builds down")
+    reset_store()
+    res = run([{}], crash=True)
+    ok(res["rc"] == 1 and len(res["stages"]) == 5, "stage 2 raised; logged as failed; builds ran")
+
+    print("\nholiday weekday: fetch and builds, no snapshot")
+    reset_store()
+    res = run([{}], today=date(2026, 11, 26))
+    ok(res["rc"] == 0 and res["attempts"] == 0 and [n for n, _ in res["stages"]][0] == "fetch"
+       and len(res["stages"]) == 5, "Thanksgiving: snapshot skipped (not a failure), everything else ran")
+
+    print("\ntruncated snapshot")
+    ch = reset_store()
+    res = run([{r: evolve(ch[r][1], TODAY).sample(frac=0.3, random_state=1) for r in ch}])
+    ok(res["rc"] == 1 and today_rows("SPXW").empty, "30% of the chain -> shared count out of band, nothing written")
+
     print("\nfront_5pct: front from the stored T-1 chain, strikes within 5% of the T-1 close")
+    ch = reset_store()
+    fresh = {r: evolve(ch[r][1], TODAY) for r in ch}
     v = FR.assess("SPXW", fresh["SPXW"], ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
     exp_n = 2 * int(sum(abs(k / SPOT - 1) <= 0.05 for k in np.arange(5000, 7000, 25.0)))
     ok(v.front == TODAY and v.front_contracts == exp_n,
@@ -289,29 +351,28 @@ def main() -> int:
     vs = FR.assess("SPX", ch["SPX"][1], ch["SPX"][1], ch["SPX"][0], TODAY, PREV, SPOT)
     ok(not vs.fresh and vs.identical_share == 1.0 and "STALE" in vs.reason,
        f"a stale SPX chain scores 100% on its front ({vs.front}, {vs.front_contracts} contracts): refused")
-    ok(FR.STALE_IDENTICAL_SHARE == 0.70, "one threshold, 70%, both roots")
+    ok(FR.STALE_IDENTICAL_SHARE == 0.70 and FR.SHARED_BAND == (0.70, 1.25) and FR.FRONT_MIN_CONTRACTS == 20,
+       "70% both roots; band 0.70-1.25; floor 20")
 
     print("\nfront-contract floor")
-    ch = reset_store()
-    fr_spx = evolve(ch["SPX"][1], TODAY)
-    w = evolve(ch["SPXW"][1], TODAY)
+    w = fresh["SPXW"]
     no_front = w[w["expiration"] != TODAY]                 # the arriving SPXW chain lacks T's expiry
     v = FR.assess("SPXW", no_front, ch["SPXW"][1], ch["SPXW"][0], TODAY, PREV, SPOT)
     ok(not v.fresh and v.front == TODAY and v.front_contracts == 0 and "too few" in v.reason,
-       f"front taken from T-1's chain, not the arriving one; 0 contracts -> refused ({v.reason[:60]}...)")
-    rc, builds, n = run([{"SPX": fr_spx, "SPXW": no_front}])
-    ok(rc == 1 and today_rows("SPX").empty and today_rows("SPXW").empty, "neither root written")
+       "front taken from T-1's chain, not the arriving one; 0 contracts -> refused")
+    res = run([{"SPX": fresh["SPX"], "SPXW": no_front}])
+    ok(res["rc"] == 1 and today_rows("SPX").empty and today_rows("SPXW").empty, "neither root written")
 
     print("\none root stale, the other fresh")
     ch = reset_store()
-    mixed = {"SPX": evolve(ch["SPX"][1], TODAY), "SPXW": ch["SPXW"][1]}
-    rc, builds, n = run([mixed])
-    ok(rc == 1 and today_rows("SPX").empty and today_rows("SPXW").empty, "neither root written")
+    res = run([{"SPX": evolve(ch["SPX"][1], TODAY), "SPXW": ch["SPXW"][1]}])
+    ok(res["rc"] == 1 and today_rows("SPX").empty and today_rows("SPXW").empty, "neither root written")
 
-    print("\ndry run")
+    print("\n--check-freshness")
     ch = reset_store()
-    rc, builds, n = run([{r: evolve(ch[r][1], TODAY) for r in ch}], dry=True)
-    ok(rc == 0 and n == 1 and not builds and today_rows("SPX").empty, "one assessment, nothing written or built")
+    res = run([{r: evolve(ch[r][1], TODAY) for r in ch}], check_only=True)
+    ok(res["rc"] == 0 and res["attempts"] == 1 and not res["stages"] and today_rows("SPX").empty,
+       "one assessment; no fetch, no write, no build")
 
     print("\nmeasure on stored pairs")
     m = FR.measure(config.SPX_OI_RAW_DIR, "SPXW", [PREV2, PREV])

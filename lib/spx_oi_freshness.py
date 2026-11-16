@@ -1,6 +1,6 @@
 """
 lib/spx_oi_freshness.py — is a same-day SPX/SPXW OI snapshot today's
-publication, or still yesterday's? The pre-open tier of run_spx_pipeline.py
+publication, or still yesterday's? The snapshot stage of run_spx_pipeline.py
 writes a snapshot only when this says fresh.
 
 THE TEST — front_5pct, the user's choice from the full-history measurement
