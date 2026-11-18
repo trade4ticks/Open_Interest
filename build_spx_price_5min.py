@@ -76,6 +76,9 @@ def main() -> int:
     p.add_argument("--start", type=_parse_day)
     p.add_argument("--end", type=_parse_day)
     p.add_argument("--dry-run", action="store_true", help="compute and check; write nothing")
+    p.add_argument("--brief", action="store_true",
+                   help="one-line spot summary instead of the full reports (the intraday job); "
+                        "compute, hard checks and write are unchanged")
     p.add_argument("--print-ddl", action="store_true", help="print the CREATE TABLE and exit")
     args = p.parse_args()
 
@@ -112,22 +115,30 @@ def main() -> int:
     print(f"  last complete session in index_ohlc: {res.data_last}")
     print(f"  computed in {_time.time() - t0:.1f}s")
 
-    print("\n--- daily OHLC report, every session from the seed (never fails the run) ---")
-    P.daily_ohlc_report(res.daily)
-    print("\n--- spot report, output sessions: P = spx_open (never fails the run) ---")
-    B.spot_report(res.grid, bars, sessions)
-    print("\n--- spec §4.1: bars outside the textbook range (expected; never clamped, never fails) ---")
-    P.textbook_report(df)
+    if args.brief:
+        print("  spot (--brief): " + B.brief_spot_line(res.grid))
+    else:
+        print("\n--- daily OHLC report, every session from the seed (never fails the run) ---")
+        P.daily_ohlc_report(res.daily)
+        print("\n--- spot report, output sessions: P = spx_open (never fails the run) ---")
+        B.spot_report(res.grid, bars, sessions)
+        print("\n--- spec §4.1: bars outside the textbook range (expected; never clamped, never fails) ---")
+        P.textbook_report(df)
 
     print("\n--- hard checks ---")
     chk = F.Checker()
     P.check_price_5min(df, sessions=sessions, chk=chk, full=res.full, daily=res.daily)
-    probe_days = sorted({sessions[0], sessions[len(sessions) // 2], sessions[-1]})
-    bad = P.lookahead_probe_5min(bars, probe_days, df)
-    chk.check(not bad, f"LOOKAHEAD probe: {', '.join(map(str, probe_days))} rebuilt from earlier sessions plus "
-                       f"only that day's spx_open through 12:00 (its high, low, close and later opens blanked); "
-                       f"every bar through 12:00 matches ({len(bad)} mismatch(es))"
-              + "".join(f"\n    {d} {q} {c}: built {a!r}, probe {b!r}" for d, q, c, a, b in bad[:10]))
+    if args.brief:
+        # Each probe day is a full recompute from the 2017 recursion seed (~5s): worth it in
+        # the morning rebuild, not 78 times a day. The ohlc_session LOOKAHEAD check above still runs.
+        print("  LOOKAHEAD probe skipped (--brief); the morning rebuild of this day runs it")
+    else:
+        probe_days = sorted({sessions[0], sessions[len(sessions) // 2], sessions[-1]})
+        bad = P.lookahead_probe_5min(bars, probe_days, df)
+        chk.check(not bad, f"LOOKAHEAD probe: {', '.join(map(str, probe_days))} rebuilt from earlier sessions "
+                           f"plus only that day's spx_open through 12:00 (its high, low, close and later opens "
+                           f"blanked); every bar through 12:00 matches ({len(bad)} mismatch(es))"
+                  + "".join(f"\n    {d} {q} {c}: built {a!r}, probe {b!r}" for d, q, c, a, b in bad[:10]))
 
     if chk.failed:
         print(f"\n{len(chk.failed)} hard check(s) FAILED — nothing written.")

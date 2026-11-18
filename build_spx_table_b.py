@@ -82,6 +82,9 @@ def main() -> int:
     p.add_argument("--start", type=_parse_day)
     p.add_argument("--end", type=_parse_day)
     p.add_argument("--dry-run", action="store_true", help="compute and check; write nothing")
+    p.add_argument("--brief", action="store_true",
+                   help="one-line spot summary instead of the full reports (the intraday job); "
+                        "compute, hard checks and write are unchanged")
     p.add_argument("--print-ddl", action="store_true", help="print the CREATE TABLE and exit")
     args = p.parse_args()
 
@@ -115,8 +118,11 @@ def main() -> int:
           f"before {res.start}: {res.lead_in_min_readings} (60 needed for its z-score)")
     print(f"  computed in {_time.time() - t0:.1f}s")
 
-    print("\n--- spot report (never fails the run) ---")
-    B.spot_report(res.grid, res.spot_df, sessions)
+    if args.brief:
+        print("  spot (--brief): " + B.brief_spot_line(res.grid))
+    else:
+        print("\n--- spot report (never fails the run) ---")
+        B.spot_report(res.grid, res.spot_df, sessions)
 
     print("\n--- hard checks ---")
     chk = F.Checker()

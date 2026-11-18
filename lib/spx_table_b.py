@@ -504,3 +504,19 @@ def spot_report(grid: pd.DataFrame, spot_df: pd.DataFrame, sessions: list[date])
     return {"unknown": int(len(bad)), "new_gap_sessions": new, "priced_off_day": len(off_day),
             "priced_off_hours": len(off_hours), "half_days": len(half),
             "truncated_days": [t[0] for t in trunc]}
+
+
+def brief_spot_line(grid: pd.DataFrame) -> str:
+    """The one-line spot summary the 5-minute builds print under --brief (the
+    intraday job parses it): bars by spot status, the last priced bar, and how
+    many bars before it are unknown — real gaps, as distinct from bars not
+    printed yet."""
+    st = grid["spot_status"].value_counts()
+    okq = grid.loc[grid["spot_status"] == "ok", "quote_time"]
+    if okq.empty:
+        tail = "priced through none; unknown before that: 0"
+    else:
+        last = okq.max()
+        gaps = int(((grid["spot_status"] != "ok") & (grid["quote_time"] < last)).sum())
+        tail = f"priced through {last:%H:%M}; unknown before that: {gaps}"
+    return ", ".join(f"{k} {v}" for k, v in st.items()) + "; " + tail
