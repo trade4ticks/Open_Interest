@@ -37,7 +37,16 @@ def ddl() -> str:
             "    family TEXT NOT NULL,\n"
             "    surfaced BOOLEAN NOT NULL,\n"
             "    built_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n"
+            "    form TEXT NOT NULL,\n"
+            "    base_column TEXT,\n"
+            "    units TEXT NOT NULL,\n"
+            "    formula TEXT NOT NULL,\n"
             "    PRIMARY KEY (table_name, metric)\n);")
+
+
+# The display fields added to an existing table: nullable on ADD (the table has rows), then
+# NOT NULL once this build's rows are in — same transaction, so a failure changes nothing.
+ADDED = [("form", True), ("base_column", False), ("units", True), ("formula", True)]
 
 
 def live_columns(dsn: str) -> dict:
@@ -54,11 +63,16 @@ def write(dsn: str, rows: list[dict]) -> int:
     with psycopg2.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(ddl())
+            for col, _ in ADDED:
+                cur.execute(f"ALTER TABLE {C.TABLE_C} ADD COLUMN IF NOT EXISTS {col} TEXT")
             cur.execute(f"DELETE FROM {C.TABLE_C} WHERE table_name = ANY(%s)", (list(C.TABLE_COLUMNS),))
             deleted = cur.rowcount
             psycopg2.extras.execute_values(
                 cur, f"INSERT INTO {C.TABLE_C} ({', '.join(C.CATALOG_COLUMNS)}) VALUES %s",
                 [tuple(r[c] for c in C.CATALOG_COLUMNS) for r in rows])
+            for col, required in ADDED:
+                if required:
+                    cur.execute(f"ALTER TABLE {C.TABLE_C} ALTER COLUMN {col} SET NOT NULL")
         conn.commit()
     print(f"  replaced {deleted} existing row(s)")
     return len(rows)
@@ -71,6 +85,8 @@ def summary(rows: list[dict]) -> None:
         for fam in sorted({f for tt, f, _ in cnt if tt == t}):
             print(f"  {t:<18}{fam:<16}{cnt[(t, fam, True)]:>9}{cnt[(t, fam, False)]:>13}")
     print(f"  total: {len(rows)} rows, {sum(r['surfaced'] for r in rows)} surfaced")
+    print("  form:  " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["form"] for r in rows).items())))
+    print("  units: " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(str(r["units"]) for r in rows).items())))
 
 
 def main() -> int:
@@ -91,7 +107,8 @@ def main() -> int:
     if args.list:
         for r in rows:
             print(f"\n  {r['table_name']}.{r['metric']}  [{r['family']}{'' if r['surfaced'] else ', NOT surfaced'}]"
-                  f"\n    {r['description']}")
+                  f"  form={r['form']} base={r['base_column']} units={r['units']}"
+                  f"\n    formula: {r['formula']}\n    {r['description']}")
 
     print("\n--- hard checks ---")
     chk = F.Checker()

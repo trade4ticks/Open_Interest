@@ -18,15 +18,29 @@ FAMILIES
   OI tables: oi, volume, cross (table A); oi_spot, volume_spot (table B).
   Price tables: price_trend, price_range, price_vol, price_momentum.
   Stored-only columns in all four tables: ingredient.
+
+DISPLAY FIELDS (read by the user's spx_analysis_dashboard, in its vocabulary)
+  form         level | chg_d | chg_1w | z, derived mechanically from the name
+               (form_and_base).
+  base_column  the level a chg_d / chg_1w / z column is derived from, NULL
+               for a level; always a metric of the same table.
+  units        one of UNITS. A change inherits its level's units, except
+               total_oi (a count) whose changes are percentages; every z-score
+               is z_score.
+  formula      the spec's formula text: OI spec §3.1 / §3.2 / §4.1, price spec
+               §3 / §4 (and §4.2 for rsi_14 / macd_hist); derivatives from §5.
 """
 from __future__ import annotations
+
+import re
 
 import lib.spx_features as F
 import lib.spx_price as P
 import lib.spx_table_b as B
 
 TABLE_C = "spx_metric_catalog"
-CATALOG_COLUMNS = ["metric", "table_name", "description", "family", "surfaced"]
+CATALOG_COLUMNS = ["metric", "table_name", "description", "family", "surfaced",
+                   "form", "base_column", "units", "formula"]
 
 FAMILIES_OI = {"oi", "volume", "cross", "oi_spot", "volume_spot", "ingredient"}
 FAMILIES_PRICE = {"price_trend", "price_range", "price_vol", "price_momentum", "ingredient"}
@@ -164,6 +178,167 @@ INGREDIENT_P5 = {
                "Ingredient of atr_normalized_ret_5d.",
 }
 
+# --- Display fields: form, base_column, units, formula ---------------------------------------------
+
+FORMS = ("level", "chg_d", "chg_1w", "z")
+# The dashboard's ten, plus pct / days / index_0_100 (added by the user for this catalog).
+UNITS = ("vol_decimal", "z_score", "slope", "ratio", "price", "log_return", "corr", "int", "date", "time",
+         "pct", "days", "index_0_100")
+
+
+def form_and_base(m: str) -> tuple[str, str | None]:
+    """The column name decides the form, mechanically."""
+    if m in ("d1_total_oi_pct_change", "d5_total_oi_pct_change"):
+        return ("chg_d" if m[1] == "1" else "chg_1w"), "total_oi"
+    g = re.fullmatch(r"d([15])_(.+)_change", m)
+    if g:
+        return ("chg_d" if g.group(1) == "1" else "chg_1w"), g.group(2)
+    g = re.fullmatch(r"zscore_(.+)_3m", m)
+    if g:
+        return "z", g.group(1)
+    return "level", None
+
+
+# Units of every level column (surfaced or not), by the user's list. Shares (pct_*) by rule below.
+UNITS_LEVEL = {
+    # pct: shares and price-relative fractions
+    "pct_up_days_20d": "pct", "donchian_pos_20d": "pct", "ma20_slope_5d": "pct", "macd_hist": "pct",
+    # ratio
+    "oi_put_call_ratio": "ratio", "oi_put_call_ratio_0_30d": "ratio", "vol_put_call_ratio": "ratio",
+    "vol_oi_ratio_all": "ratio", "vol_oi_ratio_call": "ratio", "vol_oi_ratio_put": "ratio",
+    "net_new_oi_div_vol": "ratio", "rv_ratio_5d_20d": "ratio", "atr_normalized_ret_5d": "ratio",
+    # days, 0-100 indexes, counters
+    "weighted_avg_dte_oi": "days", "weighted_avg_dte_vol": "days",
+    "rsi_14": "index_0_100", "adx_14": "index_0_100",
+    "streak": "int",
+    # stored-only: contract counts, and strikes / prices / ATR in index points
+    "total_oi": "int", "call_oi": "int", "put_oi": "int", "total_vol": "int", "call_vol": "int", "put_vol": "int",
+    "oi_weighted_all": "price", "oi_weighted_call": "price", "oi_weighted_put": "price",
+    "oi_weighted_all_0_30d": "price", "vol_weighted_all": "price", "vol_weighted_call": "price",
+    "vol_weighted_put": "price", "max_oi_strike_put": "price", "spot": "price", "atr_14d": "price",
+}
+
+
+def level_units(m: str) -> str | None:
+    if m in UNITS_LEVEL:
+        return UNITS_LEVEL[m]
+    if m.startswith("pct_"):                 # every pct_* share, pct_from_*
+        return "pct"
+    if m.endswith("_div_spot"):
+        return "ratio"
+    return None                              # a gap: fails the build
+
+
+def units_of(m: str) -> str | None:
+    form, base = form_and_base(m)
+    if form == "level":
+        return level_units(m)
+    if form == "z":
+        return "z_score"
+    if base == "total_oi":                   # a count whose changes are percentages
+        return "pct"
+    return level_units(base)
+
+
+# The specs' formula text. OI spec §3.1 (table A) and §3.2 (ingredients), §4.1 (table B);
+# price spec §3 (daily), §4 and §4.2 (5-minute). Backticks dropped; a definition the spec
+# gives under its table (DTE, front_exp, rv_n, log_ret, atr_14d, P) is appended where the
+# formula uses it.
+_DTE = "DTE = expiration − trade_date"
+_FRONT = "front_exp = MIN(expiration WHERE DTE ≥ 0), computed across both roots"
+_STRIKES = "strike concentration is computed per strike across both roots and all expirations"
+_LOGRET = "log_ret_t = LN(C_t / C_{t-1})"
+_P = "P = that bar's spx_open"
+_ATR = "atr_14d = mean(TR_t, t ∈ T-14..T-1), TR_t = MAX(H_t − L_t, |H_t − C_{t-1}|, |L_t − C_{t-1}|)"
+_ONE_STEP = "take the smoothed state as of T-1's close, frozen, and apply exactly one step using P as \"today's close\""
+
+FORMULA_LEVEL = {
+    # OI spec §3.1
+    "total_oi": "Σ(OI)",
+    "oi_put_call_ratio": "put_oi / call_oi",
+    "oi_put_call_ratio_0_30d": f"Σ(OI WHERE type='P' AND 0≤DTE≤30) / Σ(OI WHERE type='C' AND 0≤DTE≤30); {_DTE}",
+    "vol_put_call_ratio": "total_put_vol / total_call_vol",
+    "weighted_avg_dte_oi": f"Σ(DTE·OI) / Σ(OI); {_DTE}",
+    "weighted_avg_dte_vol": f"Σ(DTE·volume) / Σ(volume); {_DTE}",
+    "pct_oi_front_expiry": f"Σ(OI WHERE expiration = front_exp) / total_oi; {_FRONT}; {_DTE}",
+    "pct_vol_front_expiry": f"Σ(volume WHERE expiration = front_exp) / total_vol; {_FRONT}; {_DTE}",
+    "pct_oi_0_30d": f"Σ(OI WHERE 0≤DTE≤30) / total_oi; {_DTE}",
+    "pct_vol_0_30d": f"Σ(volume WHERE 0≤DTE≤30) / total_vol; {_DTE}",
+    "pct_oi_top5_strikes": f"Σ(OI of the 5 strikes with largest per-strike Σ OI) / total_oi; {_STRIKES}",
+    # the spec's cell reads "same, on volume"
+    "pct_vol_top5_strikes": f"Σ(volume of the 5 strikes with largest per-strike Σ volume) / total_vol; {_STRIKES}",
+    "pct_oi_spxw": "Σ(OI WHERE root='SPXW') / total_oi",
+    "pct_vol_spxw": "Σ(volume WHERE root='SPXW') / total_vol",
+    "vol_oi_ratio_all": "total_vol / total_oi",
+    "vol_oi_ratio_call": "total_call_vol / call_oi",
+    "vol_oi_ratio_put": "total_put_vol / put_oi",
+    "net_new_oi_div_vol": "d1_total_oi_change / total_vol",
+    # OI spec §3.2 (the weighted strikes are the spec's; the five counts follow its notation)
+    "call_oi": "Σ(OI WHERE type='C')",
+    "put_oi": "Σ(OI WHERE type='P')",
+    "total_vol": "Σ(volume)",
+    "call_vol": "Σ(volume WHERE type='C')",
+    "put_vol": "Σ(volume WHERE type='P')",
+    "oi_weighted_all": "Σ(strike·OI) / Σ(OI)",
+    "oi_weighted_call": "Σ(strike·OI WHERE type='C') / Σ(OI WHERE type='C')",
+    "oi_weighted_put": "Σ(strike·OI WHERE type='P') / Σ(OI WHERE type='P')",
+    "oi_weighted_all_0_30d": f"oi_weighted_all restricted to 0≤DTE≤30; {_DTE}",
+    "vol_weighted_all": "Σ(strike·volume) / Σ(volume)",
+    "vol_weighted_call": "Σ(strike·volume WHERE type='C') / Σ(volume WHERE type='C')",
+    "vol_weighted_put": "Σ(strike·volume WHERE type='P') / Σ(volume WHERE type='P')",
+    "max_oi_strike_put": "strike of the put with the largest per-strike Σ OI; ties resolve to the lowest strike",
+    # OI spec §4.1
+    "oi_weighted_all_div_spot": "oi_weighted_all / spot",
+    "oi_weighted_call_div_spot": "oi_weighted_call / spot",
+    "oi_weighted_put_div_spot": "oi_weighted_put / spot",
+    "oi_weighted_all_0_30d_div_spot": "oi_weighted_all_0_30d / spot",
+    "vol_weighted_all_div_spot": "vol_weighted_all / spot",
+    "vol_weighted_call_div_spot": "vol_weighted_call / spot",
+    "vol_weighted_put_div_spot": "vol_weighted_put / spot",
+    "max_oi_strike_put_div_spot": "max_oi_strike_put / spot",
+    "pct_oi_within_5pct": "Σ(OI WHERE |strike/spot − 1| ≤ 0.05) / total_oi",
+    "pct_vol_within_5pct": "Σ(volume WHERE |strike/spot − 1| ≤ 0.05) / total_vol",
+    "pct_oi_above_spot": "Σ(OI WHERE strike > spot) / total_oi",
+    "pct_vol_above_spot": "Σ(volume WHERE strike > spot) / total_vol",
+    # spot (tables B and 5-minute price): price spec §4, the definition table B shares
+    "spot": _P,
+    # price spec §3
+    "ma20_slope_5d": "mean(C, T-20..T-1) / mean(C, T-25..T-6) − 1",
+    "pct_up_days_20d": f"count(log_ret > 0 over T-20..T-1) / 20; {_LOGRET}",
+    "rv_ratio_5d_20d": ("rv_5d / rv_20d; rv_n = stdev(log_ret over the n sessions ending T-1) × √252, sample "
+                        f"standard deviation; {_LOGRET}"),
+    "adx_14": "Wilder's ADX over the 14 sessions ending T-1",
+    "streak": ("consecutive same-direction closes ending T-1; positive for up, negative for down, so +4 means "
+               "four straight up closes"),
+    # price spec §4
+    "pct_from_ma20": f"P / mean(C, T-20..T-1) − 1; {_P}",
+    "pct_from_ma50": f"P / mean(C, T-50..T-1) − 1; {_P}",
+    "pct_from_52w_high": f"P / MAX(C, T-252..T-1) − 1; {_P}",
+    "pct_from_52w_low": f"P / MIN(C, T-252..T-1) − 1; {_P}",
+    "donchian_pos_20d": f"(P − MIN(L, T-20..T-1)) / (MAX(H, T-20..T-1) − MIN(L, T-20..T-1)); {_P}",
+    # the spec printed C_{T-6}; corrected by the user to C_{T-5} (lib.spx_price.RET_BASE_BACK = 5)
+    "atr_normalized_ret_5d": f"(P / C_{{T-5}} − 1) / (atr_14d / C_{{T-1}}); {_ATR}; {_P}",
+    "rsi_14": f"Wilder RSI, period 14 (§4.2): {_ONE_STEP}; {_P}",
+    "macd_hist": f"(MACD − signal) / P; MACD = EMA12 − EMA26, signal = EMA9(MACD) (§4.2): {_ONE_STEP}; {_P}",
+    "atr_14d": _ATR,
+}
+
+
+def formula_of(m: str, grain: str) -> str | None:
+    """grain 'daily' or 'bar'. Derivatives from §5 of both specs."""
+    form, b = form_and_base(m)
+    if form == "level":
+        return FORMULA_LEVEL.get(m)
+    bar = ", same bar of day" if grain == "bar" else ""
+    if form == "z":
+        win = "60 readings at the same bar of day" if grain == "bar" else "60 trailing sessions inclusive of T"
+        return f"({b}_T − μ₆₀[{b}]) / σ₆₀[{b}]; {win}, sample standard deviation"
+    n = 1 if form == "chg_d" else 5
+    if b == "total_oi":
+        return f"total_oi_T / total_oi_{{T-{n}}} − 1"
+    return f"{b}_T − {b}_{{T-{n}}}{bar}"
+
+
 # --- Derivative wording ------------------------------------------------------------------------
 
 def _derivative(m: str, kind: str, grain: str) -> str:
@@ -183,8 +358,11 @@ def _derivative(m: str, kind: str, grain: str) -> str:
 
 
 def _row(metric, table, desc, family, surfaced) -> dict:
+    form, base = form_and_base(metric)
+    grain = "bar" if table in (B.TABLE_B, P.TABLE_P5) else "daily"
     return {"metric": metric, "table_name": table, "description": " ".join(desc.split()),
-            "family": family, "surfaced": bool(surfaced)}
+            "family": family, "surfaced": bool(surfaced),
+            "form": form, "base_column": base, "units": units_of(metric), "formula": formula_of(metric, grain)}
 
 
 def _a_level_desc(m: str) -> str:
@@ -288,3 +466,23 @@ def check_catalog(rows: list[dict], chk: F.Checker, db_columns: dict | None = No
     chk.check(not bad_d, f"every description is one non-empty line ({len(bad_d)} not)")
     n = sum(r["surfaced"] for r in rows)
     chk.check(n == sum(EXPECTED_SURFACED.values()), f"{n} surfaced metrics in all (110 OI + 45 price = 155)")
+
+    # Display fields
+    bad = [k for k, r in zip(keys, rows) if r["form"] not in FORMS]
+    chk.check(not bad, f"every form is one of {', '.join(FORMS)} ({len(bad)} not)" + "".join(f"\n    {x}" for x in bad[:5]))
+    bad = [k for k, r in zip(keys, rows) if (r["form"] == "level") != (r["base_column"] is None)]
+    chk.check(not bad, f"base_column is NULL exactly on levels ({len(bad)} not)" + "".join(f"\n    {x}" for x in bad[:5]))
+    have = set(keys)
+    bad = [(t, m, r["base_column"]) for (t, m), r in zip(keys, rows)
+           if r["base_column"] is not None and (t, r["base_column"]) not in have]
+    chk.check(not bad, f"every non-level row's base_column is a metric of the same table ({len(bad)} not)"
+              + "".join(f"\n    {x}" for x in bad[:5]))
+    bad = [k for k, r in zip(keys, rows) if r["surfaced"] and not r["units"]]
+    chk.check(not bad, f"every surfaced metric has units ({len(bad)} without)" + "".join(f"\n    {x}" for x in bad[:10]))
+    bad = [k for k, r in zip(keys, rows) if not r["units"]]
+    chk.check(not bad, f"every stored-only metric has units too ({len(bad)} without)" + "".join(f"\n    {x}" for x in bad[:10]))
+    bad = [(k, r["units"]) for k, r in zip(keys, rows) if r["units"] and r["units"] not in UNITS]
+    chk.check(not bad, f"every units value is in the dashboard vocabulary plus pct / days / index_0_100 "
+                       f"({len(bad)} not)" + "".join(f"\n    {x}" for x in bad[:5]))
+    bad = [k for k, r in zip(keys, rows) if not r["formula"] or "\n" in r["formula"]]
+    chk.check(not bad, f"every row has a one-line formula ({len(bad)} without)" + "".join(f"\n    {x}" for x in bad[:10]))
