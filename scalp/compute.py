@@ -282,16 +282,18 @@ def main() -> None:
             for day in days:
                 db.ensure_intraday_partition(day)
 
-        # THE RIGHT FILESYSTEM. Postgres lives on the root disk; the parquet
-        # store is on block 3. config.free_space_gb() defaults to the data
-        # dir, so a check using it would have passed while root filled to
-        # 100% — which is what happened. db.postgres_free_space_gb() asks the
-        # server for its own data directory instead, so it cannot drift.
-        free = db.postgres_free_space_gb()
+        # THE RIGHT FILESYSTEM. Postgres is not on the parquet volume, and it
+        # runs in Docker, so neither config.data_dir() nor the server's own
+        # `SHOW data_directory` (a container path) names the host filesystem
+        # it writes to. The host path comes from SCALP_PG_HOST_DATA_DIR. A
+        # missing path raises instead of falling back. See config.py.
+        measured = db.postgres_free_space_gb()
         projected = config.projected_intraday_write_gb(
             len(symbols), len(days), replace=args.replace)
-        if free is not None:
-            print(f"postgres data dir : {db.postgres_data_directory()}")
+        if measured is not None:
+            pg_path, free = measured
+            print(f"postgres data dir : {pg_path}  (host path, "
+                  f"{config.PG_HOST_DATA_DIR_ENV})")
             print(f"free there        : {free:.2f} GB")
             print(f"projected write   : {projected:.3f} GB"
                   f"{'  (x2 transient for --replace)' if args.replace else ''}")
@@ -304,8 +306,9 @@ def main() -> None:
                     f"past retention, or narrow the date range."
                 )
         else:
-            log.warning("could not read free space for the Postgres data "
-                        "directory (remote server?) — skipping the disk check")
+            log.warning("Postgres host %s is not local, so the host data "
+                        "directory is on another machine. Skipping the "
+                        "Postgres disk check", config.PG_HOST)
 
     with_quiet = not args.no_quiet
     if not with_quiet:

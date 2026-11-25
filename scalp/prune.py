@@ -64,9 +64,10 @@ def prune_intraday(args) -> None:
     for name, day in doomed:
         print(f"    {name}  ({day})")
 
-    free = db.postgres_free_space_gb()
-    if free is not None:
-        print(f"free on the PG disk: {free:.2f} GB")
+    measured = db.postgres_free_space_gb()
+    if measured is not None:
+        pg_path, free = measured
+        print(f"free on the PG disk: {free:.2f} GB  ({pg_path})")
 
     if not doomed:
         print()
@@ -88,7 +89,7 @@ def prune_intraday(args) -> None:
           f"{freed / 1024**2:.1f} MB")
     after = db.postgres_free_space_gb()
     if after is not None:
-        print(f"free on the PG disk now: {after:.2f} GB")
+        print(f"free on the PG disk now: {after[1]:.2f} GB  ({after[0]})")
 
 
 def main() -> None:

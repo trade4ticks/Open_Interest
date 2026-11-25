@@ -444,6 +444,14 @@ back to `POSTGRES_DB`. Host, port, user and password *do* fall back, so this
 reuses the same server and the `portfolio` role but never the same database as
 the factor-analysis and IV work.
 
+**Postgres disk check.** `compute.py` refuses to start, and `prune.py
+--intraday` reports, against the filesystem at `SCALP_PG_HOST_DATA_DIR`
+(default `/mnt/trading_volume_4/pgdata`). That is the *host* side of the Docker
+bind mount. The server's own `SHOW data_directory` returns the container path
+(`/var/lib/postgresql/data`), which on the host resolves to `/`, so it can't be
+used. If the configured path doesn't exist, the check raises. It does not fall
+back to a parent directory. When Postgres moves, update this setting in `.env`.
+
 The table names here are generic — `universe`, `daily_metrics`, `rankings` —
 and would be poor neighbours in a database something else owns. And if the
 strategy doesn't pan out, `DROP DATABASE equities_scalp` removes the whole

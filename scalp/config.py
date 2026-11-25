@@ -1124,12 +1124,56 @@ def projected_intraday_write_gb(n_symbols: int, n_days: int,
     return mb / 1024
 
 
-# Postgres lives on the ROOT disk, not the block-3 volume the parquet store
-# uses. A free-space check that defaulted to config.data_dir() would pass
-# while root filled — which is what happened. db.postgres_free_space_gb()
-# asks the server for its own data directory instead.
+# --- Postgres free-space guard -----------------------------------------------
+#
+# Postgres is on a DIFFERENT filesystem from the parquet store, so its guard
+# cannot reuse config.data_dir(). That first went wrong while Postgres was on
+# the root disk: a check against block 3 passed while root filled to 100%.
+#
+# The replacement asked the server (`SHOW data_directory`) and went wrong in a
+# different way. Postgres runs in Docker (portfolio_dashboard_db_1), so the
+# server reports the CONTAINER path, /var/lib/postgresql/data. That path is not
+# the data directory on the host where these scripts run. The free-space call
+# walked up from it to /, measured the root disk, and refused a 0.035 GB write
+# against 0.97 GB "free", while the real target had ~144 GB. A container cannot
+# know which host filesystem backs its own mounts, so this cannot be derived.
+# It has to be configured.
+#
+# 2026-11-21/22: Postgres data moved to volume 4, bind-mounted into the
+# container. The next migration is a change to SCALP_PG_HOST_DATA_DIR.
+#
+# There is NO walk-up to an existing ancestor. If the path is missing, the
+# guard raises; it does not fall back to a parent. The walk-up is how the
+# check ended up measuring /.
+PG_HOST_DATA_DIR_ENV = "SCALP_PG_HOST_DATA_DIR"
+PG_HOST_DATA_DIR = Path(os.environ.get(PG_HOST_DATA_DIR_ENV,
+                                       "/mnt/trading_volume_4/pgdata"))
+
+# compute.py refuses to start unless the projected intraday write plus this
+# margin fits on PG_HOST_DATA_DIR's filesystem.
 PG_FREE_SPACE_MARGIN_GB = float(
     os.environ.get("SCALP_PG_FREE_SPACE_MARGIN_GB", "5.0"))
+
+
+def pg_host_data_dir() -> Path:
+    """The configured host path of the Postgres data directory, validated.
+
+    Raises ConfigError when it does not exist or is not a directory. A
+    missing path usually means the volume is not mounted or the data moved
+    again, and either way a number measured anywhere else is wrong.
+    """
+    path = PG_HOST_DATA_DIR
+    if not path.is_dir():
+        what = "is not a directory" if path.exists() else "does not exist"
+        raise ConfigError(
+            f"{PG_HOST_DATA_DIR_ENV}={path} {what} on this host.\n"
+            "It must be the HOST path of the Postgres data directory, which is\n"
+            "the source side of the container's bind mount, not\n"
+            "/var/lib/postgresql/data. Check the mount (`df -h`, `docker\n"
+            "inspect`) and set the correct path in .env. The free-space\n"
+            "check will not fall back to a parent directory."
+        )
+    return path
 
 
 # --- filters: READ TIME ONLY -------------------------------------------------

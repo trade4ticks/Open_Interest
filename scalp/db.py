@@ -34,6 +34,7 @@ import logging
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal as _Decimal
+from pathlib import Path
 
 import pandas as pd
 import psycopg2
@@ -626,41 +627,34 @@ def table_stats(table: str) -> dict:
     return {} if df.empty else df.iloc[0].to_dict()
 
 
-def postgres_data_directory() -> str:
-    """Where the server actually keeps its files.
+def postgres_free_space_gb() -> tuple[Path, float] | None:
+    """(host path measured, free GB) for the Postgres data directory.
 
-    Asked of the server rather than read from config. Postgres lives on the
-    ROOT disk while the parquet store is on block 3, so a free-space check
-    against config.data_dir() passes while root fills — which is what
-    happened. A configurable path could drift again; this cannot.
-    """
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SHOW data_directory")
-        return cur.fetchone()[0]
+    The path is config.PG_HOST_DATA_DIR (SCALP_PG_HOST_DATA_DIR). It is not
+    taken from `SHOW data_directory`, because Postgres runs in Docker and the
+    server only knows its container path. See the config comment for the
+    incident.
 
+    Returns the path so callers print what was ACTUALLY measured.
 
-def postgres_free_space_gb() -> float | None:
-    """Free space on the filesystem holding the Postgres data directory.
-
-    Returns None when the server is not local — the path it reports is then
-    meaningless here, and a number derived from the wrong filesystem is worse
-    than no number.
+    Returns None only when the server is not local, because the configured
+    host path then refers to another machine. A missing or unreadable
+    configured path RAISES. It does not return None and does not walk up to a
+    parent, so a misconfiguration cannot turn into a silently skipped check or
+    a measurement of the wrong disk.
     """
     import shutil
-    from pathlib import Path
 
     if config.PG_HOST not in ("localhost", "127.0.0.1", "::1", ""):
         return None
+    path = config.pg_host_data_dir()          # raises ConfigError if missing
     try:
-        path = Path(postgres_data_directory())
-    except Exception:
-        return None
-    while not path.exists() and path.parent != path:
-        path = path.parent
-    try:
-        return shutil.disk_usage(path).free / (1024 ** 3)
-    except OSError:
-        return None
+        free = shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError as exc:
+        raise config.ConfigError(
+            f"could not stat {config.PG_HOST_DATA_DIR_ENV}={path}: {exc}"
+        ) from exc
+    return path, free
 
 
 def database_size_report() -> pd.DataFrame:
